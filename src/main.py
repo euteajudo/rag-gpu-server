@@ -8,13 +8,21 @@ Endpoints:
     GET  /healthz       - Liveness probe (Kubernetes)
     GET  /readyz        - Readiness probe (Kubernetes)
 
+Arquitetura:
+    - 1 worker uvicorn (modelos carregados 1x na GPU)
+    - ThreadPoolExecutor para operações GPU (não bloqueia event loop)
+    - Semáforo para limitar requests GPU simultâneos
+
 Uso:
     uvicorn src.main:app --host 0.0.0.0 --port 8000
 """
 
+import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -31,6 +39,18 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# THREAD POOL & SEMAPHORE
+# =============================================================================
+
+# Pool de threads para operações GPU blocking
+# max_workers=2: permite 2 operações GPU simultâneas (embedding + rerank)
+GPU_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+# Semáforo para limitar requests GPU simultâneos
+# Evita sobrecarga de VRAM com muitos requests em paralelo
+GPU_SEMAPHORE = asyncio.Semaphore(4)  # Max 4 requests enfileirados
 
 
 # =============================================================================
@@ -90,11 +110,13 @@ _start_time = time.time()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle do app - carrega modelos no startup."""
+    """Lifecycle do app - carrega modelos no startup, limpa no shutdown."""
     logger.info("=== RAG GPU Server iniciando ===")
     logger.info(f"Embedding model: {config.embedding_model}")
     logger.info(f"Reranker model: {config.reranker_model}")
     logger.info(f"Device: {config.device}")
+    logger.info(f"GPU ThreadPool workers: {GPU_EXECUTOR._max_workers}")
+    logger.info(f"GPU Semaphore limit: {GPU_SEMAPHORE._value}")
 
     # Pré-carrega modelos
     logger.info("Pré-carregando embedder...")
@@ -109,7 +131,11 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Shutdown: limpa recursos
     logger.info("=== GPU Server encerrando ===")
+    logger.info("Encerrando ThreadPoolExecutor...")
+    GPU_EXECUTOR.shutdown(wait=True, cancel_futures=False)
+    logger.info("=== Shutdown completo ===")
 
 
 app = FastAPI(
@@ -142,25 +168,35 @@ async def embed(request: EmbedRequest):
     Retorna:
     - dense_embeddings: Vetores 1024d (semânticos)
     - sparse_embeddings: Dicts token_id -> weight (keywords)
+
+    Nota: Operação GPU roda em thread separada para não bloquear event loop.
     """
-    try:
-        embedder = get_embedder()
-        result = embedder.encode(
-            texts=request.texts,
-            return_dense=request.return_dense,
-            return_sparse=request.return_sparse,
-        )
+    async with GPU_SEMAPHORE:  # Limita requests simultâneos
+        try:
+            embedder = get_embedder()
+            loop = asyncio.get_event_loop()
 
-        return EmbedResponse(
-            dense_embeddings=result.dense_embeddings if request.return_dense else None,
-            sparse_embeddings=result.sparse_embeddings if request.return_sparse else None,
-            latency_ms=round(result.latency_ms, 2),
-            count=len(request.texts),
-        )
+            # Executa operação GPU em thread separada
+            result = await loop.run_in_executor(
+                GPU_EXECUTOR,
+                partial(
+                    embedder.encode,
+                    texts=request.texts,
+                    return_dense=request.return_dense,
+                    return_sparse=request.return_sparse,
+                ),
+            )
 
-    except Exception as e:
-        logger.error(f"Erro no embedding: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            return EmbedResponse(
+                dense_embeddings=result.dense_embeddings if request.return_dense else None,
+                sparse_embeddings=result.sparse_embeddings if request.return_sparse else None,
+                latency_ms=round(result.latency_ms, 2),
+                count=len(request.texts),
+            )
+
+        except Exception as e:
+            logger.error(f"Erro no embedding: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/rerank", response_model=RerankResponse)
@@ -171,24 +207,34 @@ async def rerank(request: RerankRequest):
     Retorna:
     - scores: Score de relevância para cada documento (0-1)
     - rankings: Índices dos documentos ordenados por relevância
+
+    Nota: Operação GPU roda em thread separada para não bloquear event loop.
     """
-    try:
-        reranker = get_reranker()
-        result = reranker.rerank(
-            query=request.query,
-            documents=request.documents,
-            top_k=request.top_k,
-        )
+    async with GPU_SEMAPHORE:  # Limita requests simultâneos
+        try:
+            reranker = get_reranker()
+            loop = asyncio.get_event_loop()
 
-        return RerankResponse(
-            scores=result.scores,
-            rankings=result.rankings,
-            latency_ms=round(result.latency_ms, 2),
-        )
+            # Executa operação GPU em thread separada
+            result = await loop.run_in_executor(
+                GPU_EXECUTOR,
+                partial(
+                    reranker.rerank,
+                    query=request.query,
+                    documents=request.documents,
+                    top_k=request.top_k,
+                ),
+            )
 
-    except Exception as e:
-        logger.error(f"Erro no reranking: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            return RerankResponse(
+                scores=result.scores,
+                rankings=result.rankings,
+                latency_ms=round(result.latency_ms, 2),
+            )
+
+        except Exception as e:
+            logger.error(f"Erro no reranking: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -235,6 +281,23 @@ async def readyz():
 
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/stats")
+async def stats():
+    """Estatísticas de concorrência e uso."""
+    return {
+        "uptime_seconds": round(time.time() - _start_time, 2),
+        "gpu_executor": {
+            "max_workers": GPU_EXECUTOR._max_workers,
+            "active_threads": len(GPU_EXECUTOR._threads),
+        },
+        "gpu_semaphore": {
+            "limit": 4,  # Valor inicial do semáforo
+            "available": GPU_SEMAPHORE._value,
+            "waiting": 4 - GPU_SEMAPHORE._value,
+        },
+    }
 
 
 @app.get("/")
