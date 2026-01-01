@@ -122,13 +122,39 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --role="roles/storage.objectViewer"
 ```
 
-### 3. Criar Instance Template
+### 3. Criar VM para Testes (On-Demand - Recomendado para Desenvolvimento)
 
 ```bash
-# Usar DLVM (Deep Learning VM) com CUDA + PyTorch
-# Imagem: pytorch-latest-gpu (inclui drivers NVIDIA)
+# VM on-demand: fica rodando continuamente, sem risco de preempção
+# Custo maior (~$0.70/h) mas ideal para testes
 
-gcloud beta compute instance-templates create vectorgov-gpu \
+gcloud compute instances create vectorgov-gpu-test \
+    --project="${PROJECT_ID}" \
+    --zone="${ZONE}" \
+    --machine-type="g2-standard-4" \
+    --accelerator="count=1,type=nvidia-l4" \
+    --maintenance-policy="TERMINATE" \
+    --image-family="pytorch-latest-gpu" \
+    --image-project="deeplearning-platform-release" \
+    --boot-disk-type="pd-ssd" \
+    --boot-disk-size="120GB" \
+    --network-interface="network=default,network-tier=PREMIUM,stack-type=IPV4_ONLY" \
+    --service-account="${SA_EMAIL}" \
+    --scopes="https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/devstorage.read_only" \
+    --metadata=enable-guest-attributes=true \
+    --metadata-from-file=startup-script=./scripts/startup.sh,shutdown-script=./scripts/shutdown.sh \
+    --tags="http-server,https-server"
+```
+
+> **Nota**: Esta VM fica rodando 24/7 até ser manualmente parada. Ideal para testes e desenvolvimento.
+
+### 4. (Alternativa) Criar Instance Template para Produção (Spot)
+
+```bash
+# Template Spot: mais barato (~$0.28/h) mas pode ser interrompido
+# Usar apenas em produção com auto-restart configurado
+
+gcloud beta compute instance-templates create vectorgov-gpu-prod \
     --project="${PROJECT_ID}" \
     --instance-template-region="${REGION}" \
     --machine-type="g2-standard-4" \
@@ -147,13 +173,10 @@ gcloud beta compute instance-templates create vectorgov-gpu \
     --metadata=enable-guest-attributes=true \
     --metadata-from-file=startup-script=./scripts/startup.sh,shutdown-script=./scripts/shutdown.sh \
     --tags="http-server,https-server"
-```
 
-### 4. Criar Instância a partir do Template
-
-```bash
+# Criar instância a partir do template (produção)
 gcloud compute instances create vectorgov-gpu1 \
-    --source-instance-template="projects/${PROJECT_ID}/regions/${REGION}/instanceTemplates/vectorgov-gpu" \
+    --source-instance-template="projects/${PROJECT_ID}/regions/${REGION}/instanceTemplates/vectorgov-gpu-prod" \
     --zone="${ZONE}" \
     --project="${PROJECT_ID}"
 ```
@@ -212,14 +235,16 @@ sudo vim /etc/default/rag-gpu
 sudo systemctl restart rag-gpu
 ```
 
-### Custos (Spot Instance)
+### Custos
 
-| Configuração | Preço/hora | Preço/mês (24/7) |
-|--------------|------------|------------------|
-| g2-standard-4 + L4 (Spot) | ~$0.28 | ~$200 |
-| g2-standard-4 + L4 (On-demand) | ~$0.70 | ~$504 |
+| Modo | Configuração | Preço/hora | Preço/mês (24/7) | Uso |
+|------|--------------|------------|------------------|-----|
+| **Teste** | g2-standard-4 + L4 (On-demand) | ~$0.70 | ~$504 | Desenvolvimento, testes |
+| **Produção** | g2-standard-4 + L4 (Spot) | ~$0.28 | ~$200 | Produção com auto-restart |
 
-**Nota**: Spot instances podem ser interrompidas. Use `--instance-termination-action=STOP` para preservar dados.
+**Recomendação**:
+- **Testes**: Use On-demand (seção 3). VM fica rodando sem interrupções.
+- **Produção**: Use Spot (seção 4) + monitoramento para restart automático.
 
 ## Desenvolvimento Local
 
