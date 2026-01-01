@@ -84,48 +84,142 @@ Servidor GPU para embeddings (BGE-M3) e reranking (BGE-Reranker) do sistema RAG 
 
 ## Deploy no Google Cloud
 
-### 1. Criar VM com GPU
+### Pré-requisitos
+
+- Google Cloud SDK instalado (`gcloud`)
+- Projeto GCP com billing habilitado
+- Quota de GPU aprovada (solicitar em IAM & Admin > Quotas)
+
+### 1. Configurar Variáveis
 
 ```bash
-# Criar VM com GPU L4
-gcloud compute instances create rag-gpu-server \
-    --zone=us-central1-a \
-    --machine-type=g2-standard-4 \
-    --accelerator=type=nvidia-l4,count=1 \
-    --image-family=pytorch-latest-gpu \
-    --image-project=deeplearning-platform-release \
-    --boot-disk-size=100GB \
-    --metadata-from-file=startup-script=scripts/startup.sh,shutdown-script=scripts/shutdown.sh
+# Configurar projeto e região
+PROJECT_ID="gen-lang-client-0386547606"  # Seu project ID
+REGION="us-central1"
+ZONE="us-central1-a"  # ou -c onde L4 esteja disponível
+SA_EMAIL="sa-vectorgov-gpu@${PROJECT_ID}.iam.gserviceaccount.com"
 ```
 
-### 2. Variáveis de Ambiente
-
-Configurar na VM ou no metadata:
+### 2. Criar Service Account (opcional, recomendado)
 
 ```bash
-export REPO_URL=https://github.com/seu-usuario/rag-gpu-server.git
-export EMBEDDING_MODEL=BAAI/bge-m3
-export RERANKER_MODEL=BAAI/bge-reranker-v2-m3
-export PORT=8000
-export DEVICE=cuda
-export USE_FP16=true
+# Criar Service Account
+gcloud iam service-accounts create sa-vectorgov-gpu \
+    --project="$PROJECT_ID" \
+    --display-name="VectorGov GPU Server"
+
+# Adicionar permissões mínimas
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/logging.logWriter"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/monitoring.metricWriter"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/storage.objectViewer"
 ```
 
-### 3. Verificar Deploy
+### 3. Criar Instance Template
+
+```bash
+# Usar DLVM (Deep Learning VM) com CUDA + PyTorch
+# Imagem: pytorch-latest-gpu (inclui drivers NVIDIA)
+
+gcloud beta compute instance-templates create vectorgov-gpu \
+    --project="${PROJECT_ID}" \
+    --instance-template-region="${REGION}" \
+    --machine-type="g2-standard-4" \
+    --accelerator="count=1,type=nvidia-l4" \
+    --maintenance-policy="TERMINATE" \
+    --provisioning-model="SPOT" \
+    --instance-termination-action="STOP" \
+    --image-family="pytorch-latest-gpu" \
+    --image-project="deeplearning-platform-release" \
+    --boot-disk-type="pd-ssd" \
+    --boot-disk-size="120GB" \
+    --network-interface="network=default,network-tier=PREMIUM,stack-type=IPV4_ONLY" \
+    --no-enable-display-device \
+    --service-account="${SA_EMAIL}" \
+    --scopes="https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/devstorage.read_only" \
+    --metadata=enable-guest-attributes=true \
+    --metadata-from-file=startup-script=./scripts/startup.sh,shutdown-script=./scripts/shutdown.sh \
+    --tags="http-server,https-server"
+```
+
+### 4. Criar Instância a partir do Template
+
+```bash
+gcloud compute instances create vectorgov-gpu1 \
+    --source-instance-template="projects/${PROJECT_ID}/regions/${REGION}/instanceTemplates/vectorgov-gpu" \
+    --zone="${ZONE}" \
+    --project="${PROJECT_ID}"
+```
+
+### 5. Verificar Deploy
 
 ```bash
 # SSH na VM
-gcloud compute ssh rag-gpu-server --zone=us-central1-a
+gcloud compute ssh vectorgov-gpu1 --zone="$ZONE" --project="$PROJECT_ID"
 
-# Verificar serviço
+# Na VM:
 sudo systemctl status rag-gpu
-
-# Ver logs
 sudo journalctl -u rag-gpu -f
+curl -s localhost:8000/health | jq
 
-# Testar API
-curl http://localhost:8000/health
+# Verificar GPU
+nvidia-smi
 ```
+
+### 6. Configurar Firewall (se necessário)
+
+```bash
+# Permitir tráfego HTTP na porta 8000
+gcloud compute firewall-rules create allow-rag-gpu \
+    --project="$PROJECT_ID" \
+    --allow=tcp:8000 \
+    --target-tags=http-server \
+    --description="Allow RAG GPU Server traffic"
+```
+
+### 7. Obter IP Externo
+
+```bash
+gcloud compute instances describe vectorgov-gpu1 \
+    --zone="$ZONE" \
+    --project="$PROJECT_ID" \
+    --format="get(networkInterfaces[0].accessConfigs[0].natIP)"
+```
+
+### Configuração Pós-Deploy
+
+O arquivo de configuração fica em `/etc/default/rag-gpu`. Para adicionar variáveis sensíveis:
+
+```bash
+# SSH na VM
+gcloud compute ssh vectorgov-gpu1 --zone="$ZONE"
+
+# Editar configuração
+sudo vim /etc/default/rag-gpu
+
+# Adicionar no final:
+# HF_TOKEN=hf_xxx
+# MILVUS_URI=tcp://10.0.0.5:19530
+
+# Reiniciar serviço
+sudo systemctl restart rag-gpu
+```
+
+### Custos (Spot Instance)
+
+| Configuração | Preço/hora | Preço/mês (24/7) |
+|--------------|------------|------------------|
+| g2-standard-4 + L4 (Spot) | ~$0.28 | ~$200 |
+| g2-standard-4 + L4 (On-demand) | ~$0.70 | ~$504 |
+
+**Nota**: Spot instances podem ser interrompidas. Use `--instance-termination-action=STOP` para preservar dados.
 
 ## Desenvolvimento Local
 
