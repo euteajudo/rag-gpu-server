@@ -1,0 +1,18 @@
+# =============================================================================
+# RAG GPU Server - Dependencies
+# =============================================================================
+# Para GPU com CUDA 12.x
+
+# Web framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+
+# ML/Embeddings
+torch>=2.1.0
+FlagEmbedding>=1.2.0
+transformers>=4.36.0
+sentence-transformers>=2.2.0
+
+# Utils
+numpy>=1.24.0
