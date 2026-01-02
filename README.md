@@ -1,49 +1,75 @@
 # RAG GPU Server
 
-Servidor GPU para embeddings (BGE-M3) e reranking (BGE-Reranker) do sistema RAG Legal.
+Servidor GPU para embeddings (BGE-M3), reranking (BGE-Reranker) e LLM (vLLM) do sistema RAG Legal.
 
-## Arquitetura
+**Status Atual**: Produção - VM Google Cloud operacional
+
+---
+
+## Arquitetura do Sistema
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                 Google Cloud VM (GPU)                       │
-│                                                             │
-│   ┌─────────────────────────────────────────────────────┐   │
-│   │             RAG GPU Server (FastAPI)                │   │
-│   │                                                     │   │
-│   │   POST /embed   →  BGE-M3 (embeddings)              │   │
-│   │   POST /rerank  →  BGE-Reranker (cross-encoder)     │   │
-│   │   GET  /health  →  Status dos modelos               │   │
-│   │                                                     │   │
-│   │   GPU: NVIDIA L4 (24GB) ou T4 (16GB)                │   │
-│   └─────────────────────────────────────────────────────┘   │
-│                           │                                 │
-│   ┌─────────────────────────────────────────────────────┐   │
-│   │                vLLM (container)                     │   │
-│   │                                                     │   │
-│   │   /v1/chat/completions  →  Qwen3-8B-AWQ             │   │
-│   │   Porta: 8080                                       │   │
-│   └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            │ HTTPS
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     VPS Hostinger                           │
-│   FastAPI (RAG API) + Milvus + Redis + PostgreSQL           │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GOOGLE CLOUD VM (GPU)                                    │
+│                    IP: 34.44.157.159                                        │
+│                    Tipo: g2-standard-4 + NVIDIA L4 (24GB)                   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                 RAG GPU Server (FastAPI)                            │   │
+│   │                 Porta: 8000                                         │   │
+│   │                                                                     │   │
+│   │   POST /embed   →  BGE-M3 (embeddings dense 1024d + sparse)         │   │
+│   │   POST /rerank  →  BGE-Reranker-v2-m3 (cross-encoder)               │   │
+│   │   GET  /health  →  Status dos modelos + GPU                         │   │
+│   │                                                                     │   │
+│   │   Modelos carregados na GPU (~4GB VRAM)                             │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                 vLLM Container                                      │   │
+│   │                 Porta: 8001 (interno) → exposto como 8001           │   │
+│   │                                                                     │   │
+│   │   POST /v1/chat/completions  →  Qwen/Qwen3-8B-AWQ                   │   │
+│   │                                                                     │   │
+│   │   Modelo AWQ quantizado (~6GB VRAM)                                 │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ HTTPS / HTTP
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         VPS HOSTINGER                                       │
+│                         IP: 77.37.43.160                                    │
+│                                                                             │
+│   ┌─────────────────────┐  ┌─────────────┐  ┌─────────────┐                │
+│   │   FastAPI (RAG API) │  │   Milvus    │  │   Redis     │                │
+│   │   Porta: 8000       │  │   19530     │  │   6379      │                │
+│   │                     │  │             │  │             │                │
+│   │   RemoteEmbedder    │  │  leis_v3    │  │  Cache      │                │
+│   │   RemoteReranker    │  │  (1312 docs)│  │  Semântico  │                │
+│   │   RemoteLLM         │  │             │  │             │                │
+│   └─────────────────────┘  └─────────────┘  └─────────────┘                │
+│                                                                             │
+│   ┌─────────────────────┐                                                  │
+│   │   PostgreSQL        │                                                  │
+│   │   Porta: 5432       │                                                  │
+│   │   (Usuários, Logs)  │                                                  │
+│   └─────────────────────┘                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Endpoints
+---
+
+## Endpoints do GPU Server
 
 | Endpoint | Método | Descrição |
 |----------|--------|-----------|
 | `/embed` | POST | Gera embeddings dense (1024d) + sparse |
 | `/rerank` | POST | Reordena documentos por relevância |
-| `/health` | GET | Health check completo |
+| `/health` | GET | Health check completo com métricas GPU |
 | `/healthz` | GET | Liveness probe (Kubernetes) |
 | `/readyz` | GET | Readiness probe (Kubernetes) |
-| `/docs` | GET | Swagger UI |
+| `/docs` | GET | Swagger UI interativo |
 
 ### POST /embed
 
@@ -82,263 +108,650 @@ Servidor GPU para embeddings (BGE-M3) e reranking (BGE-Reranker) do sistema RAG 
 }
 ```
 
-## Deploy no Google Cloud
+---
 
-### Pré-requisitos
+## Infraestrutura Atual
 
-- Google Cloud SDK instalado (`gcloud`)
-- Projeto GCP com billing habilitado
-- Quota de GPU aprovada (solicitar em IAM & Admin > Quotas)
+### VM Google Cloud (GPU Server)
 
-### 1. Configurar Variáveis
+| Propriedade | Valor |
+|-------------|-------|
+| **Nome** | vectorgov-gpu-test |
+| **IP Externo** | 34.44.157.159 |
+| **Zona** | us-central1-c |
+| **Tipo** | g2-standard-4 |
+| **GPU** | NVIDIA L4 (24GB VRAM) |
+| **CPU** | 4 vCPUs |
+| **RAM** | 16 GB |
+| **Disco** | 120 GB SSD |
+| **OS** | Debian 11 (Deep Learning VM) |
+| **Custo** | ~$0.70/hora (on-demand) |
+
+### Serviços Rodando na VM
+
+| Serviço | Porta | Status | Comando de Verificação |
+|---------|-------|--------|------------------------|
+| GPU Server (FastAPI) | 8000 | Ativo | `curl http://34.44.157.159:8000/health` |
+| vLLM | 8001 | Ativo | `curl http://34.44.157.159:8001/health` |
+
+### VPS Hostinger
+
+| Propriedade | Valor |
+|-------------|-------|
+| **IP** | 77.37.43.160 |
+| **RAM** | 8 GB |
+| **Disco** | 200 GB NVMe |
+| **OS** | Ubuntu 22.04 |
+
+---
+
+## Configuração do Sistema
+
+### Variáveis de Ambiente na VPS
 
 ```bash
-# Configurar projeto e região
-PROJECT_ID="gen-lang-client-0386547606"  # Seu project ID
-REGION="us-central1"
-ZONE="us-central1-a"  # ou -c onde L4 esteja disponível
-SA_EMAIL="sa-vectorgov-gpu@${PROJECT_ID}.iam.gserviceaccount.com"
+# /opt/rag-api/.env
+
+# GPU Server (Google Cloud)
+GPU_SERVER_URL=http://34.44.157.159:8000
+
+# vLLM (Google Cloud)
+VLLM_BASE_URL=http://34.44.157.159:8001/v1
+VLLM_MODEL=Qwen/Qwen3-8B-AWQ
+
+# Milvus (local na VPS)
+MILVUS_HOST=127.0.0.1
+MILVUS_PORT=19530
+
+# Redis (local na VPS)
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+
+# PostgreSQL (local na VPS)
+DATABASE_URL=postgresql://rag:xxx@localhost:5432/rag_db
+
+# JWT
+JWT_SECRET_KEY=xxx
 ```
 
-### 2. Criar Service Account (opcional, recomendado)
+### Firewall do Google Cloud
+
+Regras criadas para permitir acesso:
 
 ```bash
-# Criar Service Account
-gcloud iam service-accounts create sa-vectorgov-gpu \
-    --project="$PROJECT_ID" \
-    --display-name="VectorGov GPU Server"
-
-# Adicionar permissões mínimas
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/logging.logWriter"
-
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/monitoring.metricWriter"
-
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/storage.objectViewer"
-```
-
-### 3. Criar VM para Testes (On-Demand - Recomendado para Desenvolvimento)
-
-```bash
-# VM on-demand: fica rodando continuamente, sem risco de preempção
-# Custo maior (~$0.70/h) mas ideal para testes
-
-gcloud compute instances create vectorgov-gpu-test \
-    --project="${PROJECT_ID}" \
-    --zone="${ZONE}" \
-    --machine-type="g2-standard-4" \
-    --accelerator="count=1,type=nvidia-l4" \
-    --maintenance-policy="TERMINATE" \
-    --image-family="pytorch-latest-gpu" \
-    --image-project="deeplearning-platform-release" \
-    --boot-disk-type="pd-ssd" \
-    --boot-disk-size="120GB" \
-    --network-interface="network=default,network-tier=PREMIUM,stack-type=IPV4_ONLY" \
-    --service-account="${SA_EMAIL}" \
-    --scopes="https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/devstorage.read_only" \
-    --metadata=enable-guest-attributes=true \
-    --metadata-from-file=startup-script=./scripts/startup.sh,shutdown-script=./scripts/shutdown.sh \
-    --tags="http-server,https-server"
-```
-
-> **Nota**: Esta VM fica rodando 24/7 até ser manualmente parada. Ideal para testes e desenvolvimento.
-
-### 4. (Alternativa) Criar Instance Template para Produção (Spot)
-
-```bash
-# Template Spot: mais barato (~$0.28/h) mas pode ser interrompido
-# Usar apenas em produção com auto-restart configurado
-
-gcloud beta compute instance-templates create vectorgov-gpu-prod \
-    --project="${PROJECT_ID}" \
-    --instance-template-region="${REGION}" \
-    --machine-type="g2-standard-4" \
-    --accelerator="count=1,type=nvidia-l4" \
-    --maintenance-policy="TERMINATE" \
-    --provisioning-model="SPOT" \
-    --instance-termination-action="STOP" \
-    --image-family="pytorch-latest-gpu" \
-    --image-project="deeplearning-platform-release" \
-    --boot-disk-type="pd-ssd" \
-    --boot-disk-size="120GB" \
-    --network-interface="network=default,network-tier=PREMIUM,stack-type=IPV4_ONLY" \
-    --no-enable-display-device \
-    --service-account="${SA_EMAIL}" \
-    --scopes="https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/devstorage.read_only" \
-    --metadata=enable-guest-attributes=true \
-    --metadata-from-file=startup-script=./scripts/startup.sh,shutdown-script=./scripts/shutdown.sh \
-    --tags="http-server,https-server"
-
-# Criar instância a partir do template (produção)
-gcloud compute instances create vectorgov-gpu1 \
-    --source-instance-template="projects/${PROJECT_ID}/regions/${REGION}/instanceTemplates/vectorgov-gpu-prod" \
-    --zone="${ZONE}" \
-    --project="${PROJECT_ID}"
-```
-
-### 5. Verificar Deploy
-
-```bash
-# SSH na VM
-gcloud compute ssh vectorgov-gpu1 --zone="$ZONE" --project="$PROJECT_ID"
-
-# Na VM:
-sudo systemctl status rag-gpu
-sudo journalctl -u rag-gpu -f
-curl -s localhost:8000/health | jq
-
-# Verificar GPU
-nvidia-smi
-```
-
-### 6. Configurar Firewall (se necessário)
-
-```bash
-# Permitir tráfego HTTP na porta 8000
+# Porta 8000 - GPU Server
 gcloud compute firewall-rules create allow-rag-gpu \
-    --project="$PROJECT_ID" \
     --allow=tcp:8000 \
     --target-tags=http-server \
-    --description="Allow RAG GPU Server traffic"
+    --source-ranges=0.0.0.0/0
+
+# Porta 8001 - vLLM
+gcloud compute firewall-rules create allow-vllm \
+    --allow=tcp:8001 \
+    --target-tags=http-server \
+    --source-ranges=0.0.0.0/0
 ```
 
-### 7. Obter IP Externo
+---
 
-```bash
-gcloud compute instances describe vectorgov-gpu1 \
-    --zone="$ZONE" \
-    --project="$PROJECT_ID" \
-    --format="get(networkInterfaces[0].accessConfigs[0].natIP)"
+## Arquivos Modificados na VPS
+
+### 1. model_pool.py - Modo Remoto
+
+**Arquivo**: `/opt/rag-api/src/model_pool.py`
+
+Adicionado suporte para alternar entre modo local (GPU na máquina) e remoto (GPU no Google Cloud):
+
+```python
+import os
+from typing import Optional
+
+GPU_SERVER_URL = os.getenv("GPU_SERVER_URL")
+
+_embedder = None
+_reranker = None
+
+
+def is_remote_mode() -> bool:
+    """Verifica se está usando GPU remota."""
+    return GPU_SERVER_URL is not None
+
+
+def get_embedder():
+    """Retorna embedder (remoto ou local)."""
+    global _embedder
+
+    if is_remote_mode():
+        if _embedder is None:
+            from remote import RemoteEmbedder
+            from remote.embedder import RemoteEmbedderConfig
+            config = RemoteEmbedderConfig(gpu_server_url=GPU_SERVER_URL)
+            _embedder = RemoteEmbedder(config=config)
+        return _embedder
+
+    # Fallback local (requer GPU)
+    if _embedder is None:
+        from embeddings import BGEM3Embedder
+        _embedder = BGEM3Embedder()
+    return _embedder
+
+
+def get_reranker():
+    """Retorna reranker (remoto ou local)."""
+    global _reranker
+
+    if is_remote_mode():
+        if _reranker is None:
+            from remote import RemoteReranker
+            from remote.reranker import RemoteRerankerConfig
+            config = RemoteRerankerConfig(gpu_server_url=GPU_SERVER_URL)
+            _reranker = RemoteReranker(config=config)
+        return _reranker
+
+    # Fallback local (requer GPU)
+    if _reranker is None:
+        from embeddings import BGEReranker
+        _reranker = BGEReranker()
+    return _reranker
 ```
 
-### Configuração Pós-Deploy
+### 2. RemoteEmbedder - Cliente HTTP
 
-O arquivo de configuração fica em `/etc/default/rag-gpu`. Para adicionar variáveis sensíveis:
+**Arquivo**: `/opt/rag-api/src/remote/embedder.py`
+
+Cliente que chama o GPU Server para gerar embeddings:
+
+```python
+@dataclass
+class RemoteEmbedderConfig:
+    gpu_server_url: str = "http://localhost:8000"
+    timeout: int = 30
+    max_batch_size: int = 32
+
+
+class RemoteEmbedder:
+    """Cliente para embeddings remotos via GPU Server."""
+
+    def __init__(self, config: Optional[RemoteEmbedderConfig] = None):
+        self.config = config or RemoteEmbedderConfig()
+        self.embed_url = f"{self.config.gpu_server_url}/embed"
+
+    def encode(
+        self,
+        texts: list[str],
+        return_dense: bool = True,
+        return_sparse: bool = True
+    ) -> EmbeddingResult:
+        """Gera embeddings via GPU Server."""
+        response = requests.post(
+            self.embed_url,
+            json={
+                "texts": texts,
+                "return_dense": return_dense,
+                "return_sparse": return_sparse,
+            },
+            timeout=self.config.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return EmbeddingResult(
+            dense_embeddings=data.get("dense_embeddings", []),
+            sparse_embeddings=data.get("sparse_embeddings", []),
+        )
+
+    def encode_hybrid(self, texts: list[str]) -> dict:
+        """Retorna embeddings no formato esperado pelo HybridSearcher."""
+        result = self.encode(texts, return_dense=True, return_sparse=True)
+        return {
+            "dense": result.dense_embeddings,
+            "sparse": result.sparse_embeddings,
+        }
+
+    def encode_hybrid_single(self, text: str) -> dict:
+        """Retorna embedding único no formato esperado pelo HybridSearcher."""
+        result = self.encode([text], return_dense=True, return_sparse=True)
+        return {
+            "dense": result.dense_embeddings[0],
+            "sparse": result.sparse_embeddings[0],
+        }
+```
+
+### 3. RemoteReranker - Cliente HTTP
+
+**Arquivo**: `/opt/rag-api/src/remote/reranker.py`
+
+Cliente que chama o GPU Server para reranking:
+
+```python
+@dataclass
+class RemoteRerankerConfig:
+    gpu_server_url: str = "http://localhost:8000"
+    timeout: int = 60
+
+
+class RemoteReranker:
+    """Cliente para reranking remoto via GPU Server."""
+
+    def __init__(self, config: Optional[RemoteRerankerConfig] = None):
+        self.config = config or RemoteRerankerConfig()
+        self.rerank_url = f"{self.config.gpu_server_url}/rerank"
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[dict[str, Any]],
+        text_key: str = "text",
+        top_k: Optional[int] = None,
+        return_scores: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Reordena documentos por relevância.
+
+        Interface compatível com BGEReranker local.
+        """
+        texts = [doc.get(text_key, "") for doc in documents]
+
+        response = requests.post(
+            self.rerank_url,
+            json={
+                "query": query,
+                "documents": texts,
+                "top_k": top_k or len(documents),
+            },
+            timeout=self.config.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Reordena documentos conforme rankings
+        rankings = data.get("rankings", list(range(len(documents))))
+        scores = data.get("scores", [0.0] * len(documents))
+
+        reranked = []
+        for i, rank_idx in enumerate(rankings):
+            if rank_idx < len(documents):
+                doc = documents[rank_idx].copy()
+                if return_scores:
+                    doc["rerank_score"] = scores[i] if i < len(scores) else 0.0
+                reranked.append(doc)
+
+        return reranked[:top_k] if top_k else reranked
+```
+
+### 4. vllm_client.py - URL Configurável
+
+**Arquivo**: `/opt/rag-api/src/llm/vllm_client.py`
+
+Modificado para ler URL do vLLM de variável de ambiente:
+
+```python
+import os
+from dataclasses import dataclass, field
+
+@dataclass
+class LLMConfig:
+    model: str = field(
+        default_factory=lambda: os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+    )
+    base_url: str = field(
+        default_factory=lambda: os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
+    )
+    temperature: float = 0.7
+    max_tokens: int = 2048
+```
+
+### 5. answer_generator.py - URL Configurável
+
+**Arquivo**: `/opt/rag-api/src/rag/answer_generator.py`
+
+Modificado para ler configurações de variáveis de ambiente:
+
+```python
+import os
+from dataclasses import dataclass, field
+
+@dataclass
+class GenerationConfig:
+    model: str = field(
+        default_factory=lambda: os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+    )
+    base_url: str = field(
+        default_factory=lambda: os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
+    )
+    # ... outros campos
+```
+
+### 6. search/config.py - Milvus Host Configurável
+
+**Arquivo**: `/opt/rag-api/src/search/config.py`
+
+Modificado para ler host do Milvus de variável de ambiente:
+
+```python
+import os
+from dataclasses import dataclass, field
+
+@dataclass
+class SearchConfig:
+    milvus_host: str = field(
+        default_factory=lambda: os.getenv("MILVUS_HOST", "localhost")
+    )
+    milvus_port: int = 19530
+    collection_name: str = "leis_v3"
+```
+
+---
+
+## Módulo de Clientes Remotos
+
+Estrutura do módulo `/opt/rag-api/src/remote/`:
+
+```
+src/remote/
+├── __init__.py         # Exports: RemoteEmbedder, RemoteReranker, RemoteLLM
+├── embedder.py         # RemoteEmbedder, RemoteEmbedderConfig, EmbeddingResult
+├── reranker.py         # RemoteReranker, RemoteRerankerConfig, RerankResult
+└── llm.py              # RemoteLLM, RemoteLLMConfig (wrapper para vLLM remoto)
+```
+
+### __init__.py
+
+```python
+from .embedder import RemoteEmbedder, RemoteEmbedderConfig, EmbeddingResult
+from .reranker import RemoteReranker, RemoteRerankerConfig, RerankResult
+from .llm import RemoteLLM, RemoteLLMConfig
+
+__all__ = [
+    "RemoteEmbedder",
+    "RemoteEmbedderConfig",
+    "EmbeddingResult",
+    "RemoteReranker",
+    "RemoteRerankerConfig",
+    "RerankResult",
+    "RemoteLLM",
+    "RemoteLLMConfig",
+]
+```
+
+---
+
+## Dashboard de Monitoramento
+
+### Localização
+
+**Arquivo**: `/Users/abimaeltorcate/vector_govi_2/rag-gpu-server/monitoring/dashboard.py`
+
+### Funcionalidades
+
+- **CPU**: Utilização, load average (1/5/15 min)
+- **Memória RAM**: Total, usado, livre, percentual
+- **GPU NVIDIA**: Utilização, VRAM, temperatura, consumo de energia
+- **Disco**: Espaço total, usado, livre
+- **I/O**: Leituras/escritas totais, operações
+- **Rede**: Bytes recebidos/enviados
+- **Status dos Serviços**: GPU Server (8000), vLLM (8001)
+- **Histórico**: Gráficos temporais das métricas
+- **Auto-refresh**: Atualização automática configurável
+
+### Como Executar
 
 ```bash
-# SSH na VM
-gcloud compute ssh vectorgov-gpu1 --zone="$ZONE"
+cd /Users/abimaeltorcate/vector_govi_2/rag-gpu-server
+streamlit run monitoring/dashboard.py --server.port 8502
+```
 
-# Editar configuração
-sudo vim /etc/default/rag-gpu
+Acesse: http://localhost:8502
 
-# Adicionar no final:
-# HF_TOKEN=hf_xxx
-# MILVUS_URI=tcp://10.0.0.5:19530
+### Configuração
 
-# Reiniciar serviço
+O dashboard se conecta via SSH à VM do Google Cloud:
+
+```python
+VM_IP = "34.44.157.159"
+SSH_USER = "abimaeltorcate"
+SSH_KEY = "~/.ssh/google_compute_engine"
+```
+
+### Requisitos
+
+```bash
+pip install streamlit pandas
+```
+
+---
+
+## Comandos Úteis
+
+### Conectar à VM via SSH
+
+```bash
+# Via gcloud
+gcloud compute ssh vectorgov-gpu-test --zone=us-central1-c
+
+# Via SSH direto
+ssh -i ~/.ssh/google_compute_engine abimaeltorcate@34.44.157.159
+```
+
+### Verificar Status dos Serviços
+
+```bash
+# Na VM
+sudo systemctl status rag-gpu
+sudo systemctl status vllm
+
+# Remotamente
+curl http://34.44.157.159:8000/health
+curl http://34.44.157.159:8001/health
+```
+
+### Logs dos Serviços
+
+```bash
+# GPU Server
+sudo journalctl -u rag-gpu -f
+
+# vLLM
+docker logs -f vllm
+```
+
+### Verificar GPU
+
+```bash
+# Na VM
+nvidia-smi
+
+# Uso contínuo
+watch -n 1 nvidia-smi
+```
+
+### Testar Endpoints
+
+```bash
+# Health check
+curl http://34.44.157.159:8000/health | jq
+
+# Embeddings
+curl -X POST http://34.44.157.159:8000/embed \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["Teste de embedding"], "return_dense": true, "return_sparse": true}'
+
+# Reranking
+curl -X POST http://34.44.157.159:8000/rerank \
+  -H "Content-Type: application/json" \
+  -d '{"query": "teste", "documents": ["doc1", "doc2"], "top_k": 2}'
+
+# vLLM Chat
+curl -X POST http://34.44.157.159:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-8B-AWQ",
+    "messages": [{"role": "user", "content": "Olá"}],
+    "max_tokens": 100
+  }'
+```
+
+### Gerenciar VM
+
+```bash
+# Parar VM (economiza custos)
+gcloud compute instances stop vectorgov-gpu-test --zone=us-central1-c
+
+# Iniciar VM
+gcloud compute instances start vectorgov-gpu-test --zone=us-central1-c
+
+# Ver IP atual
+gcloud compute instances describe vectorgov-gpu-test \
+  --zone=us-central1-c \
+  --format="get(networkInterfaces[0].accessConfigs[0].natIP)"
+```
+
+---
+
+## Custos e Economia
+
+### Custo Atual (On-Demand)
+
+| Componente | Custo/Hora | Custo/Dia | Custo/Mês |
+|------------|------------|-----------|-----------|
+| g2-standard-4 + L4 | $0.70 | $16.80 | ~$504 |
+| Disco 120GB SSD | $0.02 | $0.48 | ~$14 |
+| Rede (estimado) | $0.05 | $1.20 | ~$36 |
+| **Total** | **$0.77** | **$18.48** | **~$554** |
+
+### Estratégias de Economia
+
+1. **Desligar quando não usar**:
+   ```bash
+   gcloud compute instances stop vectorgov-gpu-test --zone=us-central1-c
+   ```
+   - Economia: 100% do custo de compute (ainda paga disco)
+
+2. **Usar Spot VMs** (produção):
+   - Custo: ~$0.28/hora (60% desconto)
+   - Risco: VM pode ser interrompida
+
+3. **Escalar verticalmente**:
+   - T4 (16GB): ~$0.35/hora
+   - L4 (24GB): ~$0.70/hora
+   - Usar T4 se VRAM for suficiente
+
+---
+
+## Troubleshooting
+
+### Problema: "Connection refused" na porta 8000
+
+**Causa**: GPU Server não está rodando
+
+**Solução**:
+```bash
+# Verificar status
+sudo systemctl status rag-gpu
+
+# Reiniciar
 sudo systemctl restart rag-gpu
+
+# Ver logs
+sudo journalctl -u rag-gpu -f
 ```
 
-### Custos
+### Problema: "CUDA out of memory"
 
-| Modo | Configuração | Preço/hora | Preço/mês (24/7) | Uso |
-|------|--------------|------------|------------------|-----|
-| **Teste** | g2-standard-4 + L4 (On-demand) | ~$0.70 | ~$504 | Desenvolvimento, testes |
-| **Produção** | g2-standard-4 + L4 (Spot) | ~$0.28 | ~$200 | Produção com auto-restart |
+**Causa**: GPU sem memória suficiente
 
-**Recomendação**:
-- **Testes**: Use On-demand (seção 3). VM fica rodando sem interrupções.
-- **Produção**: Use Spot (seção 4) + monitoramento para restart automático.
-
-## Desenvolvimento Local
-
-### Com GPU
-
+**Solução**:
 ```bash
-# Clonar
-git clone https://github.com/seu-usuario/rag-gpu-server.git
-cd rag-gpu-server
+# Verificar uso de memória
+nvidia-smi
 
-# Ambiente virtual
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Instalar dependências
-pip install -r requirements.txt
-
-# Rodar
-python -m uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+# Reiniciar vLLM com menos memória
+docker stop vllm
+docker run -d --gpus all --name vllm \
+  -p 8001:8000 \
+  vllm/vllm-openai:latest \
+  --model Qwen/Qwen3-8B-AWQ \
+  --max-model-len 8000 \
+  --gpu-memory-utilization 0.4
 ```
 
-### Com Docker
+### Problema: Latência alta nos embeddings
 
+**Causa**: Cold start dos modelos
+
+**Solução**:
 ```bash
-# Build
-docker build -t rag-gpu-server .
-
-# Run (com GPU)
-docker run --gpus all -p 8000:8000 rag-gpu-server
+# Warmup inicial
+curl -X POST http://34.44.157.159:8000/embed \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["warmup"], "return_dense": true}'
 ```
 
-## vLLM (Separado)
+### Problema: SSH timeout
 
-O vLLM roda como container separado:
+**Causa**: VM pode estar parada ou firewall
 
+**Solução**:
 ```bash
-docker run -d --gpus all \
-    --name vllm \
-    -p 8080:8000 \
-    -v ~/.cache/huggingface:/root/.cache/huggingface \
-    vllm/vllm-openai:latest \
-    --model Qwen/Qwen3-8B-AWQ \
-    --max-model-len 16000 \
-    --gpu-memory-utilization 0.5
+# Verificar se VM está rodando
+gcloud compute instances list --filter="name=vectorgov-gpu-test"
+
+# Iniciar se necessário
+gcloud compute instances start vectorgov-gpu-test --zone=us-central1-c
 ```
 
-## Modelos
+---
 
-| Modelo | Uso | VRAM |
-|--------|-----|------|
-| BAAI/bge-m3 | Embeddings (dense + sparse) | ~2GB |
-| BAAI/bge-reranker-v2-m3 | Reranking cross-encoder | ~2GB |
-| Qwen/Qwen3-8B-AWQ (vLLM) | Geração de texto | ~6GB |
-
-**Total VRAM**: ~10GB (cabe em T4 16GB ou L4 24GB)
-
-## Integração com VPS
-
-No arquivo `.env` da VPS:
-
-```bash
-GPU_SERVER_URL=http://<IP-DA-VM-GPU>:8000
-VLLM_BASE_URL=http://<IP-DA-VM-GPU>:8080/v1
-```
-
-## Custos Estimados
-
-| GPU | Preço/hora | Preço/mês (24/7) |
-|-----|------------|------------------|
-| NVIDIA T4 | ~$0.35 | ~$252 |
-| NVIDIA L4 | ~$0.70 | ~$504 |
-| NVIDIA A100 | ~$3.00 | ~$2,160 |
-
-**Recomendação**: Usar VM preemptível ($0.10/h com T4) + restart automático.
-
-## Estrutura do Repositório
+## Estrutura Completa do Repositório
 
 ```
 rag-gpu-server/
 ├── src/
 │   ├── __init__.py
-│   ├── config.py       # Configurações
-│   ├── embedder.py     # BGE-M3 wrapper
-│   ├── reranker.py     # BGE-Reranker wrapper
-│   └── main.py         # FastAPI app
+│   ├── config.py           # Configurações do servidor
+│   ├── embedder.py         # BGE-M3 wrapper (local)
+│   ├── reranker.py         # BGE-Reranker wrapper (local)
+│   └── main.py             # FastAPI app
 ├── scripts/
-│   ├── startup.sh      # Script de inicialização da VM
-│   ├── shutdown.sh     # Script de desligamento da VM
-│   └── warmup.py       # Pré-carrega modelos
-├── requirements.txt
-├── Dockerfile
+│   ├── startup.sh          # Script de inicialização da VM
+│   ├── shutdown.sh         # Script de desligamento
+│   └── warmup.py           # Pré-carrega modelos
+├── monitoring/
+│   ├── dashboard.py        # Streamlit dashboard
+│   └── requirements.txt    # Dependências do dashboard
+├── requirements.txt        # Dependências do servidor
+├── Dockerfile             # Container do GPU Server
+├── .env.example           # Exemplo de variáveis de ambiente
 ├── .gitignore
-└── README.md
+└── README.md              # Esta documentação
 ```
+
+---
+
+## Próximos Passos (TODO)
+
+- [ ] Configurar HTTPS com Let's Encrypt
+- [ ] Adicionar autenticação (API Key)
+- [ ] Implementar auto-scaling
+- [ ] Configurar alertas de monitoramento
+- [ ] Backup automático dos modelos
+- [ ] Documentar API com OpenAPI completo
+
+---
+
+## Histórico de Mudanças
+
+### 2024-01-01
+
+- Criado GPU Server e deployado no Google Cloud
+- Configurada VM g2-standard-4 com NVIDIA L4
+- Implementados endpoints /embed e /rerank
+- Configurado vLLM com Qwen3-8B-AWQ
+- Criados clientes remotos (RemoteEmbedder, RemoteReranker)
+- Configurada VPS para usar GPU remota
+- Criado dashboard de monitoramento Streamlit
+- Documentação completa
+
+---
 
 ## Licença
 
