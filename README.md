@@ -701,29 +701,134 @@ gcloud compute instances start vectorgov-gpu-test --zone=us-central1-c
 
 ---
 
-## Estrutura Completa do Repositório
+## Estrutura do Código (2 Repositórios)
+
+O projeto está dividido em **2 repositórios** que correspondem à separação da infraestrutura:
 
 ```
-rag-gpu-server/
-├── src/
-│   ├── __init__.py
-│   ├── config.py           # Configurações do servidor
-│   ├── embedder.py         # BGE-M3 wrapper (local)
-│   ├── reranker.py         # BGE-Reranker wrapper (local)
-│   └── main.py             # FastAPI app
-├── scripts/
-│   ├── startup.sh          # Script de inicialização da VM
-│   ├── shutdown.sh         # Script de desligamento
-│   └── warmup.py           # Pré-carrega modelos
-├── monitoring/
-│   ├── dashboard.py        # Streamlit dashboard
-│   └── requirements.txt    # Dependências do dashboard
-├── requirements.txt        # Dependências do servidor
-├── Dockerfile             # Container do GPU Server
-├── .env.example           # Exemplo de variáveis de ambiente
-├── .gitignore
-└── README.md              # Esta documentação
+┌─────────────────────────────────────────────────────────────────────┐
+│                    REPOSITÓRIO 1: rag-gpu-server                    │
+│                    (Este repositório)                               │
+│                                                                     │
+│   Função: Servidor de inferência GPU                                │
+│   Deploy: Google Cloud VM (34.44.157.159)                           │
+│   Caminho na VM: /srv/app/                                          │
+│                                                                     │
+│   rag-gpu-server/                                                   │
+│   ├── src/                                                          │
+│   │   ├── main.py           # FastAPI app                           │
+│   │   ├── embedder.py       # BGE-M3 wrapper                        │
+│   │   ├── reranker.py       # BGE-Reranker wrapper                  │
+│   │   └── config.py         # Configurações                         │
+│   ├── monitoring/                                                   │
+│   │   └── dashboard.py      # Dashboard Streamlit (roda local)      │
+│   ├── scripts/                                                      │
+│   │   └── warmup.py         # Pré-carrega modelos                   │
+│   └── requirements.txt                                              │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    REPOSITÓRIO 2: vector_govi_2/extracao            │
+│                    (Repositório principal)                          │
+│                                                                     │
+│   Função: API RAG + Pipeline de Extração                            │
+│   Deploy: VPS Hostinger (77.37.43.160)                              │
+│   Caminho na VPS: /opt/rag-api/                                     │
+│                                                                     │
+│   extracao/                                                         │
+│   ├── src/api/              # FastAPI endpoints (/ask, /search)     │
+│   ├── src/rag/              # Answer Generator + Citações           │
+│   ├── src/search/           # Busca híbrida no Milvus               │
+│   ├── src/remote/           # Clientes remotos (→ GPU Server)       │
+│   ├── src/cache/            # Cache semântico                       │
+│   ├── src/parsing/          # SpanParser, Docling                   │
+│   ├── src/chunking/         # ChunkMaterializer                     │
+│   ├── src/enrichment/       # Enriquecimento LLM                    │
+│   └── src/dashboard/        # Dashboard Streamlit (local)           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Por que 2 repositórios?**
+
+| Aspecto | rag-gpu-server | extracao |
+|---------|----------------|----------|
+| **Hardware** | GPU (L4 24GB) | CPU only |
+| **Dependências** | FlagEmbedding, PyTorch CUDA | Requests, Milvus client |
+| **Tamanho** | ~10GB (modelos) | ~500MB |
+| **Escala** | Vertical (GPU maior) | Horizontal (mais workers) |
+| **Custo** | $0.70/hora | $20/mês fixo |
+
+---
+
+## Configuração Manual na VM (Não está no Git)
+
+As seguintes configurações foram feitas **manualmente** na VM e não estão versionadas:
+
+### 1. Container vLLM (Docker)
+
+```bash
+# Baixar imagem vLLM
+docker pull vllm/vllm-openai:latest
+
+# Criar container (modelo baixa automaticamente ~5.7GB)
+docker run -d \
+    --gpus all \
+    --name vllm \
+    -p 8001:8000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --restart unless-stopped \
+    vllm/vllm-openai:latest \
+    --model Qwen/Qwen3-8B-AWQ \
+    --max-model-len 16000 \
+    --gpu-memory-utilization 0.5 \
+    --dtype auto \
+    --trust-remote-code
+```
+
+### 2. Serviço Systemd (rag-gpu.service)
+
+```bash
+# /etc/systemd/system/rag-gpu.service
+[Unit]
+Description=RAG GPU Server - Embeddings & Reranking
+After=network.target
+
+[Service]
+Type=simple
+User=ragapp
+Group=ragapp
+WorkingDirectory=/srv/app
+EnvironmentFile=/etc/default/rag-gpu
+Environment="PATH=/srv/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/srv/app/.venv/bin/python -m uvicorn src.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 3. Usuário e Diretórios
+
+```bash
+# Criar usuário
+sudo useradd -r -s /bin/bash -m -d /srv/app ragapp
+
+# Clonar repositório
+sudo -u ragapp git clone <repo> /srv/app
+
+# Criar venv e instalar
+sudo -u ragapp python3 -m venv /srv/app/.venv
+sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
+```
+
+### 4. Modelos Baixados Automaticamente
+
+| Modelo | Tamanho | Local |
+|--------|---------|-------|
+| BAAI/bge-m3 | ~2GB | ~/.cache/huggingface (GPU Server) |
+| BAAI/bge-reranker-v2-m3 | ~2GB | ~/.cache/huggingface (GPU Server) |
+| Qwen/Qwen3-8B-AWQ | ~5.7GB | ~/.cache/huggingface (vLLM container) |
 
 ---
 
