@@ -29,12 +29,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Configurações
-VM_IP = "34.69.48.45"  # GPU Server (Google Cloud)
-VPS_IP = "77.37.43.160"  # VPS (Hostinger) - RAG API + Milvus
-SSH_USER = "abimaeltorcate"
-SSH_KEY = "~/.ssh/google_compute_engine"
-VPS_SSH_KEY = "~/.ssh/id_rsa"  # Chave SSH para VPS
+# Configurações centralizadas (importadas de config.py)
+from config import (
+    VM_IP, VPS_IP, SSH_USER, SSH_KEY, VPS_SSH_KEY,
+    GPU_SERVER_URL, VLLM_BASE_URL
+)
 
 
 @dataclass
@@ -219,8 +218,8 @@ def start_enrichment() -> tuple[bool, str]:
     # Reinicia Celery
     run_vps_command('systemctl restart rag-celery')
 
-    # Dispara enriquecimento via script
-    success, output = run_vps_command('''
+    # Dispara enriquecimento via script (usa URLs do config.py)
+    success, output = run_vps_command(f'''
 cd /opt/rag-api && source venv/bin/activate && PYTHONPATH=/opt/rag-api python3 << 'EOF'
 import os
 import sys
@@ -229,8 +228,8 @@ import uuid
 sys.path.insert(0, "/opt/rag-api")
 os.environ["MILVUS_HOST"] = "127.0.0.1"
 os.environ["REDIS_HOST"] = "127.0.0.1"
-os.environ["GPU_SERVER_URL"] = "http://34.69.48.45:8000"
-os.environ["VLLM_BASE_URL"] = "http://34.69.48.45:8001/v1"
+os.environ["GPU_SERVER_URL"] = "{GPU_SERVER_URL}"
+os.environ["VLLM_BASE_URL"] = "{VLLM_BASE_URL}"
 
 import redis
 from pymilvus import connections, Collection
