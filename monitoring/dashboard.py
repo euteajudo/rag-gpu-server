@@ -306,54 +306,40 @@ EOF
     return False, output
 
 
-def collect_metrics() -> Optional[VMMetrics]:
-    """Coleta todas as métricas da VM."""
+def ensure_metrics_script() -> bool:
+    """Garante que o script de coleta existe na VM."""
+    check_cmd = "test -f /tmp/collect_metrics.py && echo EXISTS"
+    success, output = run_ssh_command(check_cmd, timeout=5)
+    if success and "EXISTS" in output:
+        return True
 
-    # Script para coletar métricas
-    collect_script = '''
-python3 << 'PYEOF'
-import json
+    # Script não existe, cria
+    script_content = '''import json
 import subprocess
 import os
 
 metrics = {}
 
-# CPU
 try:
-    with open('/proc/stat', 'r') as f:
-        cpu_line = f.readline()
-        cpu_times = list(map(int, cpu_line.split()[1:]))
-        idle = cpu_times[3]
-        total = sum(cpu_times)
-
-    # Load average
     with open('/proc/loadavg', 'r') as f:
         loads = f.read().split()
         metrics['load_1min'] = float(loads[0])
         metrics['load_5min'] = float(loads[1])
         metrics['load_15min'] = float(loads[2])
-
-    # CPU count
     metrics['cpu_count'] = os.cpu_count()
-
-    # CPU percent (aproximado do load)
     metrics['cpu_percent'] = min(100, (metrics['load_1min'] / metrics['cpu_count']) * 100)
 except Exception as e:
     metrics['cpu_error'] = str(e)
 
-# Memória
 try:
     with open('/proc/meminfo', 'r') as f:
         meminfo = {}
         for line in f:
             parts = line.split()
             meminfo[parts[0].rstrip(':')] = int(parts[1])
-
-    mem_total = meminfo['MemTotal'] / 1024 / 1024  # GB
-    mem_free = meminfo['MemFree'] / 1024 / 1024
+    mem_total = meminfo['MemTotal'] / 1024 / 1024
     mem_available = meminfo.get('MemAvailable', meminfo['MemFree']) / 1024 / 1024
     mem_used = mem_total - mem_available
-
     metrics['mem_total_gb'] = round(mem_total, 2)
     metrics['mem_used_gb'] = round(mem_used, 2)
     metrics['mem_free_gb'] = round(mem_available, 2)
@@ -361,13 +347,8 @@ try:
 except Exception as e:
     metrics['mem_error'] = str(e)
 
-# GPU (nvidia-smi)
 try:
-    result = subprocess.run(
-        ['nvidia-smi', '--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit',
-         '--format=csv,noheader,nounits'],
-        capture_output=True, text=True
-    )
+    result = subprocess.run(['nvidia-smi', '--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit', '--format=csv,noheader,nounits'], capture_output=True, text=True)
     if result.returncode == 0:
         parts = result.stdout.strip().split(', ')
         metrics['gpu_name'] = parts[0]
@@ -378,18 +359,14 @@ try:
         metrics['gpu_mem_percent'] = round((float(parts[3]) / float(parts[4])) * 100, 1)
         metrics['gpu_power_draw'] = float(parts[5])
         metrics['gpu_power_limit'] = float(parts[6])
-    else:
-        metrics['gpu_error'] = result.stderr
 except Exception as e:
     metrics['gpu_error'] = str(e)
 
-# Disco
 try:
     statvfs = os.statvfs('/')
     disk_total = (statvfs.f_frsize * statvfs.f_blocks) / 1024 / 1024 / 1024
     disk_free = (statvfs.f_frsize * statvfs.f_bavail) / 1024 / 1024 / 1024
     disk_used = disk_total - disk_free
-
     metrics['disk_total_gb'] = round(disk_total, 2)
     metrics['disk_used_gb'] = round(disk_used, 2)
     metrics['disk_free_gb'] = round(disk_free, 2)
@@ -397,23 +374,16 @@ try:
 except Exception as e:
     metrics['disk_error'] = str(e)
 
-# I/O
 try:
     with open('/proc/diskstats', 'r') as f:
-        io_read = 0
-        io_write = 0
-        io_read_count = 0
-        io_write_count = 0
+        io_read = io_write = io_read_count = io_write_count = 0
         for line in f:
             parts = line.split()
             if len(parts) >= 14:
-                # Soma todos os discos
                 io_read_count += int(parts[3])
                 io_read += int(parts[5])
                 io_write_count += int(parts[7])
                 io_write += int(parts[9])
-
-    # Converte setores para MB (assumindo 512 bytes por setor)
     metrics['io_read_mb'] = round((io_read * 512) / 1024 / 1024, 2)
     metrics['io_write_mb'] = round((io_write * 512) / 1024 / 1024, 2)
     metrics['io_read_count'] = io_read_count
@@ -421,39 +391,45 @@ try:
 except Exception as e:
     metrics['io_error'] = str(e)
 
-# Rede
 try:
     with open('/proc/net/dev', 'r') as f:
-        lines = f.readlines()[2:]  # Skip headers
-        recv_bytes = 0
-        sent_bytes = 0
+        lines = f.readlines()[2:]
+        recv_bytes = sent_bytes = 0
         for line in lines:
             parts = line.split()
             if len(parts) >= 10:
                 recv_bytes += int(parts[1])
                 sent_bytes += int(parts[9])
-
     metrics['net_recv_mb'] = round(recv_bytes / 1024 / 1024, 2)
     metrics['net_sent_mb'] = round(sent_bytes / 1024 / 1024, 2)
 except Exception as e:
     metrics['net_error'] = str(e)
 
-# Status dos serviços
 try:
-    # vLLM (porta 8001)
     result = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True)
     metrics['vllm_status'] = 'running' if ':8001' in result.stdout else 'stopped'
-
-    # GPU Server (porta 8000)
     metrics['gpu_server_status'] = 'running' if ':8000' in result.stdout else 'stopped'
 except Exception as e:
     metrics['service_error'] = str(e)
 
 print(json.dumps(metrics))
-PYEOF
 '''
+    # Escapa aspas simples para bash
+    escaped = script_content.replace("'", "'\\''")
+    create_cmd = f"echo '{escaped}' > /tmp/collect_metrics.py"
+    success, _ = run_ssh_command(create_cmd, timeout=10)
+    return success
 
-    success, output = run_ssh_command(collect_script, timeout=15)
+
+def collect_metrics() -> Optional[VMMetrics]:
+    """Coleta todas as métricas da VM."""
+    # Garante que o script existe
+    if not ensure_metrics_script():
+        st.error("Erro ao criar script de métricas na VM")
+        return None
+
+    # Executa o script
+    success, output = run_ssh_command("python3 /tmp/collect_metrics.py", timeout=15)
 
     if not success:
         st.error(f"Erro ao coletar métricas: {output}")
