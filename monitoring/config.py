@@ -19,7 +19,7 @@ ZONE = os.getenv("GPU_VM_ZONE", "us-east1-b")
 PROJECT = os.getenv("GPU_VM_PROJECT", "gen-lang-client-0386547606")
 
 # SSH
-SSH_USER = os.getenv("GPU_SSH_USER", "abimaeltorcate")
+SSH_USER = os.getenv("GPU_SSH_USER", "abimael")
 SSH_KEY = os.getenv("GPU_SSH_KEY", "~/.ssh/google_compute_engine")
 
 # ============================================
