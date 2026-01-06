@@ -80,7 +80,9 @@ class VMMetrics:
 
 def run_ssh_command(command: str, timeout: int = 10) -> tuple[bool, str]:
     """Executa comando via SSH na VM GPU."""
-    ssh_cmd = f'ssh -i {SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 {SSH_USER}@{VM_IP} "{command}"'
+    # -T: desabilita pseudo-terminal (evita MOTD)
+    # -o LogLevel=ERROR: suprime mensagens de aviso
+    ssh_cmd = f'ssh -T -i {SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o LogLevel=ERROR {SSH_USER}@{VM_IP} "{command}"'
     try:
         result = subprocess.run(
             ssh_cmd,
