@@ -31,8 +31,8 @@ st.set_page_config(
 
 # Configurações centralizadas (importadas de config.py)
 from config import (
-    VM_IP, VPS_IP, SSH_USER, SSH_KEY, VPS_SSH_KEY,
-    GPU_SERVER_URL, VLLM_BASE_URL
+    VM_IP, VPS_IP, SSH_USER, SSH_KEY, SSH_PORT, VPS_SSH_KEY,
+    GPU_SERVER_URL, VLLM_BASE_URL, VM_NAME, GPU_PROVIDER
 )
 
 
@@ -82,7 +82,9 @@ def run_ssh_command(command: str, timeout: int = 10) -> tuple[bool, str]:
     """Executa comando via SSH na VM GPU."""
     # -T: desabilita pseudo-terminal (evita MOTD)
     # -o LogLevel=ERROR: suprime mensagens de aviso
-    ssh_cmd = f'ssh -T -i {SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o LogLevel=ERROR {SSH_USER}@{VM_IP} "{command}"'
+    # -p: porta SSH (diferente para RunPod)
+    port_arg = f"-p {SSH_PORT}" if SSH_PORT != 22 else ""
+    ssh_cmd = f'ssh -T {port_arg} -i {SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o LogLevel=ERROR {SSH_USER}@{VM_IP} "{command}"'
     try:
         result = subprocess.run(
             ssh_cmd,
@@ -600,7 +602,8 @@ def render_enrichment_tab():
 
 def main():
     st.title("🖥️ VectorGov Infrastructure Monitor")
-    st.markdown(f"**GPU VM:** `{VM_IP}` | **VPS:** `{VPS_IP}` | **Atualização:** {datetime.now().strftime('%H:%M:%S')}")
+    provider_badge = "🟢 RunPod" if GPU_PROVIDER == "runpod" else "🔵 Google Cloud"
+    st.markdown(f"**{provider_badge}** | **GPU:** `{VM_NAME}` ({VM_IP}) | **VPS:** `{VPS_IP}` | **Atualização:** {datetime.now().strftime('%H:%M:%S')}")
 
     # Sidebar
     with st.sidebar:
@@ -617,7 +620,8 @@ def main():
         st.divider()
 
         st.markdown("### 📡 Conexões")
-        st.code(f"# GPU Server\nssh {SSH_USER}@{VM_IP}")
+        port_str = f" -p {SSH_PORT}" if SSH_PORT != 22 else ""
+        st.code(f"# GPU Server ({GPU_PROVIDER})\nssh{port_str} {SSH_USER}@{VM_IP}")
         st.code(f"# VPS\nssh root@{VPS_IP}")
 
     # Tabs principais
