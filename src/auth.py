@@ -1,12 +1,16 @@
 """
 Middleware de autenticacao para GPU Server.
 Protege endpoints com API Key.
+
+IMPORTANTE: Em BaseHTTPMiddleware, HTTPException nao funciona corretamente.
+Usamos JSONResponse diretamente para retornar erros de autenticacao.
 """
 
 import os
 import logging
-from fastapi import Request, HTTPException
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +50,18 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
             logger.warning(
                 f"Request sem API key: {path} from {request.client.host if request.client else 'unknown'}"
             )
-            raise HTTPException(
+            return JSONResponse(
                 status_code=401,
-                detail=f"Missing {API_KEY_HEADER} header",
+                content={"detail": f"Missing {API_KEY_HEADER} header"},
             )
 
         if api_key not in VALID_API_KEYS:
             logger.warning(
                 f"API key invalida: {api_key[:12]}... from {request.client.host if request.client else 'unknown'}"
             )
-            raise HTTPException(
+            return JSONResponse(
                 status_code=403,
-                detail="Invalid API key",
+                content={"detail": "Invalid API key"},
             )
 
         # Key valida - processa request
