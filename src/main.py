@@ -42,6 +42,7 @@ from .batch_collector import (
     create_embed_batch_processor,
     create_rerank_batch_processor,
 )
+from .auth import APIKeyAuthMiddleware
 
 # Logging
 logging.basicConfig(
@@ -200,14 +201,29 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# =============================================================================
+# MIDDLEWARE (ordem importa: primeiro adicionado = ultimo executado)
+# =============================================================================
+
+# 1. CORS - Restrito apenas para dominios vectorgov.io e VPS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://vectorgov.io",
+        "https://www.vectorgov.io",
+        "http://77.37.43.160",       # VPS Hostinger
+        "http://localhost:3000",      # Dev local
+        "http://127.0.0.1:3000",      # Dev local
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# 2. Autenticacao por API Key
+app.add_middleware(APIKeyAuthMiddleware)
+
+logger.info("Middleware de seguranca ativado: CORS restrito + API Key auth")
 
 
 # =============================================================================
