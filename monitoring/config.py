@@ -18,11 +18,11 @@ GPU_PROVIDER = os.getenv("GPU_PROVIDER", "runpod")
 # ============================================
 # RunPod - GPU A40 46GB (ATIVO)
 # ============================================
-RUNPOD_IP = os.getenv("RUNPOD_IP", "194.68.245.138")
-RUNPOD_SSH_PORT = int(os.getenv("RUNPOD_SSH_PORT", "22181"))
+RUNPOD_IP = os.getenv("RUNPOD_IP", "69.30.85.101")
+RUNPOD_SSH_PORT = int(os.getenv("RUNPOD_SSH_PORT", "22075"))
 RUNPOD_SSH_USER = os.getenv("RUNPOD_SSH_USER", "root")
 RUNPOD_SSH_KEY = os.getenv("RUNPOD_SSH_KEY", "~/.ssh/id_ed25519")
-RUNPOD_POD_ID = os.getenv("RUNPOD_POD_ID", "wbfsmrch8rtgc8-644111ef")
+RUNPOD_POD_ID = os.getenv("RUNPOD_POD_ID", "85ylutufrraa2n-64411396")
 
 # ============================================
 # Google Cloud - VM GPU (backup/inativo)

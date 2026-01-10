@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from .config import config
 from .embedder import get_embedder
 from .reranker import get_reranker
+from .ingestion.pipeline import get_pipeline
 from .batch_collector import (
     BatchCollector,
     EmbedBatchItem,
@@ -43,6 +44,7 @@ from .batch_collector import (
     create_rerank_batch_processor,
 )
 from .auth import APIKeyAuthMiddleware
+from .ingestion.router import router as ingestion_router
 
 # Logging
 logging.basicConfig(
@@ -123,6 +125,7 @@ class HealthResponse(BaseModel):
     status: str
     embedder: dict
     reranker: dict
+    docling: dict
     uptime_seconds: float
 
 
@@ -154,6 +157,15 @@ async def lifespan(app: FastAPI):
     logger.info("Pré-carregando reranker...")
     reranker = get_reranker()
     reranker._ensure_loaded()
+
+    # Pré-carrega Docling (modelos de layout e table structure na GPU)
+    logger.info("Pré-carregando Docling...")
+    try:
+        pipeline = get_pipeline()
+        docling_warmup = pipeline.warmup()
+        logger.info(f"Docling warmup: {docling_warmup}")
+    except Exception as e:
+        logger.warning(f"Docling warmup falhou (continuando sem pré-carga): {e}")
 
     logger.info("=== Modelos carregados! ===")
 
@@ -224,6 +236,9 @@ app.add_middleware(
 app.add_middleware(APIKeyAuthMiddleware)
 
 logger.info("Middleware de seguranca ativado: CORS restrito + API Key auth")
+
+# Router de ingestao
+app.include_router(ingestion_router)
 
 
 # =============================================================================
@@ -308,20 +323,29 @@ async def health():
     """Health check completo com status dos modelos."""
     embedder = get_embedder()
     reranker = get_reranker()
+    pipeline = get_pipeline()
 
     embedder_health = embedder.health_check()
     reranker_health = reranker.health_check()
+
+    # Docling health
+    docling_health = {
+        "status": "online" if pipeline.is_warmed_up() else "cold",
+        "warmed_up": pipeline.is_warmed_up(),
+    }
 
     # Status geral
     all_online = (
         embedder_health.get("status") == "online"
         and reranker_health.get("status") == "online"
+        and docling_health.get("status") == "online"
     )
 
     return HealthResponse(
         status="healthy" if all_online else "degraded",
         embedder=embedder_health,
         reranker=reranker_health,
+        docling=docling_health,
         uptime_seconds=round(time.time() - _start_time, 2),
     )
 
