@@ -42,6 +42,7 @@ from .batch_collector import (
     create_embed_batch_processor,
     create_rerank_batch_processor,
 )
+from .ingestion import ingestion_router
 
 # Logging
 logging.basicConfig(
@@ -208,6 +209,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Routers
+app.include_router(ingestion_router)
 
 
 # =============================================================================
