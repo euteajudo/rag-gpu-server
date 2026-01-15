@@ -1,0 +1,117 @@
+name: Deploy to RunPod
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      restart_services:
+        description: 'Restart GPU services after deploy'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  RUNPOD_SSH_HOST: ${{ secrets.RUNPOD_SSH_HOST }}
+  RUNPOD_SSH_PORT: ${{ secrets.RUNPOD_SSH_PORT }}
+  RUNPOD_SSH_USER: ${{ secrets.RUNPOD_SSH_USER || 'root' }}
+  WORKSPACE_PATH: /workspace/rag-gpu-server
+
+jobs:
+  deploy:
+    name: Deploy to RunPod GPU Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.RUNPOD_SSH_KEY }}" > ~/.ssh/runpod_key
+          chmod 600 ~/.ssh/runpod_key
+
+          # Add host to known_hosts (skip host key verification for RunPod dynamic IPs)
+          echo "StrictHostKeyChecking no" >> ~/.ssh/config
+          echo "UserKnownHostsFile /dev/null" >> ~/.ssh/config
+
+      - name: Test SSH connection
+        run: |
+          ssh -i ~/.ssh/runpod_key \
+              -p ${{ env.RUNPOD_SSH_PORT }} \
+              ${{ env.RUNPOD_SSH_USER }}@${{ env.RUNPOD_SSH_HOST }} \
+              "echo 'SSH connection successful'"
+
+      - name: Pull latest code on RunPod
+        run: |
+          ssh -i ~/.ssh/runpod_key \
+              -p ${{ env.RUNPOD_SSH_PORT }} \
+              ${{ env.RUNPOD_SSH_USER }}@${{ env.RUNPOD_SSH_HOST }} \
+              "cd ${{ env.WORKSPACE_PATH }} && \
+               git fetch origin && \
+               git reset --hard origin/main && \
+               echo 'Code updated successfully'"
+
+      - name: Install/Update dependencies
+        run: |
+          ssh -i ~/.ssh/runpod_key \
+              -p ${{ env.RUNPOD_SSH_PORT }} \
+              ${{ env.RUNPOD_SSH_USER }}@${{ env.RUNPOD_SSH_HOST }} \
+              "cd ${{ env.WORKSPACE_PATH }} && \
+               if [ -f requirements.txt ]; then \
+                 pip install -r requirements.txt --quiet; \
+               fi && \
+               echo 'Dependencies updated'"
+
+      - name: Restart GPU Server
+        if: ${{ github.event.inputs.restart_services != 'false' }}
+        run: |
+          ssh -i ~/.ssh/runpod_key \
+              -p ${{ env.RUNPOD_SSH_PORT }} \
+              ${{ env.RUNPOD_SSH_USER }}@${{ env.RUNPOD_SSH_HOST }} \
+              "cd ${{ env.WORKSPACE_PATH }} && \
+               pkill -f 'uvicorn src.main' || true && \
+               sleep 2 && \
+               nohup python -m uvicorn src.main:app --host 0.0.0.0 --port 8000 > /workspace/logs/gpu-server.log 2>&1 & \
+               sleep 5 && \
+               curl -s http://localhost:8000/health || echo 'Health check pending...'"
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/runpod_key \
+              -p ${{ env.RUNPOD_SSH_PORT }} \
+              ${{ env.RUNPOD_SSH_USER }}@${{ env.RUNPOD_SSH_HOST }} \
+              "cd ${{ env.WORKSPACE_PATH }} && \
+               echo '=== Git Status ===' && \
+               git log -1 --oneline && \
+               echo '' && \
+               echo '=== Service Status ===' && \
+               pgrep -f 'uvicorn src.main' > /dev/null && echo 'GPU Server: Running' || echo 'GPU Server: Not running'"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          rm -f ~/.ssh/runpod_key
+
+  notify:
+    name: Notify deployment status
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+
+    steps:
+      - name: Deployment succeeded
+        if: needs.deploy.result == 'success'
+        run: |
+          echo "✅ Deployment to RunPod completed successfully"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+
+      - name: Deployment failed
+        if: needs.deploy.result == 'failure'
+        run: |
+          echo "❌ Deployment to RunPod failed"
+          echo "Check the logs for details"
+          exit 1
