@@ -3,10 +3,12 @@ Pipeline de Ingestao de PDFs com GPU.
 
 Pipeline completo:
 1. Docling (PDF -> Markdown) - GPU accelerated
-2. SpanParser (Markdown -> Spans)
-3. ArticleOrchestrator (LLM extraction)
-4. ChunkMaterializer (parent-child chunks)
-5. Embeddings (BGE-M3)
+2. Validacao de Qualidade (detecta texto corrompido)
+3. OCR Fallback (se qualidade baixa)
+4. SpanParser (Markdown -> Spans)
+5. ArticleOrchestrator (LLM extraction)
+6. ChunkMaterializer (parent-child chunks)
+7. Embeddings (BGE-M3)
 
 Retorna chunks prontos para indexacao (VPS faz o insert no Milvus).
 """
@@ -19,8 +21,17 @@ import tempfile
 from typing import Optional, List
 from datetime import datetime
 from dataclasses import dataclass, field
+from enum import Enum
 
 from .models import IngestRequest, ProcessedChunk, IngestStatus, IngestError
+from .quality_validator import QualityValidator
+
+
+class ExtractionMethod(str, Enum):
+    """Metodo usado para extrair o texto do PDF."""
+    NATIVE_TEXT = "native_text"  # Texto nativo do PDF
+    OCR_EASYOCR = "ocr_easyocr"  # OCR com EasyOCR
+    OCR_TESSERACT = "ocr_tesseract"  # OCR com Tesseract
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +47,11 @@ class PipelineResult:
     total_time_seconds: float = 0.0
     markdown_content: str = ""
     document_hash: str = ""
+    # Novas métricas de qualidade
+    extraction_method: ExtractionMethod = ExtractionMethod.NATIVE_TEXT
+    quality_score: float = 0.0
+    quality_issues: List[str] = field(default_factory=list)
+    ocr_fallback_used: bool = False
 
 
 class IngestionPipeline:
@@ -43,41 +59,83 @@ class IngestionPipeline:
 
     def __init__(self):
         self._docling_converter = None
+        self._docling_converter_ocr = None  # Converter com OCR para fallback
         self._span_parser = None
         self._llm_client = None
         self._orchestrator = None
         self._embedder = None
+        self._quality_validator = QualityValidator(
+            min_readable_ratio=0.7,
+            min_article_count=1,
+            min_word_ratio=0.3,
+        )
+
+    def _create_docling_converter(self, enable_ocr: bool = False):
+        """
+        Cria um DocumentConverter do Docling.
+
+        Args:
+            enable_ocr: Se True, habilita OCR para PDFs com texto corrompido
+
+        Referência: https://docling-project.github.io/docling/examples/full_page_ocr/
+        """
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
+
+        # Configuração GPU otimizada
+        # Nota: Algumas versões do Docling podem requerer ocr_options no construtor
+        try:
+            pipeline_options = PdfPipelineOptions()
+        except TypeError:
+            # Fallback para versões que requerem ocr_options
+            pipeline_options = PdfPipelineOptions(ocr_options=EasyOcrOptions())
+
+        # Tenta configurar aceleração GPU (pode não estar disponível em todas versões)
+        try:
+            from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+            pipeline_options.accelerator_options = AcceleratorOptions(
+                device=AcceleratorDevice.CUDA
+            )
+        except (ImportError, AttributeError) as e:
+            logger.warning(f"Aceleração GPU não disponível: {e}")
+
+        if enable_ocr:
+            # OCR habilitado para PDFs com texto corrompido
+            # IMPORTANTE: force_full_page_ocr deve ser passado para EasyOcrOptions
+            pipeline_options.do_ocr = True
+            pipeline_options.ocr_options = EasyOcrOptions(
+                force_full_page_ocr=True,  # Ignora camada de texto, força OCR
+                use_gpu=True,
+                lang=["pt", "en"],  # Português e inglês
+            )
+            logger.info("Docling converter criado com OCR (force_full_page_ocr=True)")
+        else:
+            # Extração de texto nativo (rápido)
+            pipeline_options.do_ocr = False
+            logger.info("Docling converter criado sem OCR (texto nativo)")
+
+        return DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=pipeline_options,
+                )
+            }
+        )
 
     @property
     def docling_converter(self):
+        """Converter padrão (sem OCR) - para PDFs com texto nativo."""
         if self._docling_converter is None:
-            from docling.document_converter import DocumentConverter, PdfFormatOption
-            from docling.datamodel.base_models import InputFormat
-            from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions
-            from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-            from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
-
-            # Configuração GPU otimizada (padrão oficial da documentação)
-            pipeline_options = ThreadedPdfPipelineOptions(
-                accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
-                layout_batch_size=64,  # Batch grande para GPU
-                table_batch_size=4,
-                ocr_batch_size=4,
-            )
-            # OCR desabilitado por padrão (PDFs de leis geralmente são texto nativo)
-            # Se necessário, habilitar com: pipeline_options.do_ocr = True
-            pipeline_options.do_ocr = False
-
-            self._docling_converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(
-                        pipeline_cls=ThreadedStandardPdfPipeline,
-                        pipeline_options=pipeline_options,
-                    )
-                }
-            )
-            logger.info(f"Docling converter inicializado com GPU (ThreadedStandardPdfPipeline)")
+            self._docling_converter = self._create_docling_converter(enable_ocr=False)
         return self._docling_converter
+
+    @property
+    def docling_converter_ocr(self):
+        """Converter com OCR - para PDFs com texto corrompido."""
+        if self._docling_converter_ocr is None:
+            self._docling_converter_ocr = self._create_docling_converter(enable_ocr=True)
+        return self._docling_converter_ocr
 
     @property
     def span_parser(self):
@@ -252,21 +310,129 @@ class IngestionPipeline:
         return result
 
     def _phase_docling(self, pdf_path: str, result: PipelineResult) -> PipelineResult:
-        """Fase 1: Docling - PDF -> Markdown"""
+        """
+        Fase 1: Docling - PDF -> Markdown
+
+        Pipeline robusto:
+        1. Tenta extração de texto nativo (rápido)
+        2. Valida qualidade do texto extraído
+        3. Se qualidade baixa, faz fallback para OCR
+        4. Valida novamente após OCR
+        """
         phase_start = time.perf_counter()
+
         try:
-            logger.info("Fase 1: Docling iniciando...")
+            # === TENTATIVA 1: Texto Nativo ===
+            logger.info("Fase 1.1: Docling iniciando (texto nativo)...")
             doc_result = self.docling_converter.convert(pdf_path)
-            result.markdown_content = doc_result.document.export_to_markdown()
+            markdown_content = doc_result.document.export_to_markdown()
+
+            # Valida qualidade do texto extraído
+            quality_report = self._quality_validator.validate(markdown_content)
+            logger.info(
+                f"Fase 1.2: Qualidade do texto nativo: score={quality_report.score:.2f}, "
+                f"readable={quality_report.readable_ratio:.1%}, "
+                f"articles={quality_report.article_count}"
+            )
+
+            if quality_report.is_valid:
+                # Texto nativo OK - continua pipeline
+                result.markdown_content = markdown_content
+                result.extraction_method = ExtractionMethod.NATIVE_TEXT
+                result.quality_score = quality_report.score
+                result.quality_issues = quality_report.issues
+
+                duration = round(time.perf_counter() - phase_start, 2)
+                result.phases.append({
+                    "name": "docling",
+                    "duration_seconds": duration,
+                    "output": f"Extraido {len(markdown_content)} caracteres (texto nativo)",
+                    "quality_score": quality_report.score,
+                    "method": "native_text",
+                    "success": True,
+                })
+                logger.info(f"Fase 1: Docling concluida em {duration}s (texto nativo OK)")
+                return result
+
+            # === TENTATIVA 2: OCR Fallback ===
+            logger.warning(
+                f"Fase 1.3: Qualidade baixa ({quality_report.score:.2f}), "
+                f"issues: {quality_report.issues}. Tentando OCR..."
+            )
+
+            ocr_start = time.perf_counter()
+            doc_result_ocr = self.docling_converter_ocr.convert(pdf_path)
+            markdown_content_ocr = doc_result_ocr.document.export_to_markdown()
+            ocr_duration = round(time.perf_counter() - ocr_start, 2)
+
+            # Valida qualidade do OCR
+            quality_report_ocr = self._quality_validator.validate(markdown_content_ocr)
+            logger.info(
+                f"Fase 1.4: Qualidade após OCR: score={quality_report_ocr.score:.2f}, "
+                f"readable={quality_report_ocr.readable_ratio:.1%}, "
+                f"articles={quality_report_ocr.article_count} (tempo: {ocr_duration}s)"
+            )
+
+            if quality_report_ocr.is_valid:
+                # OCR OK - continua pipeline
+                result.markdown_content = markdown_content_ocr
+                result.extraction_method = ExtractionMethod.OCR_EASYOCR
+                result.quality_score = quality_report_ocr.score
+                result.quality_issues = quality_report_ocr.issues
+                result.ocr_fallback_used = True
+
+                duration = round(time.perf_counter() - phase_start, 2)
+                result.phases.append({
+                    "name": "docling",
+                    "duration_seconds": duration,
+                    "output": f"Extraido {len(markdown_content_ocr)} caracteres (OCR)",
+                    "quality_score": quality_report_ocr.score,
+                    "method": "ocr_easyocr",
+                    "ocr_duration_seconds": ocr_duration,
+                    "success": True,
+                })
+                logger.info(f"Fase 1: Docling concluida em {duration}s (OCR fallback)")
+                return result
+
+            # === FALHA: Nem texto nativo nem OCR funcionaram ===
+            logger.error(
+                f"Fase 1.5: FALHA - Texto nativo e OCR falharam. "
+                f"Score texto nativo: {quality_report.score:.2f}, "
+                f"Score OCR: {quality_report_ocr.score:.2f}"
+            )
+
+            # Usa o melhor dos dois (mesmo que ruim)
+            if quality_report_ocr.score > quality_report.score:
+                result.markdown_content = markdown_content_ocr
+                result.extraction_method = ExtractionMethod.OCR_EASYOCR
+                result.quality_score = quality_report_ocr.score
+                result.quality_issues = quality_report_ocr.issues
+                result.ocr_fallback_used = True
+            else:
+                result.markdown_content = markdown_content
+                result.extraction_method = ExtractionMethod.NATIVE_TEXT
+                result.quality_score = quality_report.score
+                result.quality_issues = quality_report.issues
 
             duration = round(time.perf_counter() - phase_start, 2)
             result.phases.append({
                 "name": "docling",
                 "duration_seconds": duration,
-                "output": f"Extraido {len(result.markdown_content)} caracteres",
-                "success": True,
+                "output": f"Extraido {len(result.markdown_content)} caracteres (QUALIDADE BAIXA)",
+                "quality_score": result.quality_score,
+                "method": result.extraction_method.value,
+                "success": True,  # Sucesso técnico, mas qualidade baixa
+                "warning": "Qualidade abaixo do esperado - documento pode ter problemas",
             })
-            logger.info(f"Fase 1: Docling concluida em {duration}s")
+
+            # Adiciona aviso nos erros
+            result.errors.append(IngestError(
+                phase="docling",
+                message=f"Qualidade de extração baixa ({result.quality_score:.2f}). "
+                        f"Issues: {', '.join(result.quality_issues[:3])}",
+            ))
+
+            logger.warning(f"Fase 1: Docling concluida em {duration}s (QUALIDADE BAIXA)")
 
         except Exception as e:
             logger.error(f"Erro no Docling: {e}", exc_info=True)
