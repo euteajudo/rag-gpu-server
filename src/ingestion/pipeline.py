@@ -70,12 +70,13 @@ class IngestionPipeline:
             min_word_ratio=0.3,
         )
 
-    def _create_docling_converter(self, enable_ocr: bool = False):
+    def _create_docling_converter(self, enable_ocr: bool = False, fast_mode: bool = True):
         """
         Cria um DocumentConverter do Docling.
 
         Args:
             enable_ocr: Se True, habilita OCR para PDFs com texto corrompido
+            fast_mode: Se True, desabilita análise de tabelas (muito mais rápido)
 
         Referência: https://docling-project.github.io/docling/examples/full_page_ocr/
         """
@@ -90,6 +91,15 @@ class IngestionPipeline:
         except TypeError:
             # Fallback para versões que requerem ocr_options
             pipeline_options = PdfPipelineOptions(ocr_options=EasyOcrOptions())
+
+        # OTIMIZAÇÃO: Modo rápido para documentos legais (majoritariamente texto)
+        # force_backend_text=True: extrai texto do PDF sem layout analysis (GPU)
+        # do_table_structure=False: desabilita análise de tabelas
+        # Resultado: de 30+ min para ~30s em PDFs de 60 páginas
+        if fast_mode:
+            pipeline_options.force_backend_text = True
+            pipeline_options.do_table_structure = False
+            logger.info("Modo rápido: force_backend_text + sem análise de tabelas")
 
         # Tenta configurar aceleração GPU (pode não estar disponível em todas versões)
         try:
