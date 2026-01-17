@@ -150,7 +150,7 @@ class IngestionPipeline:
     @property
     def span_parser(self):
         if self._span_parser is None:
-            from parsing import SpanParser
+            from ..parsing import SpanParser
             self._span_parser = SpanParser()
             logger.info("SpanParser inicializado")
         return self._span_parser
@@ -158,7 +158,7 @@ class IngestionPipeline:
     @property
     def llm_client(self):
         if self._llm_client is None:
-            from llm.vllm_client import VLLMClient, LLMConfig
+            from ..llm.vllm_client import VLLMClient, LLMConfig
             llm_config = LLMConfig.for_extraction()
             self._llm_client = VLLMClient(llm_config)
             logger.info("VLLMClient inicializado")
@@ -167,7 +167,7 @@ class IngestionPipeline:
     @property
     def orchestrator(self):
         if self._orchestrator is None:
-            from parsing import ArticleOrchestrator
+            from ..parsing import ArticleOrchestrator
             self._orchestrator = ArticleOrchestrator(llm_client=self.llm_client)
             logger.info("ArticleOrchestrator inicializado")
         return self._orchestrator
@@ -175,7 +175,7 @@ class IngestionPipeline:
     @property
     def embedder(self):
         if self._embedder is None:
-            from embedder import get_embedder
+            from ..embedder import get_embedder
             self._embedder = get_embedder()
             logger.info("BGE-M3 Embedder inicializado")
         return self._embedder
@@ -480,8 +480,7 @@ class IngestionPipeline:
         try:
             logger.info("Fase 3: ArticleOrchestrator iniciando...")
             extraction_result = self.orchestrator.extract_all_articles(
-                parsed_doc,
-                max_articles=max_articles
+                parsed_doc
             )
 
             duration = round(time.perf_counter() - phase_start, 2)
@@ -505,7 +504,7 @@ class IngestionPipeline:
         phase_start = time.perf_counter()
         try:
             logger.info("Fase 4: ChunkMaterializer iniciando...")
-            from chunking import ChunkMaterializer, ChunkMetadata
+            from ..chunking import ChunkMaterializer, ChunkMetadata
 
             metadata = ChunkMetadata(
                 schema_version="1.0.0",
@@ -550,12 +549,12 @@ class IngestionPipeline:
                 # Usa o embedder do GPU server (ja carregado)
                 embed_result = self.embedder.encode([text_for_embedding])
 
-                chunk._dense_vector = embed_result["dense_embeddings"][0]
-                chunk._sparse_vector = embed_result.get("sparse_embeddings", [{}])[0]
+                chunk._dense_vector = embed_result.dense_embeddings[0]
+                chunk._sparse_vector = embed_result.sparse_embeddings[0] if embed_result.sparse_embeddings else {}
 
                 if chunk.thesis_text:
                     thesis_result = self.embedder.encode([chunk.thesis_text])
-                    chunk._thesis_vector = thesis_result["dense_embeddings"][0]
+                    chunk._thesis_vector = thesis_result.dense_embeddings[0]
                 else:
                     chunk._thesis_vector = [0.0] * 1024
 
