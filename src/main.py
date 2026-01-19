@@ -1,21 +1,14 @@
 """
 RAG GPU Server - FastAPI para embeddings e reranking.
 
+Versao async-safe: health checks usam asyncio.to_thread() para nao bloquear.
+
 Endpoints:
-    POST /embed         - Gera embeddings (dense + sparse) com batching automático
-    POST /rerank        - Reordena documentos por relevância com batching
-    GET  /health        - Health check
+    POST /embed         - Gera embeddings (dense + sparse) com batching automatico
+    POST /rerank        - Reordena documentos por relevancia com batching
+    GET  /health        - Health check (async-safe)
     GET  /healthz       - Liveness probe (Kubernetes)
     GET  /readyz        - Readiness probe (Kubernetes)
-
-Arquitetura:
-    - 1 worker uvicorn (modelos carregados 1x na GPU)
-    - BatchCollector para agrupar requests e processar em batch
-    - Micro-batching: espera até 50ms ou 16 items antes de processar
-    - Throughput 3-5x maior para requests concorrentes
-
-Uso:
-    uvicorn src.main:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
@@ -58,25 +51,25 @@ logger = logging.getLogger(__name__)
 # THREAD POOL & BATCH COLLECTORS
 # =============================================================================
 
-# Pool de threads para operações GPU blocking
-# max_workers=2: permite 2 operações GPU simultâneas (embedding + rerank)
+# Pool de threads para operacoes GPU blocking
+# max_workers=2: permite 2 operacoes GPU simultaneas (embedding + rerank)
 GPU_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
-# Semáforo para limitar requests GPU simultâneos (fallback, se não usar batch)
+# Semaforo para limitar requests GPU simultaneos (fallback, se nao usar batch)
 GPU_SEMAPHORE = asyncio.Semaphore(4)  # Max 4 requests enfileirados
 
 # Batch Collectors (inicializados no lifespan)
 EMBED_COLLECTOR: BatchCollector | None = None
 RERANK_COLLECTOR: BatchCollector | None = None
 
-# Configuração de batching
+# Configuracao de batching
 BATCH_CONFIG = {
     "embed": {
-        "max_batch_size": 16,  # Máximo de requests agrupados
-        "max_wait_ms": 50,      # Espera máxima por mais requests
+        "max_batch_size": 16,  # Maximo de requests agrupados
+        "max_wait_ms": 50,      # Espera maxima por mais requests
     },
     "rerank": {
-        "max_batch_size": 8,    # Rerank é mais pesado
+        "max_batch_size": 8,    # Rerank e mais pesado
         "max_wait_ms": 30,      # Menor espera
     },
 }
@@ -103,12 +96,12 @@ class EmbedRequest(BaseModel):
     @field_validator("texts")
     @classmethod
     def validate_text_length(cls, texts: list[str]) -> list[str]:
-        """Valida que cada texto não excede o limite de caracteres."""
+        """Valida que cada texto nao excede o limite de caracteres."""
         max_len = config.max_text_length
         for i, text in enumerate(texts):
             if len(text) > max_len:
                 raise ValueError(
-                    f"Texto na posição {i} excede o limite de {max_len} caracteres "
+                    f"Texto na posicao {i} excede o limite de {max_len} caracteres "
                     f"(tem {len(text)} caracteres)"
                 )
         return texts
@@ -133,7 +126,7 @@ class RerankRequest(BaseModel):
     @field_validator("query")
     @classmethod
     def validate_query_length(cls, query: str) -> str:
-        """Valida que a query não excede o limite de caracteres."""
+        """Valida que a query nao excede o limite de caracteres."""
         max_len = config.max_text_length
         if len(query) > max_len:
             raise ValueError(
@@ -145,12 +138,12 @@ class RerankRequest(BaseModel):
     @field_validator("documents")
     @classmethod
     def validate_documents_length(cls, documents: list[str]) -> list[str]:
-        """Valida que cada documento não excede o limite de caracteres."""
+        """Valida que cada documento nao excede o limite de caracteres."""
         max_len = config.max_text_length
         for i, doc in enumerate(documents):
             if len(doc) > max_len:
                 raise ValueError(
-                    f"Documento na posição {i} excede o limite de {max_len} caracteres "
+                    f"Documento na posicao {i} excede o limite de {max_len} caracteres "
                     f"(tem {len(doc)} caracteres)"
                 )
         return documents
@@ -178,7 +171,7 @@ class HealthResponse(BaseModel):
 # APP
 # =============================================================================
 
-# Tempo de início
+# Tempo de inicio
 _start_time = time.time()
 
 
@@ -194,23 +187,23 @@ async def lifespan(app: FastAPI):
     logger.info(f"GPU ThreadPool workers: {GPU_EXECUTOR._max_workers}")
     logger.info(f"Batch config: {BATCH_CONFIG}")
 
-    # Pré-carrega modelos
-    logger.info("Pré-carregando embedder...")
+    # Pre-carrega modelos
+    logger.info("Pre-carregando embedder...")
     embedder = get_embedder()
     embedder._ensure_loaded()
 
-    logger.info("Pré-carregando reranker...")
+    logger.info("Pre-carregando reranker...")
     reranker = get_reranker()
     reranker._ensure_loaded()
 
-    # Pré-carrega Docling (modelos de layout e table structure na GPU)
-    logger.info("Pré-carregando Docling...")
+    # Pre-carrega Docling (modelos de layout e table structure na GPU)
+    logger.info("Pre-carregando Docling...")
     try:
         pipeline = get_pipeline()
         docling_warmup = pipeline.warmup()
         logger.info(f"Docling warmup: {docling_warmup}")
     except Exception as e:
-        logger.warning(f"Docling warmup falhou (continuando sem pré-carga): {e}")
+        logger.warning(f"Docling warmup falhou (continuando sem pre-carga): {e}")
 
     logger.info("=== Modelos carregados! ===")
 
@@ -281,8 +274,6 @@ app.add_middleware(
 app.add_middleware(APIKeyAuthMiddleware)
 
 # 3. Rate Limiting (in-memory, sem Redis)
-# Limita requisições por API key ou IP nos endpoints /embed e /rerank
-# Configurável via env var GPU_RATE_LIMIT (default: 100 req/min)
 app.add_middleware(RateLimitMiddleware, rate_limiter=RATE_LIMITER)
 
 logger.info(
@@ -305,17 +296,15 @@ async def embed(request: EmbedRequest):
     Gera embeddings para lista de textos.
 
     Retorna:
-    - dense_embeddings: Vetores 1024d (semânticos)
+    - dense_embeddings: Vetores 1024d (semanticos)
     - sparse_embeddings: Dicts token_id -> weight (keywords)
 
     Nota: Usa BatchCollector para agrupar requests e processar em batch.
-    Múltiplos requests simultâneos são agrupados para melhor throughput.
     """
     try:
         if EMBED_COLLECTOR is None:
             raise HTTPException(status_code=503, detail="Batch collector not initialized")
 
-        # Submete para o batch collector
         batch_item = EmbedBatchItem(
             texts=request.texts,
             return_dense=request.return_dense,
@@ -339,19 +328,16 @@ async def embed(request: EmbedRequest):
 @app.post("/rerank", response_model=RerankResponse)
 async def rerank(request: RerankRequest):
     """
-    Reordena documentos por relevância à query.
+    Reordena documentos por relevancia a query.
 
     Retorna:
-    - scores: Score de relevância para cada documento (0-1)
-    - rankings: Índices dos documentos ordenados por relevância
-
-    Nota: Usa BatchCollector para agrupar requests de diferentes clientes.
+    - scores: Score de relevancia para cada documento (0-1)
+    - rankings: Indices dos documentos ordenados por relevancia
     """
     try:
         if RERANK_COLLECTOR is None:
             raise HTTPException(status_code=503, detail="Batch collector not initialized")
 
-        # Submete para o batch collector
         batch_item = RerankBatchItem(
             query=request.query,
             documents=request.documents,
@@ -373,32 +359,47 @@ async def rerank(request: RerankRequest):
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Health check completo com status dos modelos."""
-    embedder = get_embedder()
-    reranker = get_reranker()
-    pipeline = get_pipeline()
+    """
+    Health check completo com status dos modelos.
 
-    embedder_health = embedder.health_check()
-    reranker_health = reranker.health_check()
+    CORRIGIDO: Usa asyncio.to_thread() para nao bloquear event loop.
+    """
 
-    # Docling health
-    docling_health = {
-        "status": "online" if pipeline.is_warmed_up() else "cold",
-        "warmed_up": pipeline.is_warmed_up(),
-    }
+    def _do_health_checks():
+        """Executa health checks (sync - roda em thread)."""
+        embedder = get_embedder()
+        reranker = get_reranker()
+        pipeline = get_pipeline()
 
-    # Status geral
-    all_online = (
-        embedder_health.get("status") == "online"
-        and reranker_health.get("status") == "online"
-        and docling_health.get("status") == "online"
-    )
+        embedder_health = embedder.health_check()
+        reranker_health = reranker.health_check()
+
+        docling_health = {
+            "status": "online" if pipeline.is_warmed_up() else "cold",
+            "warmed_up": pipeline.is_warmed_up(),
+        }
+
+        all_online = (
+            embedder_health.get("status") == "online"
+            and reranker_health.get("status") == "online"
+            and docling_health.get("status") == "online"
+        )
+
+        return {
+            "status": "healthy" if all_online else "degraded",
+            "embedder": embedder_health,
+            "reranker": reranker_health,
+            "docling": docling_health,
+        }
+
+    # Executa em thread para nao bloquear
+    result = await asyncio.to_thread(_do_health_checks)
 
     return HealthResponse(
-        status="healthy" if all_online else "degraded",
-        embedder=embedder_health,
-        reranker=reranker_health,
-        docling=docling_health,
+        status=result["status"],
+        embedder=result["embedder"],
+        reranker=result["reranker"],
+        docling=result["docling"],
         uptime_seconds=round(time.time() - _start_time, 2),
     )
 
@@ -413,7 +414,6 @@ async def healthz():
 async def readyz():
     """Readiness probe (Kubernetes)."""
     try:
-        # Verifica se modelos estão carregados
         embedder = get_embedder()
         reranker = get_reranker()
 
@@ -428,7 +428,7 @@ async def readyz():
 
 @app.get("/stats")
 async def stats():
-    """Estatísticas de concorrência, batching, rate limiting e uso."""
+    """Estatisticas de concorrencia, batching, rate limiting e uso."""
     return {
         "uptime_seconds": round(time.time() - _start_time, 2),
         "gpu_executor": {

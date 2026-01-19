@@ -1,11 +1,14 @@
 """
 Router FastAPI para ingestao de PDFs.
 
+Versao async-safe: usa asyncio.to_thread() para pipeline blocking.
+
 Endpoints:
     POST /ingest  - Processa PDF e retorna chunks prontos para indexacao
-    GET  /ingest/status/{task_id}  - Status do processamento (futuro)
+    GET  /ingest/health  - Health check do modulo
 """
 
+import asyncio
 import logging
 from typing import Optional, List
 
@@ -53,13 +56,14 @@ async def ingest_pdf(
     4. ChunkMaterializer (parent-child chunks)
     5. Embeddings (BGE-M3) - opcional
 
-    A VPS recebe os chunks processados e faz a indexacao no Milvus.
+    CORRIGIDO: Usa asyncio.to_thread() para nao bloquear o event loop.
+    O pipeline pode levar varios minutos para documentos grandes.
     """
     # Valida arquivo
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Arquivo deve ser PDF")
 
-    # Le conteudo
+    # Le conteudo (I/O async do FastAPI)
     pdf_content = await file.read()
     if len(pdf_content) == 0:
         raise HTTPException(status_code=400, detail="Arquivo PDF vazio")
@@ -77,9 +81,14 @@ async def ingest_pdf(
         max_articles=max_articles,
     )
 
-    # Processa
-    pipeline = get_pipeline()
-    result: PipelineResult = pipeline.process(pdf_content, request)
+    def _do_process(pdf_bytes: bytes, ingest_req: IngestRequest) -> PipelineResult:
+        """Executa pipeline (sync - roda em thread)."""
+        pipeline = get_pipeline()
+        return pipeline.process(pdf_bytes, ingest_req)
+
+    # Executa em thread para nao bloquear event loop
+    # IMPORTANTE: pipeline.process() pode levar minutos!
+    result: PipelineResult = await asyncio.to_thread(_do_process, pdf_content, request)
 
     # Monta resposta
     return IngestResponse(
@@ -97,12 +106,21 @@ async def ingest_pdf(
 
 @router.get("/health")
 async def ingest_health():
-    """Health check do modulo de ingestao."""
-    pipeline = get_pipeline()
-    return {
-        "status": "healthy",
-        "docling_loaded": pipeline._docling_converter is not None,
-        "span_parser_loaded": pipeline._span_parser is not None,
-        "llm_client_loaded": pipeline._llm_client is not None,
-        "embedder_loaded": pipeline._embedder is not None,
-    }
+    """
+    Health check do modulo de ingestao.
+
+    CORRIGIDO: Usa asyncio.to_thread() para verificacoes que podem bloquear.
+    """
+
+    def _do_health_check() -> dict:
+        """Executa health check (sync - roda em thread)."""
+        pipeline = get_pipeline()
+        return {
+            "status": "healthy",
+            "docling_loaded": pipeline._docling_converter is not None,
+            "span_parser_loaded": pipeline._span_parser is not None,
+            "llm_client_loaded": pipeline._llm_client is not None,
+            "embedder_loaded": pipeline._embedder is not None,
+        }
+
+    return await asyncio.to_thread(_do_health_check)
