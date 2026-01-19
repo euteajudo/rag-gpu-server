@@ -14,6 +14,12 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Rate Limiting
+    gpu_rate_limit: int = 100  # Requisições por minuto por API key/IP
+
+    # String Size Limits (segurança contra VRAM overflow)
+    max_text_length: int = 10000  # Máximo de caracteres por texto
+
     # Models
     embedding_model: str = "BAAI/bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
@@ -35,6 +41,8 @@ class Config:
         return cls(
             host=os.getenv("HOST", "0.0.0.0"),
             port=int(os.getenv("PORT", "8000")),
+            gpu_rate_limit=int(os.getenv("GPU_RATE_LIMIT", "100")),
+            max_text_length=int(os.getenv("MAX_TEXT_LENGTH", "10000")),
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
             reranker_model=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
             vllm_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8080/v1"),

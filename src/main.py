@@ -28,7 +28,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .config import config
 from .embedder import get_embedder
@@ -45,6 +45,7 @@ from .batch_collector import (
 )
 from .auth import APIKeyAuthMiddleware
 from .ingestion.router import router as ingestion_router
+from .middleware.rate_limit import RateLimitMiddleware, InMemoryRateLimiter
 
 # Logging
 logging.basicConfig(
@@ -80,6 +81,12 @@ BATCH_CONFIG = {
     },
 }
 
+# Rate Limiter (in-memory, sem Redis)
+RATE_LIMITER = InMemoryRateLimiter(
+    max_requests=config.gpu_rate_limit,
+    window_seconds=60,
+)
+
 
 # =============================================================================
 # MODELS
@@ -92,6 +99,19 @@ class EmbedRequest(BaseModel):
     texts: list[str] = Field(..., min_length=1, max_length=100)
     return_dense: bool = True
     return_sparse: bool = True
+
+    @field_validator("texts")
+    @classmethod
+    def validate_text_length(cls, texts: list[str]) -> list[str]:
+        """Valida que cada texto não excede o limite de caracteres."""
+        max_len = config.max_text_length
+        for i, text in enumerate(texts):
+            if len(text) > max_len:
+                raise ValueError(
+                    f"Texto na posição {i} excede o limite de {max_len} caracteres "
+                    f"(tem {len(text)} caracteres)"
+                )
+        return texts
 
 
 class EmbedResponse(BaseModel):
@@ -109,6 +129,31 @@ class RerankRequest(BaseModel):
     query: str = Field(..., min_length=1)
     documents: list[str] = Field(..., min_length=1, max_length=100)
     top_k: Optional[int] = Field(None, ge=1, le=100)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query_length(cls, query: str) -> str:
+        """Valida que a query não excede o limite de caracteres."""
+        max_len = config.max_text_length
+        if len(query) > max_len:
+            raise ValueError(
+                f"Query excede o limite de {max_len} caracteres "
+                f"(tem {len(query)} caracteres)"
+            )
+        return query
+
+    @field_validator("documents")
+    @classmethod
+    def validate_documents_length(cls, documents: list[str]) -> list[str]:
+        """Valida que cada documento não excede o limite de caracteres."""
+        max_len = config.max_text_length
+        for i, doc in enumerate(documents):
+            if len(doc) > max_len:
+                raise ValueError(
+                    f"Documento na posição {i} excede o limite de {max_len} caracteres "
+                    f"(tem {len(doc)} caracteres)"
+                )
+        return documents
 
 
 class RerankResponse(BaseModel):
@@ -235,7 +280,15 @@ app.add_middleware(
 # 2. Autenticacao por API Key
 app.add_middleware(APIKeyAuthMiddleware)
 
-logger.info("Middleware de seguranca ativado: CORS restrito + API Key auth")
+# 3. Rate Limiting (in-memory, sem Redis)
+# Limita requisições por API key ou IP nos endpoints /embed e /rerank
+# Configurável via env var GPU_RATE_LIMIT (default: 100 req/min)
+app.add_middleware(RateLimitMiddleware, rate_limiter=RATE_LIMITER)
+
+logger.info(
+    f"Middleware de seguranca ativado: CORS restrito + API Key auth + "
+    f"Rate Limit ({RATE_LIMITER.max_requests}/min)"
+)
 
 # Router de ingestao
 app.include_router(ingestion_router)
@@ -375,7 +428,7 @@ async def readyz():
 
 @app.get("/stats")
 async def stats():
-    """Estatísticas de concorrência, batching e uso."""
+    """Estatísticas de concorrência, batching, rate limiting e uso."""
     return {
         "uptime_seconds": round(time.time() - _start_time, 2),
         "gpu_executor": {
@@ -386,6 +439,7 @@ async def stats():
             "embed": EMBED_COLLECTOR.stats() if EMBED_COLLECTOR else None,
             "rerank": RERANK_COLLECTOR.stats() if RERANK_COLLECTOR else None,
         },
+        "rate_limiter": RATE_LIMITER.get_stats(),
     }
 
 
