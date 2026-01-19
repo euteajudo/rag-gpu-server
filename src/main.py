@@ -40,6 +40,69 @@ from .auth import APIKeyAuthMiddleware
 from .ingestion.router import router as ingestion_router
 from .middleware.rate_limit import RateLimitMiddleware, InMemoryRateLimiter
 
+# GPU Metrics via pynvml
+try:
+    import pynvml
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
+
+def get_gpu_hardware_metrics() -> dict:
+    """
+    Obtém métricas de hardware da GPU via pynvml.
+
+    Returns:
+        Dict com utilização, memória, temperatura, etc.
+    """
+    if not PYNVML_AVAILABLE:
+        return {"available": False, "error": "pynvml not installed"}
+
+    try:
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+
+        if device_count == 0:
+            return {"available": False, "error": "No GPU found"}
+
+        # Usa primeira GPU
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+        # Nome da GPU
+        name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+
+        # Utilização
+        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+
+        # Memória
+        memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+        # Temperatura
+        temperature = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+
+        # Power
+        try:
+            power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000  # mW to W
+        except pynvml.NVMLError:
+            power = 0
+
+        pynvml.nvmlShutdown()
+
+        return {
+            "available": True,
+            "name": name,
+            "utilization_percent": utilization.gpu,
+            "memory_utilization_percent": utilization.memory,
+            "memory_used_bytes": memory.used,
+            "memory_total_bytes": memory.total,
+            "memory_free_bytes": memory.free,
+            "temperature_celsius": temperature,
+            "power_draw_watts": round(power, 1),
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -429,8 +492,12 @@ async def readyz():
 @app.get("/stats")
 async def stats():
     """Estatisticas de concorrencia, batching, rate limiting e uso."""
+    # GPU hardware metrics (non-blocking)
+    gpu_metrics = await asyncio.to_thread(get_gpu_hardware_metrics)
+
     return {
         "uptime_seconds": round(time.time() - _start_time, 2),
+        "gpu": gpu_metrics,  # Métricas de hardware da GPU
         "gpu_executor": {
             "max_workers": GPU_EXECUTOR._max_workers,
             "active_threads": len(GPU_EXECUTOR._threads),
