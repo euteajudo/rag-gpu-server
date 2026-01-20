@@ -66,6 +66,10 @@ Servidor GPU para embeddings (BGE-M3), reranking (BGE-Reranker) e LLM (vLLM) do 
 |----------|--------|-----------|
 | `/embed` | POST | Gera embeddings dense (1024d) + sparse |
 | `/rerank` | POST | Reordena documentos por relevância |
+| `/ingest` | POST | **NOVO** Inicia processamento async de PDF |
+| `/ingest/status/{task_id}` | GET | **NOVO** Retorna progresso do processamento |
+| `/ingest/result/{task_id}` | GET | **NOVO** Retorna chunks quando completo |
+| `/ingest/health` | GET | **NOVO** Health check do módulo de ingestão |
 | `/health` | GET | Health check completo com métricas GPU |
 | `/healthz` | GET | Liveness probe (Kubernetes) |
 | `/readyz` | GET | Readiness probe (Kubernetes) |
@@ -106,6 +110,140 @@ Servidor GPU para embeddings (BGE-M3), reranking (BGE-Reranker) e LLM (vLLM) do 
     "rankings": [0, 1, 2],
     "latency_ms": 120.5
 }
+```
+
+### POST /ingest (Async - Novo em 20/01/2025)
+
+Processa PDF de forma assíncrona para evitar timeout do Cloudflare (100s).
+
+```json
+// Request (multipart/form-data)
+{
+    "file": "<PDF binary>",
+    "document_id": "LEI-14133-2021",
+    "tipo_documento": "LEI",
+    "numero": "14133",
+    "ano": 2021,
+    "skip_embeddings": false,
+    "max_articles": null
+}
+
+// Response (retorna imediatamente ~1s)
+{
+    "task_id": "abc123def456",
+    "document_id": "LEI-14133-2021",
+    "message": "Processamento iniciado em background. Use GET /ingest/status/{task_id} para acompanhar."
+}
+```
+
+### GET /ingest/status/{task_id}
+
+Retorna o progresso do processamento.
+
+```json
+// Response (durante processamento)
+{
+    "task_id": "abc123def456",
+    "document_id": "LEI-14133-2021",
+    "status": "processing",
+    "progress": 0.45,
+    "current_phase": "extraction",
+    "started_at": "2025-01-20T10:30:00Z",
+    "completed_at": null,
+    "error_message": null
+}
+
+// Response (quando completo)
+{
+    "task_id": "abc123def456",
+    "document_id": "LEI-14133-2021",
+    "status": "completed",
+    "progress": 1.0,
+    "current_phase": "completed",
+    "started_at": "2025-01-20T10:30:00Z",
+    "completed_at": "2025-01-20T10:38:00Z",
+    "error_message": null
+}
+```
+
+### GET /ingest/result/{task_id}
+
+Retorna os chunks processados (só disponível quando status == "completed").
+
+```json
+// Response
+{
+    "success": true,
+    "document_id": "LEI-14133-2021",
+    "status": "completed",
+    "total_chunks": 498,
+    "phases": [
+        {"phase": "docling", "duration_seconds": 15.2},
+        {"phase": "parsing", "duration_seconds": 0.5},
+        {"phase": "extraction", "duration_seconds": 120.3},
+        {"phase": "materialization", "duration_seconds": 2.1},
+        {"phase": "embedding", "duration_seconds": 45.8}
+    ],
+    "errors": [],
+    "total_time_seconds": 183.9,
+    "chunks": [
+        {
+            "chunk_id": "LEI-14133-2021#ART-001",
+            "parent_chunk_id": "",
+            "span_id": "ART-001",
+            "device_type": "article",
+            "text": "Art. 1º Esta Lei estabelece...",
+            "dense_vector": [0.1, 0.2, ...],
+            "sparse_vector": {"123": 0.5, ...}
+        }
+    ],
+    "document_hash": "sha256:abc123..."
+}
+```
+
+### Fases de Processamento
+
+| Fase | Progress | Descrição |
+|------|----------|-----------|
+| `queued` | 0.0 | Aguardando início |
+| `initializing` | 0.05 | Iniciando pipeline |
+| `docling` | 0.1-0.3 | Convertendo PDF → Markdown |
+| `parsing` | 0.3-0.4 | SpanParser extraindo spans |
+| `extraction` | 0.4-0.7 | ArticleOrchestrator (LLM) |
+| `materialization` | 0.7-0.8 | ChunkMaterializer |
+| `embedding` | 0.8-0.95 | BGE-M3 embeddings |
+| `completed` | 1.0 | Finalizado com sucesso |
+
+### Fluxo de Polling Recomendado
+
+```python
+import time
+import requests
+
+# 1. Iniciar processamento
+response = requests.post(
+    "https://gpu.vectorgov.io/ingest",
+    files={"file": open("lei.pdf", "rb")},
+    data={"document_id": "LEI-14133-2021", "tipo_documento": "LEI", "numero": "14133", "ano": 2021}
+)
+task_id = response.json()["task_id"]
+
+# 2. Polling até completar
+while True:
+    status = requests.get(f"https://gpu.vectorgov.io/ingest/status/{task_id}").json()
+
+    print(f"Progress: {status['progress']*100:.1f}% - {status['current_phase']}")
+
+    if status["status"] == "completed":
+        break
+    elif status["status"] == "failed":
+        raise Exception(status["error_message"])
+
+    time.sleep(3)  # Poll a cada 3 segundos
+
+# 3. Obter resultado
+result = requests.get(f"https://gpu.vectorgov.io/ingest/result/{task_id}").json()
+print(f"Total chunks: {result['total_chunks']}")
 ```
 
 ---
@@ -845,7 +983,18 @@ sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
 
 ## Histórico de Mudanças
 
-### 2024-01-01
+### 2025-01-20
+
+- **Ingestão Async**: Implementado processamento assíncrono de PDFs
+  - POST `/ingest` retorna task_id imediatamente (~1s)
+  - GET `/ingest/status/{task_id}` retorna progresso (0.0 a 1.0)
+  - GET `/ingest/result/{task_id}` retorna chunks quando completo
+  - Background processing com `threading.Thread`
+  - Progress callback para reportar fases
+- **Problema resolvido**: Cloudflare timeout 524 após 100s
+- **Testado**: Lei 13.303/2016 (498 chunks, ~8 min processamento)
+
+### 2025-01-01
 
 - Criado GPU Server e deployado no Google Cloud
 - Configurada VM g2-standard-4 com NVIDIA L4
