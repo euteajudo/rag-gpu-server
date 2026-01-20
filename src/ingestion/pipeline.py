@@ -244,6 +244,7 @@ class IngestionPipeline:
         self,
         pdf_content: bytes,
         request: IngestRequest,
+        progress_callback=None,
     ) -> PipelineResult:
         """
         Processa um PDF e retorna chunks prontos para indexacao.
@@ -251,15 +252,25 @@ class IngestionPipeline:
         Args:
             pdf_content: Conteudo binario do PDF
             request: Metadados do documento
+            progress_callback: Funcao callback(phase: str, progress: float)
+                               para reportar progresso (0.0 a 1.0)
 
         Returns:
             PipelineResult com chunks processados
         """
+        def report_progress(phase: str, progress: float):
+            if progress_callback:
+                try:
+                    progress_callback(phase, progress)
+                except Exception as e:
+                    logger.warning(f"Erro no progress_callback: {e}")
+
         start_time = time.perf_counter()
         result = PipelineResult(
             status=IngestStatus.PROCESSING,
             document_id=request.document_id,
         )
+        report_progress("initializing", 0.05)
 
         # Calcula hash do documento
         result.document_hash = hashlib.sha256(pdf_content).hexdigest()
@@ -271,37 +282,49 @@ class IngestionPipeline:
                 temp_path = f.name
 
             try:
-                # Fase 1: Docling (PDF -> Markdown)
+                # Fase 1: Docling (PDF -> Markdown) - 10% a 40%
+                report_progress("docling", 0.1)
                 result = self._phase_docling(temp_path, result)
                 if result.status == IngestStatus.FAILED:
                     return result
+                report_progress("docling", 0.4)
 
-                # Fase 2: SpanParser (Markdown -> Spans)
+                # Fase 2: SpanParser (Markdown -> Spans) - 40% a 45%
+                report_progress("parsing", 0.42)
                 parsed_doc = self._phase_parsing(result)
                 if result.status == IngestStatus.FAILED:
                     return result
+                report_progress("parsing", 0.45)
 
-                # Fase 3: ArticleOrchestrator (LLM extraction)
+                # Fase 3: ArticleOrchestrator (LLM extraction) - 45% a 70%
+                report_progress("extraction", 0.45)
                 article_chunks = self._phase_extraction(parsed_doc, result, request.max_articles)
                 if result.status == IngestStatus.FAILED:
                     return result
+                report_progress("extraction", 0.70)
 
-                # Fase 4: ChunkMaterializer (parent-child chunks)
+                # Fase 4: ChunkMaterializer (parent-child chunks) - 70% a 75%
+                report_progress("materialization", 0.72)
                 materialized = self._phase_materialization(
                     article_chunks, parsed_doc, request, result
                 )
                 if result.status == IngestStatus.FAILED:
                     return result
+                report_progress("materialization", 0.75)
 
-                # Fase 5: Embeddings (se nao pular)
+                # Fase 5: Embeddings (se nao pular) - 75% a 95%
                 if not request.skip_embeddings:
+                    report_progress("embedding", 0.75)
                     self._phase_embeddings(materialized, result)
                     if result.status == IngestStatus.FAILED:
                         return result
+                    report_progress("embedding", 0.95)
 
-                # Converte para ProcessedChunk
+                # Converte para ProcessedChunk - 95% a 100%
+                report_progress("finalizing", 0.95)
                 result.chunks = self._to_processed_chunks(materialized, request, result)
                 result.status = IngestStatus.COMPLETED
+                report_progress("completed", 1.0)
 
             finally:
                 # Remove arquivo temporario
