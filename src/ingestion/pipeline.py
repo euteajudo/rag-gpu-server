@@ -605,6 +605,7 @@ class IngestionPipeline:
         chunks = []
         for chunk in materialized:
             pc = ProcessedChunk(
+                node_id=chunk.node_id,
                 chunk_id=chunk.chunk_id,
                 parent_chunk_id=chunk.parent_chunk_id or "",
                 span_id=chunk.span_id,

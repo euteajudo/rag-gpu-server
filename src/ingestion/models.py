@@ -43,6 +43,7 @@ class ProcessedChunk(BaseModel):
     """Chunk processado, pronto para indexação."""
 
     # Identificação
+    node_id: str = Field(..., description="PK canônica: leis:DOC#SPAN_ID")
     chunk_id: str = Field(..., description="ID único: DOC#SPAN_ID")
     parent_chunk_id: str = Field("", description="ID do chunk pai (vazio se artigo)")
     span_id: str = Field(..., description="ID do span: ART-005, PAR-005-1, etc")
@@ -76,6 +77,7 @@ class ProcessedChunk(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
+                "node_id": "leis:LEI-123-2006#ART-005",
                 "chunk_id": "LEI-123-2006#ART-005",
                 "parent_chunk_id": "",
                 "span_id": "ART-005",
