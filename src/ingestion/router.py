@@ -80,6 +80,9 @@ def _set_task_result(task_id: str, result: PipelineResult):
             task.status = "completed" if result.status == IngestStatus.COMPLETED else "failed"
             task.progress = 1.0
             task.completed_at = datetime.now().isoformat()
+            # CORREÇÃO: Define error_message se houver erros (para VPS poder ler)
+            if result.errors:
+                task.error_message = "; ".join([e.message for e in result.errors])
             task.result = {
                 "success": result.status == IngestStatus.COMPLETED,
                 "document_id": result.document_id,
