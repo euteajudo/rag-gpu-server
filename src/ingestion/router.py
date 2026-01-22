@@ -171,9 +171,17 @@ def _background_process(task_id: str, pdf_content: bytes, request: IngestRequest
 async def ingest_pdf(
     file: UploadFile = File(..., description="Arquivo PDF para processar"),
     document_id: str = Form(..., description="ID unico do documento (ex: LEI-14133-2021)"),
-    tipo_documento: str = Form(..., description="Tipo: LEI, DECRETO, IN, etc"),
+    tipo_documento: str = Form(..., description="Tipo: LEI, DECRETO, IN, ACORDAO, etc"),
     numero: str = Form(..., description="Numero do documento"),
     ano: int = Form(..., ge=1900, le=2100, description="Ano do documento"),
+    titulo: Optional[str] = Form(None, description="Titulo do documento (opcional)"),
+    # Campos especificos para Acordaos TCU
+    colegiado: Optional[str] = Form(None, description="Colegiado: P (Plenario), 1C, 2C"),
+    processo: Optional[str] = Form(None, description="Numero do processo (TC xxx.xxx/xxxx-x)"),
+    relator: Optional[str] = Form(None, description="Nome do Ministro Relator"),
+    data_sessao: Optional[str] = Form(None, description="Data da sessao (DD/MM/YYYY)"),
+    unidade_tecnica: Optional[str] = Form(None, description="Unidade tecnica responsavel"),
+    # Configuracoes opcionais
     skip_embeddings: bool = Form(False, description="Pular geracao de embeddings"),
     max_articles: Optional[int] = Form(None, description="Limite de artigos (debug)"),
 ):
@@ -203,6 +211,14 @@ async def ingest_pdf(
         tipo_documento=tipo_documento,
         numero=numero,
         ano=ano,
+        titulo=titulo,
+        # Campos especificos para Acordaos TCU
+        colegiado=colegiado,
+        processo=processo,
+        relator=relator,
+        data_sessao=data_sessao,
+        unidade_tecnica=unidade_tecnica,
+        # Configuracoes opcionais
         skip_embeddings=skip_embeddings,
         max_articles=max_articles,
     )

@@ -198,6 +198,14 @@ from .node_id_metrics import (
     validate_and_collect_metrics,
 )
 
+# Acórdãos TCU
+from .acordao_chunker import (
+    AcordaoChunker,
+    AcordaoChunkMetadata,
+    MaterializedAcordaoChunk,
+    materialize_acordao,
+)
+
 __all__ = [
     # Modelos
     "LegalChunk",
@@ -217,4 +225,9 @@ __all__ = [
     "NodeIdMetricsCollector",
     "NodeIdStats",
     "validate_and_collect_metrics",
+    # Acórdãos TCU
+    "AcordaoChunker",
+    "AcordaoChunkMetadata",
+    "MaterializedAcordaoChunk",
+    "materialize_acordao",
 ]

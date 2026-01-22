@@ -27,9 +27,17 @@ class IngestRequest(BaseModel):
 
     # Metadados do documento
     document_id: str = Field(..., description="ID único do documento (ex: LEI-123-2006)")
-    tipo_documento: str = Field(..., description="Tipo: LEI, DECRETO, IN, etc")
+    tipo_documento: str = Field(..., description="Tipo: LEI, DECRETO, IN, ACORDAO, etc")
     numero: str = Field(..., description="Número do documento")
     ano: int = Field(..., ge=1900, le=2100, description="Ano do documento")
+    titulo: Optional[str] = Field(None, description="Título do documento (opcional)")
+
+    # Campos específicos para Acórdãos TCU
+    colegiado: Optional[str] = Field(None, description="Colegiado: P (Plenário), 1C, 2C")
+    processo: Optional[str] = Field(None, description="Número do processo (TC xxx.xxx/xxxx-x)")
+    relator: Optional[str] = Field(None, description="Nome do Ministro Relator")
+    data_sessao: Optional[str] = Field(None, description="Data da sessão (DD/MM/YYYY)")
+    unidade_tecnica: Optional[str] = Field(None, description="Unidade técnica responsável")
 
     # Configurações opcionais
     skip_enrichment: bool = Field(False, description="Pular enriquecimento LLM")

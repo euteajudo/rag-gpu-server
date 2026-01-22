@@ -180,6 +180,28 @@ class IngestionPipeline:
             logger.info("BGE-M3 Embedder inicializado")
         return self._embedder
 
+    # === Acórdãos TCU ===
+    _acordao_parser = None
+    _acordao_chunker = None
+
+    @property
+    def acordao_parser(self):
+        """Parser específico para acórdãos do TCU."""
+        if self._acordao_parser is None:
+            from ..parsing import AcordaoSpanParser
+            self._acordao_parser = AcordaoSpanParser()
+            logger.info("AcordaoSpanParser inicializado")
+        return self._acordao_parser
+
+    @property
+    def acordao_chunker(self):
+        """Chunker específico para acórdãos do TCU."""
+        if self._acordao_chunker is None:
+            from ..chunking import AcordaoChunker
+            self._acordao_chunker = AcordaoChunker()
+            logger.info("AcordaoChunker inicializado")
+        return self._acordao_chunker
+
     def warmup(self) -> dict:
         """
         Pré-carrega modelos Docling na GPU.
@@ -289,28 +311,53 @@ class IngestionPipeline:
                     return result
                 report_progress("docling", 0.4)
 
-                # Fase 2: SpanParser (Markdown -> Spans) - 40% a 45%
-                report_progress("parsing", 0.42)
-                parsed_doc = self._phase_parsing(result)
-                if result.status == IngestStatus.FAILED:
-                    return result
-                report_progress("parsing", 0.45)
+                # Detecta se é acórdão TCU
+                is_acordao = request.tipo_documento.upper() == "ACORDAO"
 
-                # Fase 3: ArticleOrchestrator (LLM extraction) - 45% a 70%
-                report_progress("extraction", 0.45)
-                article_chunks = self._phase_extraction(parsed_doc, result, request.max_articles)
-                if result.status == IngestStatus.FAILED:
-                    return result
-                report_progress("extraction", 0.70)
+                if is_acordao:
+                    # === PIPELINE ACÓRDÃO TCU ===
+                    logger.info("Detectado tipo ACORDAO - usando pipeline específico")
 
-                # Fase 4: ChunkMaterializer (parent-child chunks) - 70% a 75%
-                report_progress("materialization", 0.72)
-                materialized = self._phase_materialization(
-                    article_chunks, parsed_doc, request, result
-                )
-                if result.status == IngestStatus.FAILED:
-                    return result
-                report_progress("materialization", 0.75)
+                    # Fase 2A: AcordaoSpanParser - 40% a 55%
+                    report_progress("parsing_acordao", 0.42)
+                    parsed_acordao = self._phase_parsing_acordao(result, request)
+                    if result.status == IngestStatus.FAILED:
+                        return result
+                    report_progress("parsing_acordao", 0.55)
+
+                    # Fase 3A: AcordaoChunker (materializa direto, sem LLM) - 55% a 75%
+                    report_progress("materialization_acordao", 0.60)
+                    materialized = self._phase_materialization_acordao(
+                        parsed_acordao, request, result
+                    )
+                    if result.status == IngestStatus.FAILED:
+                        return result
+                    report_progress("materialization_acordao", 0.75)
+
+                else:
+                    # === PIPELINE LEIS/DECRETOS ===
+                    # Fase 2: SpanParser (Markdown -> Spans) - 40% a 45%
+                    report_progress("parsing", 0.42)
+                    parsed_doc = self._phase_parsing(result)
+                    if result.status == IngestStatus.FAILED:
+                        return result
+                    report_progress("parsing", 0.45)
+
+                    # Fase 3: ArticleOrchestrator (LLM extraction) - 45% a 70%
+                    report_progress("extraction", 0.45)
+                    article_chunks = self._phase_extraction(parsed_doc, result, request.max_articles)
+                    if result.status == IngestStatus.FAILED:
+                        return result
+                    report_progress("extraction", 0.70)
+
+                    # Fase 4: ChunkMaterializer (parent-child chunks) - 70% a 75%
+                    report_progress("materialization", 0.72)
+                    materialized = self._phase_materialization(
+                        article_chunks, parsed_doc, request, result
+                    )
+                    if result.status == IngestStatus.FAILED:
+                        return result
+                    report_progress("materialization", 0.75)
 
                 # Fase 5: Embeddings (se nao pular) - 75% a 95%
                 if not request.skip_embeddings:
@@ -322,7 +369,7 @@ class IngestionPipeline:
 
                 # Converte para ProcessedChunk - 95% a 100%
                 report_progress("finalizing", 0.95)
-                result.chunks = self._to_processed_chunks(materialized, request, result)
+                result.chunks = self._to_processed_chunks(materialized, request, result, is_acordao=is_acordao)
                 result.status = IngestStatus.COMPLETED
                 report_progress("completed", 1.0)
 
@@ -497,6 +544,73 @@ class IngestionPipeline:
             result.errors.append(IngestError(phase="parsing", message=str(e)))
             return None
 
+    def _phase_parsing_acordao(self, result: PipelineResult, request: IngestRequest):
+        """Fase 2A: AcordaoSpanParser - Markdown -> ParsedAcordao"""
+        phase_start = time.perf_counter()
+        try:
+            logger.info("Fase 2A: AcordaoSpanParser iniciando...")
+            parsed_acordao = self.acordao_parser.parse(result.markdown_content)
+
+            # Complementa metadados do request se disponíveis
+            if request.colegiado and not parsed_acordao.metadata.colegiado:
+                from ..parsing import parse_colegiado
+                parsed_acordao.metadata.colegiado = parse_colegiado(request.colegiado)
+            if request.processo and not parsed_acordao.metadata.processo:
+                parsed_acordao.metadata.processo = request.processo
+            if request.relator and not parsed_acordao.metadata.relator:
+                parsed_acordao.metadata.relator = request.relator
+            if request.data_sessao and not parsed_acordao.metadata.data_sessao:
+                parsed_acordao.metadata.data_sessao = request.data_sessao
+            if request.unidade_tecnica and not parsed_acordao.metadata.unidade_tecnica:
+                parsed_acordao.metadata.unidade_tecnica = request.unidade_tecnica
+            if request.numero:
+                parsed_acordao.metadata.numero = int(request.numero)
+            if request.ano:
+                parsed_acordao.metadata.ano = request.ano
+
+            duration = round(time.perf_counter() - phase_start, 2)
+            result.phases.append({
+                "name": "parsing_acordao",
+                "duration_seconds": duration,
+                "output": f"Encontrados {len(parsed_acordao.spans)} spans, acordao_id={parsed_acordao.acordao_id}",
+                "success": True,
+            })
+            logger.info(f"Fase 2A: AcordaoSpanParser concluido em {duration}s - {len(parsed_acordao.spans)} spans")
+            return parsed_acordao
+
+        except Exception as e:
+            logger.error(f"Erro no AcordaoSpanParser: {e}", exc_info=True)
+            result.status = IngestStatus.FAILED
+            result.errors.append(IngestError(phase="parsing_acordao", message=str(e)))
+            return None
+
+    def _phase_materialization_acordao(self, parsed_acordao, request: IngestRequest, result: PipelineResult):
+        """Fase 3A: AcordaoChunker - ParsedAcordao -> MaterializedAcordaoChunk"""
+        phase_start = time.perf_counter()
+        try:
+            logger.info("Fase 3A: AcordaoChunker iniciando...")
+
+            materialized = self.acordao_chunker.materialize(
+                parsed_acordao,
+                document_hash=result.document_hash,
+            )
+
+            duration = round(time.perf_counter() - phase_start, 2)
+            result.phases.append({
+                "name": "materialization_acordao",
+                "duration_seconds": duration,
+                "output": f"Materializados {len(materialized)} chunks de acordao",
+                "success": True,
+            })
+            logger.info(f"Fase 3A: AcordaoChunker concluido em {duration}s - {len(materialized)} chunks")
+            return materialized
+
+        except Exception as e:
+            logger.error(f"Erro no AcordaoChunker: {e}", exc_info=True)
+            result.status = IngestStatus.FAILED
+            result.errors.append(IngestError(phase="materialization_acordao", message=str(e)))
+            return None
+
     def _phase_extraction(self, parsed_doc, result: PipelineResult, max_articles: Optional[int] = None):
         """Fase 3: ArticleOrchestrator - LLM extraction"""
         phase_start = time.perf_counter()
@@ -599,30 +713,56 @@ class IngestionPipeline:
         self,
         materialized,
         request: IngestRequest,
-        result: PipelineResult
+        result: PipelineResult,
+        is_acordao: bool = False
     ) -> List[ProcessedChunk]:
-        """Converte MaterializedChunk para ProcessedChunk (Pydantic)."""
+        """Converte MaterializedChunk ou MaterializedAcordaoChunk para ProcessedChunk (Pydantic)."""
         chunks = []
         for chunk in materialized:
-            pc = ProcessedChunk(
-                node_id=chunk.node_id,
-                chunk_id=chunk.chunk_id,
-                parent_chunk_id=chunk.parent_chunk_id or "",
-                span_id=chunk.span_id,
-                device_type=chunk.device_type.value if hasattr(chunk.device_type, "value") else str(chunk.device_type),
-                chunk_level=chunk.chunk_level.name.lower() if hasattr(chunk.chunk_level, "name") else str(chunk.chunk_level),
-                text=chunk.text or "",
-                enriched_text=chunk.enriched_text or chunk.text or "",
-                context_header=chunk.context_header or "",
-                thesis_text=chunk.thesis_text or "",
-                thesis_type=chunk.thesis_type or "",
-                synthetic_questions="",
-                document_id=request.document_id,
-                tipo_documento=request.tipo_documento,
-                numero=request.numero,
-                ano=request.ano,
-                article_number=chunk.article_number or "",
-            )
+            if is_acordao:
+                # MaterializedAcordaoChunk
+                pc = ProcessedChunk(
+                    node_id=chunk.node_id,
+                    chunk_id=chunk.chunk_id,
+                    parent_chunk_id=chunk.parent_chunk_id or "",
+                    span_id=chunk.span_id,
+                    device_type=chunk.device_type,
+                    chunk_level="acordao_span",  # Nível específico para acórdãos
+                    text=chunk.text or "",
+                    enriched_text=chunk.enriched_text or chunk.text or "",
+                    context_header=chunk.context_header or "",
+                    thesis_text=chunk.thesis_text or "",
+                    thesis_type=chunk.thesis_type or "",
+                    synthetic_questions=chunk.synthetic_questions or "",
+                    document_id=request.document_id,
+                    tipo_documento=request.tipo_documento,
+                    numero=request.numero,
+                    ano=request.ano,
+                    article_number="",  # Acórdãos usam span_id
+                    # Campos específicos de acórdão (via citations como JSON)
+                    citations=[chunk.acordao_id] if hasattr(chunk, "acordao_id") else [],
+                )
+            else:
+                # MaterializedChunk (leis/decretos)
+                pc = ProcessedChunk(
+                    node_id=chunk.node_id,
+                    chunk_id=chunk.chunk_id,
+                    parent_chunk_id=chunk.parent_chunk_id or "",
+                    span_id=chunk.span_id,
+                    device_type=chunk.device_type.value if hasattr(chunk.device_type, "value") else str(chunk.device_type),
+                    chunk_level=chunk.chunk_level.name.lower() if hasattr(chunk.chunk_level, "name") else str(chunk.chunk_level),
+                    text=chunk.text or "",
+                    enriched_text=chunk.enriched_text or chunk.text or "",
+                    context_header=chunk.context_header or "",
+                    thesis_text=chunk.thesis_text or "",
+                    thesis_type=chunk.thesis_type or "",
+                    synthetic_questions="",
+                    document_id=request.document_id,
+                    tipo_documento=request.tipo_documento,
+                    numero=request.numero,
+                    ano=request.ano,
+                    article_number=chunk.article_number or "",
+                )
 
             # Adiciona vetores se foram gerados
             if hasattr(chunk, "_dense_vector"):

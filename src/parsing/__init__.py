@@ -202,6 +202,17 @@ from .page_spans import (
     extract_page_spans_from_pdf,
 )
 
+# Acórdãos TCU
+from .acordao_models import (
+    AcordaoSpanType,
+    AcordaoSpan,
+    AcordaoMetadata,
+    ParsedAcordao,
+    normalize_acordao_id,
+    parse_colegiado,
+)
+from .acordao_span_parser import AcordaoSpanParser
+
 __all__ = [
     # Core models
     "SpanType",
@@ -234,4 +245,12 @@ __all__ = [
     "TextLocation",
     "SpanLocation",
     "extract_page_spans_from_pdf",
+    # Acórdãos TCU
+    "AcordaoSpanType",
+    "AcordaoSpan",
+    "AcordaoMetadata",
+    "ParsedAcordao",
+    "normalize_acordao_id",
+    "parse_colegiado",
+    "AcordaoSpanParser",
 ]
