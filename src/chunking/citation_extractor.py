@@ -65,6 +65,74 @@ KNOWN_DOCUMENTS = {
     "carta magna": "CF-1988",
 }
 
+# Tabela canônica de normas: (tipo, número) -> ano correto
+# Usado para validar/corrigir anos extraídos incorretamente
+CANONICAL_NORMS = {
+    # Leis Federais
+    ("LEI", "8666"): 1993,       # Lei de Licitações (antiga)
+    ("LEI", "10520"): 2002,      # Lei do Pregão
+    ("LEI", "12462"): 2011,      # RDC
+    ("LEI", "13303"): 2016,      # Lei das Estatais
+    ("LEI", "14133"): 2021,      # Nova Lei de Licitações
+    ("LEI", "8429"): 1992,       # Lei de Improbidade
+    ("LEI", "9784"): 1999,       # Processo Administrativo Federal
+    ("LEI", "12527"): 2011,      # Lei de Acesso à Informação
+    ("LEI", "13709"): 2018,      # LGPD
+    ("LEI", "4320"): 1964,       # Normas Gerais de Direito Financeiro
+    ("LEI", "8112"): 1990,       # Estatuto do Servidor Público Federal
+    ("LEI", "10406"): 2002,      # Código Civil
+    ("LEI", "5172"): 1966,       # CTN - Código Tributário Nacional
+    ("LEI", "6404"): 1976,       # Lei das S.A.
+    ("LEI", "9472"): 1997,       # Lei Geral de Telecomunicações
+    ("LEI", "9478"): 1997,       # Lei do Petróleo
+    ("LEI", "11079"): 2004,      # Lei das PPPs
+    ("LEI", "11107"): 2005,      # Lei dos Consórcios Públicos
+    ("LEI", "8987"): 1995,       # Lei de Concessões
+    ("LEI", "13019"): 2014,      # Marco Regulatório das OSCs
+
+    # Leis Complementares
+    ("LC", "101"): 2000,         # LRF
+    ("LC", "123"): 2006,         # Estatuto ME/EPP
+    ("LC", "116"): 2003,         # ISS
+    ("LC", "87"): 1996,          # Lei Kandir (ICMS)
+
+    # Decretos
+    ("DECRETO", "10024"): 2019,  # Pregão Eletrônico
+    ("DECRETO", "10947"): 2022,  # Regulamenta Lei 14.133
+    ("DECRETO", "7892"): 2013,   # SRP
+    ("DECRETO", "9507"): 2018,   # Terceirização
+    ("DECRETO", "8538"): 2015,   # ME/EPP
+    ("DECRETO", "6170"): 2007,   # Convênios
+    ("DECRETO", "93872"): 1986,  # Unificação de recursos de caixa
+
+    # Instruções Normativas SEGES/ME
+    ("IN", "5"): 2017,           # Terceirização
+    ("IN", "40"): 2020,          # Elaboração de ETP
+    ("IN", "58"): 2022,          # ETP e TR
+    ("IN", "65"): 2021,          # Pesquisa de Preços
+    ("IN", "73"): 2020,          # Contratação de TIC
+    ("IN", "81"): 2022,          # Contratações de TIC
+    ("IN", "98"): 2022,          # Dispensa eletrônica
+
+    # Portarias
+    ("PORTARIA", "938"): 2022,   # Catálogo de Soluções de TIC
+    ("PORTARIA", "8678"): 2021,  # Modelo de Contratação de TIC
+}
+
+# Anos mínimos e máximos válidos por tipo de norma
+NORM_YEAR_BOUNDS = {
+    "LEI": (1824, 2030),           # Desde o Império
+    "LC": (1967, 2030),            # LC só existe desde 1967
+    "DECRETO": (1889, 2030),       # Desde a República
+    "DL": (1937, 1988),            # Decretos-Lei só até 1988
+    "IN": (1990, 2030),            # INs modernas
+    "PORTARIA": (1950, 2030),
+    "RESOLUCAO": (1950, 2030),
+    "ACORDAO": (1990, 2030),       # Acórdãos modernos
+    "MP": (1988, 2030),            # MPs só desde 1988
+    "EC": (1992, 2030),            # ECs à CF/88
+}
+
 # Padrões que indicam contexto normativo (acionam LLM fallback)
 NORMATIVE_CONTEXT_PATTERNS = [
     r"\bconforme\b",
@@ -456,17 +524,89 @@ class CitationExtractor:
         number: Optional[str],
         year: Optional[str]
     ) -> Optional[str]:
-        """Constrói doc_id normalizado."""
+        """
+        Constrói doc_id normalizado com validação de ano.
+
+        Usa CANONICAL_NORMS para:
+        1. Fornecer ano quando ausente
+        2. Corrigir ano quando claramente errado
+        """
         if not number:
             return None
 
         type_prefix = norm_type.value
-        parts = [type_prefix, number]
+        number_clean = number.replace(".", "").lstrip("0") or number
 
-        if year:
-            parts.append(year)
+        # Busca ano canônico na tabela
+        canonical_key = (type_prefix, number_clean)
+        canonical_year = CANONICAL_NORMS.get(canonical_key)
+
+        # Valida ano extraído
+        validated_year = self._validate_year(
+            type_prefix=type_prefix,
+            number=number_clean,
+            extracted_year=year,
+            canonical_year=canonical_year
+        )
+
+        parts = [type_prefix, number_clean]
+        if validated_year:
+            parts.append(str(validated_year))
 
         return "-".join(parts)
+
+    def _validate_year(
+        self,
+        type_prefix: str,
+        number: str,
+        extracted_year: Optional[str],
+        canonical_year: Optional[int]
+    ) -> Optional[int]:
+        """
+        Valida e corrige o ano extraído.
+
+        Regras:
+        1. Se temos ano canônico, usa ele (mais confiável)
+        2. Se ano extraído está fora dos limites válidos, descarta
+        3. Se ano extraído é claramente errado (ex: Lei 8.666/2021), corrige
+        """
+        # Se temos ano canônico, é sempre preferido
+        if canonical_year:
+            if extracted_year:
+                try:
+                    ext_year = int(extracted_year)
+                    # Log se há discrepância significativa
+                    if abs(ext_year - canonical_year) > 2:
+                        logger.debug(
+                            f"Ano corrigido: {type_prefix}-{number}/{extracted_year} "
+                            f"-> {canonical_year}"
+                        )
+                except ValueError:
+                    pass
+            return canonical_year
+
+        # Se não temos canônico mas temos extraído, valida
+        if extracted_year:
+            try:
+                year_int = int(extracted_year)
+
+                # Verifica limites por tipo de norma
+                bounds = NORM_YEAR_BOUNDS.get(type_prefix, (1900, 2030))
+                min_year, max_year = bounds
+
+                if year_int < min_year or year_int > max_year:
+                    logger.warning(
+                        f"Ano fora dos limites: {type_prefix}-{number}/{extracted_year} "
+                        f"(válido: {min_year}-{max_year})"
+                    )
+                    return None
+
+                return year_int
+
+            except ValueError:
+                return None
+
+        return None
 
     def _build_span_ref(
         self,
