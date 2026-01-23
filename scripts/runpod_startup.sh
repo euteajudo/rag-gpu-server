@@ -92,13 +92,17 @@ pkill -f "uvicorn.*main:app" 2>/dev/null || true
 sleep 2
 
 # Inicia vLLM (porta 8001)
-echo "  - Iniciando vLLM (porta 8001, 32K contexto)..."
+# IMPORTANTE: gpu-memory-utilization deve ser <= 0.65 para deixar espaço
+# para BGE-M3 (~2.5GB), Reranker (~2.5GB) e Docling (~1GB)
+# A40 48GB: 0.65 * 48 = 31.2GB para vLLM, ~12GB para outros modelos
+echo "  - Iniciando vLLM (porta 8001, 8K contexto, 65% GPU)..."
 nohup python3 -m vllm.entrypoints.openai.api_server \
     --model $SNAPSHOT_PATH \
     --host 0.0.0.0 \
     --port 8001 \
-    --max-model-len 32000 \
-    --gpu-memory-utilization 0.85 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.65 \
+    --enable-prefix-caching \
     > $LOGS/vllm.log 2>&1 &
 
 # Aguarda vLLM iniciar
