@@ -25,6 +25,7 @@ from enum import Enum
 
 from .models import IngestRequest, ProcessedChunk, IngestStatus, IngestError
 from .quality_validator import QualityValidator
+from ..chunking.citation_extractor import extract_citations_from_chunk
 
 
 class ExtractionMethod(str, Enum):
@@ -744,6 +745,12 @@ class IngestionPipeline:
                 )
             else:
                 # MaterializedChunk (leis/decretos)
+                # Extrai citações normativas do texto do chunk
+                chunk_citations = extract_citations_from_chunk(
+                    text=chunk.text or "",
+                    document_id=request.document_id,
+                )
+
                 pc = ProcessedChunk(
                     node_id=chunk.node_id,
                     chunk_id=chunk.chunk_id,
@@ -762,6 +769,7 @@ class IngestionPipeline:
                     numero=request.numero,
                     ano=request.ano,
                     article_number=chunk.article_number or "",
+                    citations=chunk_citations,  # Lista de target_node_ids citados
                 )
 
             # Adiciona vetores se foram gerados

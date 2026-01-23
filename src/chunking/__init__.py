@@ -206,6 +206,13 @@ from .acordao_chunker import (
     materialize_acordao,
 )
 
+# Extração de citações normativas
+from .citation_extractor import (
+    CitationExtractor,
+    extract_citations_from_chunk,
+    NormativeReference,
+)
+
 __all__ = [
     # Modelos
     "LegalChunk",
@@ -230,4 +237,8 @@ __all__ = [
     "AcordaoChunkMetadata",
     "MaterializedAcordaoChunk",
     "materialize_acordao",
+    # Extração de citações
+    "CitationExtractor",
+    "extract_citations_from_chunk",
+    "NormativeReference",
 ]
