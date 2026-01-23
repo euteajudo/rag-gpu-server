@@ -1,24 +1,61 @@
 # =============================================================================
-# RAG GPU Server - Dependencies
+# VectorGov RAG GPU Server - Requirements
 # =============================================================================
-# Para GPU com CUDA 12.x
-# Versoes especificas para garantir compatibilidade
+# Pacotes essenciais para o servidor GPU no RunPod
+# Baseado no backup do pod anterior (pip_freeze.txt)
+# Instalação: pip install -r requirements.txt
+# =============================================================================
 
-# Web framework
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.5.0
+# --- Core ML/GPU ---
+torch>=2.9.0
+torchvision>=0.24.0
+torchaudio>=2.9.0
+vllm>=0.13.0
+transformers>=4.57.0
+accelerate>=1.12.0
+safetensors>=0.7.0
 
-# PyTorch e dependencias (versoes compativeis)
-# IMPORTANTE: torch, torchvision e torchaudio devem ser da mesma versao
-torch==2.4.1+cu124
-torchvision==0.19.1+cu124
-torchaudio==2.4.1+cu124
+# --- Embeddings & Reranking ---
+FlagEmbedding>=1.3.5
+sentence-transformers>=5.2.0
 
-# ML/Embeddings
-FlagEmbedding>=1.2.0,<1.4.0
-transformers>=4.36.0,<4.50.0
-sentence-transformers>=2.2.0,<3.0.0
+# --- PDF Processing (Docling) ---
+docling>=2.67.0
+docling-core>=2.58.1
+docling-ibm-models>=3.10.3
+docling-parse>=4.7.2
+PyMuPDF>=1.26.0
+pypdfium2>=4.30.0
+easyocr>=1.7.2
 
-# Utils
-numpy>=1.24.0,<2.0.0
+# --- API/Web ---
+fastapi>=0.128.0
+uvicorn>=0.40.0
+httpx>=0.28.0
+pydantic>=2.12.0
+pydantic-settings>=2.12.0
+python-multipart>=0.0.21
+sse-starlette>=3.1.0
+
+# --- HuggingFace ---
+huggingface-hub>=0.36.0
+tokenizers>=0.22.0
+sentencepiece>=0.2.0
+tiktoken>=0.12.0
+
+# --- Utilities ---
+python-dotenv>=1.2.0
+loguru>=0.7.3
+tqdm>=4.67.0
+rich>=14.2.0
+numpy>=2.2.0
+pandas>=2.3.0
+Pillow>=11.3.0
+PyYAML>=6.0.0
+
+# --- OpenAI Client (para vLLM) ---
+openai>=2.14.0
+
+# --- Monitoring ---
+prometheus-fastapi-instrumentator>=7.1.0
+prometheus-client>=0.23.0
