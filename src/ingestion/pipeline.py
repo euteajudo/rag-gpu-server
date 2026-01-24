@@ -184,6 +184,16 @@ class IngestionPipeline:
     # === Acórdãos TCU ===
     _acordao_parser = None
     _acordao_chunker = None
+    _chunk_enricher = None
+
+    @property
+    def chunk_enricher(self):
+        """Enricher para adicionar contexto semântico aos chunks."""
+        if self._chunk_enricher is None:
+            from ..enrichment import ChunkEnricher
+            self._chunk_enricher = ChunkEnricher(llm_client=self.llm_client)
+            logger.info("ChunkEnricher inicializado")
+        return self._chunk_enricher
 
     @property
     def acordao_parser(self):
@@ -326,14 +336,22 @@ class IngestionPipeline:
                         return result
                     report_progress("parsing_acordao", 0.55)
 
-                    # Fase 3A: AcordaoChunker (materializa direto, sem LLM) - 55% a 75%
-                    report_progress("materialization_acordao", 0.60)
+                    # Fase 3A: AcordaoChunker (materializa) - 55% a 65%
+                    report_progress("materialization_acordao", 0.55)
                     materialized = self._phase_materialization_acordao(
                         parsed_acordao, request, result
                     )
                     if result.status == IngestStatus.FAILED:
                         return result
-                    report_progress("materialization_acordao", 0.75)
+                    report_progress("materialization_acordao", 0.65)
+
+                    # Fase 4A: Enriquecimento com LLM - 65% a 75%
+                    if not request.skip_enrichment:
+                        report_progress("enrichment_acordao", 0.65)
+                        self._phase_enrichment_acordao(materialized, request, result)
+                        if result.status == IngestStatus.FAILED:
+                            return result
+                        report_progress("enrichment_acordao", 0.75)
 
                 else:
                     # === PIPELINE LEIS/DECRETOS ===
@@ -564,6 +582,10 @@ class IngestionPipeline:
                 parsed_acordao.metadata.data_sessao = request.data_sessao
             if request.unidade_tecnica and not parsed_acordao.metadata.unidade_tecnica:
                 parsed_acordao.metadata.unidade_tecnica = request.unidade_tecnica
+            if request.unidade_jurisdicionada and not parsed_acordao.metadata.unidade_jurisdicionada:
+                parsed_acordao.metadata.unidade_jurisdicionada = request.unidade_jurisdicionada
+            if request.titulo and not parsed_acordao.metadata.titulo:
+                parsed_acordao.metadata.titulo = request.titulo
             if request.numero:
                 parsed_acordao.metadata.numero = int(request.numero)
             if request.ano:
@@ -611,6 +633,48 @@ class IngestionPipeline:
             result.status = IngestStatus.FAILED
             result.errors.append(IngestError(phase="materialization_acordao", message=str(e)))
             return None
+
+    def _phase_enrichment_acordao(self, materialized, request: IngestRequest, result: PipelineResult):
+        """Fase 4A: Enriquecimento de chunks de acordao com LLM."""
+        phase_start = time.perf_counter()
+        try:
+            logger.info(f"Fase 4A: Enriquecimento de {len(materialized)} chunks de acordao...")
+
+            from ..enrichment import DocumentMetadata
+
+            # Cria metadados do documento para o enricher
+            doc_meta = DocumentMetadata(
+                document_id=request.document_id,
+                document_type="ACORDAO",
+                number=request.numero,
+                year=request.ano,
+                issuing_body="TCU",  # Tribunal de Contas da União
+            )
+
+            # Enriquece chunks (modifica in-place)
+            self.chunk_enricher.apply_to_chunks(
+                chunks=materialized,
+                doc_meta=doc_meta,
+                batch_size=5,  # Processa 5 chunks por chamada LLM
+            )
+
+            # Estatísticas do enricher
+            stats = self.chunk_enricher.get_stats()
+
+            duration = round(time.perf_counter() - phase_start, 2)
+            result.phases.append({
+                "name": "enrichment_acordao",
+                "duration_seconds": duration,
+                "output": f"Enriquecidos {len(materialized)} chunks de acordao",
+                "enricher_stats": stats,
+                "success": True,
+            })
+            logger.info(f"Fase 4A: Enriquecimento concluido em {duration}s - {stats.get('chunks_processed', 0)} processados")
+
+        except Exception as e:
+            logger.error(f"Erro no enriquecimento de acordao: {e}", exc_info=True)
+            result.status = IngestStatus.FAILED
+            result.errors.append(IngestError(phase="enrichment_acordao", message=str(e)))
 
     def _phase_extraction(self, parsed_doc, result: PipelineResult, max_articles: Optional[int] = None):
         """Fase 3: ArticleOrchestrator - LLM extraction"""
