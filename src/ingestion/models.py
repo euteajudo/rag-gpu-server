@@ -74,6 +74,13 @@ class ProcessedChunk(BaseModel):
     ano: int
     article_number: str = Field("", description="Número do artigo")
 
+    # Campos específicos para Acórdãos TCU (opcionais)
+    colegiado: Optional[str] = Field(None, description="Colegiado: P (Plenário), 1C, 2C")
+    processo: Optional[str] = Field(None, description="Número do processo (TC xxx.xxx/xxxx-x)")
+    relator: Optional[str] = Field(None, description="Nome do Ministro Relator")
+    data_sessao: Optional[str] = Field(None, description="Data da sessão (DD/MM/YYYY)")
+    unidade_tecnica: Optional[str] = Field(None, description="Unidade técnica responsável")
+
     # Vetores (opcionais, preenchidos se skip_embeddings=False)
     dense_vector: Optional[list[float]] = Field(None, description="Embedding dense 1024d")
     sparse_vector: Optional[dict[int, float]] = Field(None, description="Embedding sparse")

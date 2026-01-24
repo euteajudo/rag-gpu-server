@@ -804,7 +804,12 @@ class IngestionPipeline:
                     numero=request.numero,
                     ano=request.ano,
                     article_number="",  # Acórdãos usam span_id
-                    # Campos específicos de acórdão (via citations como JSON)
+                    # Campos específicos de acórdão
+                    colegiado=getattr(chunk, "colegiado", None) or request.colegiado,
+                    processo=getattr(chunk, "processo", None) or request.processo,
+                    relator=getattr(chunk, "relator", None) or request.relator,
+                    data_sessao=getattr(chunk, "data_sessao", None) or request.data_sessao,
+                    unidade_tecnica=getattr(chunk, "unidade_tecnica", None) or request.unidade_tecnica,
                     citations=[chunk.acordao_id] if hasattr(chunk, "acordao_id") else [],
                 )
             else:
