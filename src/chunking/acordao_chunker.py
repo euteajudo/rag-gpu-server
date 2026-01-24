@@ -82,7 +82,9 @@ class MaterializedAcordaoChunk:
     relator: str
     data_sessao: str
     unidade_tecnica: str
+    unidade_jurisdicionada: str  # Unidade jurisdicionada
     codigo_eletronico: str
+    titulo: str  # Título/Sumário do acórdão
 
     # Conteudo
     text: str
@@ -123,7 +125,9 @@ class MaterializedAcordaoChunk:
             "relator": self.relator,
             "data_sessao": self.data_sessao,
             "unidade_tecnica": self.unidade_tecnica,
+            "unidade_jurisdicionada": self.unidade_jurisdicionada,
             "codigo_eletronico": self.codigo_eletronico,
+            "titulo": self.titulo,
             "text": self.text,
             "enriched_text": self.enriched_text or self.text,
             "context_header": self.context_header,
@@ -224,7 +228,9 @@ class AcordaoChunker:
             relator=acordao.metadata.relator,
             data_sessao=acordao.metadata.data_sessao,
             unidade_tecnica=acordao.metadata.unidade_tecnica,
+            unidade_jurisdicionada=acordao.metadata.unidade_jurisdicionada,
             codigo_eletronico=acordao.metadata.codigo_eletronico,
+            titulo=acordao.metadata.titulo,
             text=span.text,
             metadata=metadata,
         )

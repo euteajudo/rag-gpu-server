@@ -93,6 +93,8 @@ class AcordaoMetadata:
     relator: str = ""
     data_sessao: str = ""  # DD/MM/YYYY
     unidade_tecnica: str = ""
+    unidade_jurisdicionada: str = ""  # Órgão/Entidade objeto da deliberação
+    titulo: str = ""  # Título/Sumário do acórdão
     interessado: str = ""
     assunto: str = ""
     grupo: str = ""  # GRUPO II

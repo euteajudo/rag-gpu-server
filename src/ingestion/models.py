@@ -38,6 +38,7 @@ class IngestRequest(BaseModel):
     relator: Optional[str] = Field(None, description="Nome do Ministro Relator")
     data_sessao: Optional[str] = Field(None, description="Data da sessão (DD/MM/YYYY)")
     unidade_tecnica: Optional[str] = Field(None, description="Unidade técnica responsável")
+    unidade_jurisdicionada: Optional[str] = Field(None, description="Órgão/Entidade objeto da deliberação")
 
     # Configurações opcionais
     skip_enrichment: bool = Field(False, description="Pular enriquecimento LLM")

@@ -181,6 +181,7 @@ async def ingest_pdf(
     relator: Optional[str] = Form(None, description="Nome do Ministro Relator"),
     data_sessao: Optional[str] = Form(None, description="Data da sessao (DD/MM/YYYY)"),
     unidade_tecnica: Optional[str] = Form(None, description="Unidade tecnica responsavel"),
+    unidade_jurisdicionada: Optional[str] = Form(None, description="Orgao/Entidade objeto da deliberacao"),
     # Configuracoes opcionais
     skip_embeddings: bool = Form(False, description="Pular geracao de embeddings"),
     max_articles: Optional[int] = Form(None, description="Limite de artigos (debug)"),
@@ -218,6 +219,7 @@ async def ingest_pdf(
         relator=relator,
         data_sessao=data_sessao,
         unidade_tecnica=unidade_tecnica,
+        unidade_jurisdicionada=unidade_jurisdicionada,
         # Configuracoes opcionais
         skip_embeddings=skip_embeddings,
         max_articles=max_articles,
