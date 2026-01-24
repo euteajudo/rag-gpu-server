@@ -184,6 +184,7 @@ async def ingest_pdf(
     unidade_jurisdicionada: Optional[str] = Form(None, description="Orgao/Entidade objeto da deliberacao"),
     # Configuracoes opcionais
     skip_embeddings: bool = Form(False, description="Pular geracao de embeddings"),
+    skip_enrichment: bool = Form(False, description="Pular enriquecimento LLM (enriquecer apos indexacao)"),
     max_articles: Optional[int] = Form(None, description="Limite de artigos (debug)"),
 ):
     """
@@ -222,6 +223,7 @@ async def ingest_pdf(
         unidade_jurisdicionada=unidade_jurisdicionada,
         # Configuracoes opcionais
         skip_embeddings=skip_embeddings,
+        skip_enrichment=skip_enrichment,
         max_articles=max_articles,
     )
 

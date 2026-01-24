@@ -90,6 +90,10 @@ class ProcessedChunk(BaseModel):
     citations: list[str] = Field(default_factory=list, description="Spans citados")
     schema_version: str = Field("1.0.0")
 
+    # Campos adicionais para Milvus leis_v4
+    aliases: str = Field("", description="Aliases/termos alternativos do chunk")
+    sparse_source: str = Field("", description="Texto fonte para sparse embedding")
+
     class Config:
         json_schema_extra = {
             "example": {

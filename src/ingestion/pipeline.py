@@ -786,6 +786,10 @@ class IngestionPipeline:
         for chunk in materialized:
             if is_acordao:
                 # MaterializedAcordaoChunk
+                # Prepara aliases para acórdão
+                acordao_aliases = getattr(chunk, "aliases", "[]")
+                acordao_sparse_source = getattr(chunk, "sparse_source", "") or chunk.enriched_text or chunk.text or ""
+
                 pc = ProcessedChunk(
                     node_id=chunk.node_id,
                     chunk_id=chunk.chunk_id,
@@ -804,13 +808,15 @@ class IngestionPipeline:
                     numero=request.numero,
                     ano=request.ano,
                     article_number="",  # Acórdãos usam span_id
-                    # Campos específicos de acórdão
-                    colegiado=getattr(chunk, "colegiado", None) or request.colegiado,
-                    processo=getattr(chunk, "processo", None) or request.processo,
-                    relator=getattr(chunk, "relator", None) or request.relator,
-                    data_sessao=getattr(chunk, "data_sessao", None) or request.data_sessao,
-                    unidade_tecnica=getattr(chunk, "unidade_tecnica", None) or request.unidade_tecnica,
+                    # Campos específicos de acórdão (NUNCA None - Milvus nullable=False)
+                    colegiado=(getattr(chunk, "colegiado", None) or request.colegiado) or "",
+                    processo=(getattr(chunk, "processo", None) or request.processo) or "",
+                    relator=(getattr(chunk, "relator", None) or request.relator) or "",
+                    data_sessao=(getattr(chunk, "data_sessao", None) or request.data_sessao) or "",
+                    unidade_tecnica=(getattr(chunk, "unidade_tecnica", None) or request.unidade_tecnica) or "",
                     citations=[chunk.acordao_id] if hasattr(chunk, "acordao_id") else [],
+                    aliases=acordao_aliases,
+                    sparse_source=acordao_sparse_source,
                 )
             else:
                 # MaterializedChunk (leis/decretos)
@@ -819,6 +825,20 @@ class IngestionPipeline:
                     text=chunk.text or "",
                     document_id=request.document_id,
                 )
+
+                # Prepara aliases (converte lista para JSON string se necessário)
+                chunk_aliases = getattr(chunk, "aliases", [])
+                if isinstance(chunk_aliases, list):
+                    import json
+                    chunk_aliases = json.dumps(chunk_aliases)
+                else:
+                    chunk_aliases = chunk_aliases or ""
+
+                # Prepara sparse_source
+                chunk_sparse_source = getattr(chunk, "sparse_source", "")
+                if not chunk_sparse_source:
+                    # Usa enriched_text como fallback
+                    chunk_sparse_source = chunk.enriched_text or chunk.text or ""
 
                 pc = ProcessedChunk(
                     node_id=chunk.node_id,
@@ -839,6 +859,8 @@ class IngestionPipeline:
                     ano=request.ano,
                     article_number=chunk.article_number or "",
                     citations=chunk_citations,  # Lista de target_node_ids citados
+                    aliases=chunk_aliases,
+                    sparse_source=chunk_sparse_source,
                 )
 
             # Adiciona vetores se foram gerados
