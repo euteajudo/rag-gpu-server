@@ -451,41 +451,18 @@ class ArticleOrchestrator:
         """
         Extrai hierarquia completa de todos os artigos.
 
+        NOTA: Este método agora usa extract_all_articles_with_split() para
+        dividir automaticamente artigos grandes (>10k chars) em partes menores,
+        evitando erros HTTP 422 do GPU Server durante o enriquecimento.
+
         Args:
             parsed_doc: Documento já parseado pelo SpanParser
 
         Returns:
             ArticleExtractionResult com chunks e validação
         """
-        result = ArticleExtractionResult(total_articles=len(parsed_doc.articles))
-
-        for article in parsed_doc.articles:
-            try:
-                chunk = self._extract_article(article, parsed_doc)
-                result.chunks.append(chunk)
-
-                # Atualiza estatísticas
-                if chunk.status == ValidationStatus.VALID:
-                    result.valid_articles += 1
-                elif chunk.status == ValidationStatus.SUSPECT:
-                    result.suspect_articles += 1
-                else:
-                    result.invalid_articles += 1
-
-            except Exception as e:
-                logger.error(f"Erro ao extrair {article.span_id}: {e}")
-                result.errors.append({
-                    "article_id": article.span_id,
-                    "error": str(e)
-                })
-                result.invalid_articles += 1
-
-        logger.info(
-            f"Extração concluída: {result.valid_articles}/{result.total_articles} válidos, "
-            f"{result.suspect_articles} suspeitos, {result.invalid_articles} inválidos"
-        )
-
-        return result
+        # Delega para versão com split de artigos grandes
+        return self.extract_all_articles_with_split(parsed_doc)
 
     def _extract_article(
         self,
@@ -1105,6 +1082,166 @@ Retorne a lista COMPLETA:
         for child in parsed_doc.get_children(parent_id):
             lines.append(f"{prefix}{child.text}")
             self._add_children_text(child.span_id, parsed_doc, lines, indent + 1)
+
+    def _split_large_article(
+        self,
+        article: Span,
+        parsed_doc: ParsedDocument,
+        max_chars: int = 5000
+    ) -> list[tuple[str, str, list[str]]]:
+        """
+        Divide artigo grande em partes menores preservando estrutura.
+
+        Args:
+            article: Span do artigo a dividir
+            parsed_doc: Documento completo parseado
+            max_chars: Tamanho máximo de cada parte (default: 5000)
+
+        Returns:
+            Lista de tuplas (part_id, text, child_ids) para cada parte
+            Exemplo: [
+                ("ART-006-PART-1", "Art. 6º Para...", ["INC-006-I", "INC-006-II"]),
+                ("ART-006-PART-2", "[continuação]...", ["INC-006-III", "INC-006-IV"])
+            ]
+
+        Estratégia de Split:
+            1. Extrai todos os filhos (parágrafos, incisos, alíneas)
+            2. Divide filhos em grupos que não excedam max_chars
+            3. Cada grupo se torna uma "parte" do artigo
+            4. Preserva IDs originais dos filhos em cada parte
+        """
+        # 1. Obtém todos os filhos do artigo
+        children = self._get_all_descendants(article.span_id, parsed_doc)
+
+        # Se o artigo inteiro cabe em max_chars, não divide
+        if len(article.text) <= max_chars:
+            return [(article.span_id, article.text, [article.span_id])]
+
+        # 2. Ordena filhos por posição no texto
+        children_sorted = sorted(children, key=lambda s: article.text.find(s.text))
+
+        # 3. Divide em partes
+        parts = []
+        current_part_text = ""
+        current_part_children = []
+        part_number = 1
+
+        # Cabeçalho do artigo (primeira linha, ex: "Art. 6º Para os fins desta Lei:")
+        article_header = article.text.split('\n')[0] if '\n' in article.text else article.text[:200]
+
+        for child in children_sorted:
+            # Se adicionar este filho exceder o limite, inicia nova parte
+            child_text = child.text
+            if current_part_text and len(current_part_text) + len(child_text) > max_chars:
+                # Salva parte atual
+                part_id = f"{article.span_id}-PART-{part_number}"
+                parts.append((
+                    part_id,
+                    f"[PARTE {part_number}]\n{article_header}\n\n{current_part_text}",
+                    current_part_children
+                ))
+
+                # Inicia nova parte
+                part_number += 1
+                current_part_text = child_text + "\n"
+                current_part_children = [child.span_id]
+            else:
+                # Adiciona à parte atual
+                current_part_text += child_text + "\n"
+                current_part_children.append(child.span_id)
+
+        # Salva última parte
+        if current_part_text:
+            part_id = f"{article.span_id}-PART-{part_number}"
+            parts.append((
+                part_id,
+                f"[PARTE {part_number}]\n{article_header}\n\n{current_part_text}",
+                current_part_children
+            ))
+
+        logger.info(
+            f"Artigo {article.span_id} dividido em {len(parts)} partes "
+            f"(original: {len(article.text)} chars)"
+        )
+
+        return parts
+
+    def extract_all_articles_with_split(
+        self,
+        parsed_doc: ParsedDocument,
+        large_article_threshold: int = 10000
+    ) -> ArticleExtractionResult:
+        """
+        Versão modificada de extract_all_articles que divide artigos grandes.
+
+        Args:
+            parsed_doc: Documento parseado
+            large_article_threshold: Artigos >threshold chars são divididos (default: 10k)
+
+        Returns:
+            ArticleExtractionResult com chunks (incluindo partes de artigos grandes)
+        """
+        result = ArticleExtractionResult(total_articles=len(parsed_doc.articles))
+
+        for article in parsed_doc.articles:
+            try:
+                # Detecta se artigo é grande
+                if len(article.text) > large_article_threshold:
+                    logger.warning(
+                        f"Artigo grande detectado: {article.span_id} "
+                        f"({len(article.text)} chars) - dividindo em partes"
+                    )
+
+                    # Divide artigo em partes
+                    parts = self._split_large_article(article, parsed_doc)
+
+                    # Processa cada parte como um chunk independente
+                    for part_id, part_text, child_ids in parts:
+                        # Cria ArticleChunk simplificado para esta parte
+                        chunk = ArticleChunk(
+                            article_id=part_id,
+                            article_number=article.identifier or "",
+                            text=part_text,
+                            citations=child_ids,  # IDs dos filhos nesta parte
+                            inciso_ids=[],  # Não extrai hierarquia para partes
+                            paragrafo_ids=[],
+                            status=ValidationStatus.VALID,
+                            validation_notes=[f"Parte de artigo grande (split automático)"],
+                            parser_paragrafos_count=0,
+                            parser_incisos_count=0,
+                            llm_paragrafos_count=0,
+                            llm_incisos_count=0,
+                            retry_count=0,
+                        )
+                        result.chunks.append(chunk)
+                        result.valid_articles += 1
+                else:
+                    # Processa normalmente (artigo pequeno)
+                    chunk = self._extract_article(article, parsed_doc)
+                    result.chunks.append(chunk)
+
+                    # Atualiza estatísticas
+                    if chunk.status == ValidationStatus.VALID:
+                        result.valid_articles += 1
+                    elif chunk.status == ValidationStatus.SUSPECT:
+                        result.suspect_articles += 1
+                    else:
+                        result.invalid_articles += 1
+
+            except Exception as e:
+                logger.error(f"Erro ao extrair {article.span_id}: {e}")
+                result.errors.append({
+                    "article_id": article.span_id,
+                    "error": str(e)
+                })
+                result.invalid_articles += 1
+
+        logger.info(
+            f"Extração concluída: {result.valid_articles}/{result.total_articles} válidos, "
+            f"{result.suspect_articles} suspeitos, {result.invalid_articles} inválidos"
+        )
+
+        return result
 
 
 # =============================================================================
