@@ -1023,6 +1023,12 @@ sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
   - Gera partes ART-XXX-P1, P2, P3...
   - Parent marcado com `_skip_milvus_index=True`
 
+- **ChunkMaterializer - Correção parent_chunk_id de Incisos**
+  - Incisos agora apontam para o parágrafo pai quando existir
+  - Usa `inc_span.parent_id` do SpanParser (antes era ignorado)
+  - Fallback para artigo quando não há parágrafo pai
+  - Corrige hierarquia: `INC-018-V → PAR-018-1` (antes: `INC-018-V → ART-018`)
+
 - **MarkdownSanitizer - Novo Módulo**
   - Remove anomalias do Docling (`<!-- image -->`, etc)
   - Normaliza espaços e linhas em branco

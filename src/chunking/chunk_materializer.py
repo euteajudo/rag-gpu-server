@@ -649,10 +649,16 @@ class ChunkMaterializer:
             inc_text = self._reconstruct_inciso_text(inc_id, parsed_doc)
             inc_citations = self._get_inciso_citations(inc_id, parsed_doc)
 
+            # Determina parent_chunk_id correto: parágrafo (se existir) ou artigo
+            if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
+                correct_parent_chunk_id = f"{self.document_id}#{inc_span.parent_id}"
+            else:
+                correct_parent_chunk_id = parent_chunk_id  # Fallback para artigo
+
             child = MaterializedChunk(
                 node_id=child_node_id,
                 chunk_id=child_chunk_id,
-                parent_chunk_id=parent_chunk_id,
+                parent_chunk_id=correct_parent_chunk_id,
                 span_id=inc_id,
                 device_type=DeviceType.INCISO,
                 chunk_level=ChunkLevel.DEVICE,
@@ -938,10 +944,16 @@ class ChunkMaterializer:
                 inc_text = self._reconstruct_inciso_text(inc_id, parsed_doc)
                 inc_citations = self._get_inciso_citations(inc_id, parsed_doc)
 
+                # Determina parent_chunk_id correto: parágrafo (se existir) ou artigo
+                if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
+                    correct_parent_chunk_id = f"{self.document_id}#{inc_span.parent_id}"
+                else:
+                    correct_parent_chunk_id = parent_chunk_id  # Fallback para artigo
+
                 child = MaterializedChunk(
                     node_id=child_node_id,
                     chunk_id=child_chunk_id,
-                    parent_chunk_id=parent_chunk_id,
+                    parent_chunk_id=correct_parent_chunk_id,
                     span_id=inc_id,
                     device_type=DeviceType.INCISO,
                     chunk_level=ChunkLevel.DEVICE,
