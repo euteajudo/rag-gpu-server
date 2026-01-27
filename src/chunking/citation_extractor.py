@@ -17,11 +17,15 @@ Formato de saída (JSON string para Milvus VarChar):
     {
         "raw": "Lei nº 14.133/2021",
         "type": "LEI",
-        "doc_id": "LEI-14133-2021",
+        "doc_id": "LEI-14.133-2021",
         "span_ref": null,
-        "target_node_id": "leis:LEI-14133-2021"
+        "target_node_id": "leis:LEI-14.133-2021"
     }
 ]
+
+NOTA: doc_id e target_node_id são normalizados via normalize_document_id():
+- Números >= 1000 recebem ponto de milhar: 14133 -> 14.133
+- Anos (4 dígitos no final) não recebem ponto: 2021 fica 2021
 
 @author: Equipe VectorGov
 @since: 22/01/2025
@@ -33,6 +37,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 from enum import Enum
+
+from src.utils.normalization import normalize_document_id
 
 logger = logging.getLogger(__name__)
 
@@ -553,7 +559,9 @@ class CitationExtractor:
         if validated_year:
             parts.append(str(validated_year))
 
-        return "-".join(parts)
+        # Aplica normalizacao para garantir formato canonico (ex: LEI-14.133-2021)
+        raw_doc_id = "-".join(parts)
+        return normalize_document_id(raw_doc_id)
 
     def _validate_year(
         self,

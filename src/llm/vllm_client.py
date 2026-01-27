@@ -50,7 +50,7 @@ class LLMConfig:
     """Configuracao do cliente LLM."""
 
     # Conexao
-    base_url: str = field(default_factory=lambda: os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"))
+    base_url: str = field(default_factory=lambda: os.getenv("VLLM_BASE_URL", "http://localhost:8002/v1"))
     api_key: str = "not-needed"  # vLLM nao precisa de API key
     timeout: float = 120.0  # segundos
 
