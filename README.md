@@ -854,14 +854,27 @@ O projeto está dividido em **2 repositórios** que correspondem à separação 
 │                                                                     │
 │   rag-gpu-server/                                                   │
 │   ├── src/                                                          │
-│   │   ├── main.py           # FastAPI app                           │
-│   │   ├── embedder.py       # BGE-M3 wrapper                        │
-│   │   ├── reranker.py       # BGE-Reranker wrapper                  │
-│   │   └── config.py         # Configurações                         │
+│   │   ├── main.py              # FastAPI app                        │
+│   │   ├── embedder.py          # BGE-M3 wrapper                     │
+│   │   ├── reranker.py          # BGE-Reranker wrapper               │
+│   │   ├── config.py            # Configurações                      │
+│   │   ├── ingestion/                                                │
+│   │   │   ├── pipeline.py      # Pipeline de ingestão               │
+│   │   │   ├── models.py        # Modelos Pydantic                   │
+│   │   │   └── markdown_sanitizer.py  # Limpeza de markdown          │
+│   │   ├── parsing/                                                  │
+│   │   │   ├── span_parser.py   # Parser de estrutura legal          │
+│   │   │   ├── span_models.py   # Modelos de spans                   │
+│   │   │   └── article_orchestrator.py  # Extração LLM               │
+│   │   ├── chunking/                                                 │
+│   │   │   ├── chunk_materializer.py  # Materialização + split       │
+│   │   │   └── citation_extractor.py  # Extração de citações         │
+│   │   └── llm/                                                      │
+│   │       └── vllm_client.py   # Cliente vLLM                       │
 │   ├── monitoring/                                                   │
-│   │   └── dashboard.py      # Dashboard Streamlit (roda local)      │
+│   │   └── dashboard.py         # Dashboard Streamlit (roda local)   │
 │   ├── scripts/                                                      │
-│   │   └── warmup.py         # Pré-carrega modelos                   │
+│   │   └── warmup.py            # Pré-carrega modelos                │
 │   └── requirements.txt                                              │
 └─────────────────────────────────────────────────────────────────────┘
 
@@ -982,6 +995,44 @@ sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
 ---
 
 ## Histórico de Mudanças
+
+### 2025-01-27
+
+- **SpanParser - Prefixos Numéricos do Docling**
+  - Regex atualizado para aceitar "11. Art. 56" (listas numeradas)
+  - Limpeza automática dos prefixos no texto final
+  - Corrige ART-056 e ART-057 que não eram detectados na Lei 14.133
+
+- **VLLMClient - Fallback para JSON Inválido**
+  - Captura `JSONDecodeError` e retorna `{}` ao invés de crash
+  - Tenta extrair JSON válido da resposta truncada
+  - Evita perda de artigos grandes como ART-006 (~23k chars)
+
+- **Pipeline - Filtro `_skip_milvus_index`**
+  - Adiciona verificação em `_phase_embeddings()`
+  - Adiciona verificação em `_to_processed_chunks()`
+  - Parents de artigos splitados não são mais indexados
+
+- **CitationExtractor - Remoção de Parent-Loops**
+  - `normalize_citations()` aceita `parent_chunk_id` e `document_type`
+  - Remove citações onde filho cita o pai (ex: ART-006-P1 → ART-006)
+  - Mantém citações externas válidas
+
+- **ChunkMaterializer - Split de Artigos Grandes**
+  - Threshold de 8000 chars para split
+  - Gera partes ART-XXX-P1, P2, P3...
+  - Parent marcado com `_skip_milvus_index=True`
+
+- **MarkdownSanitizer - Novo Módulo**
+  - Remove anomalias do Docling (`<!-- image -->`, etc)
+  - Normaliza espaços e linhas em branco
+
+- **Testado com Lei 14.133/2021**:
+  - 1299 chunks gerados
+  - ART-006 splitado em 6 partes (~23k chars total)
+  - ART-056 e ART-057 presentes (antes faltavam)
+  - ART-075 splitado em 3 partes
+  - Texto limpo sem prefixos numéricos
 
 ### 2025-01-20
 
