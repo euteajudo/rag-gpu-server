@@ -571,9 +571,18 @@ class VLLMClient:
                     raise
 
             except json.JSONDecodeError as e:
-                # Isso nao deveria acontecer com json_schema
-                logger.error(f"JSON invalido mesmo com json_schema: {e}")
-                raise
+                # Fallback: tenta extrair JSON valido da resposta
+                logger.warning(f"JSON invalido com json_schema, tentando extrair: {e}")
+                import re
+                match = re.search(r"\{[\s\S]*\}", content)
+                if match:
+                    try:
+                        return json.loads(match.group())
+                    except json.JSONDecodeError:
+                        pass
+                # Retorna estrutura vazia ao inves de raise (artigo sera processado com dados vazios)
+                logger.error(f"Nao foi possivel recuperar JSON, retornando estrutura vazia")
+                return {}
 
             except Exception as e:
                 logger.error(f"Erro inesperado: {e}")

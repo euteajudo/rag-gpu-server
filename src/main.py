@@ -347,6 +347,9 @@ logger.info(
 # Router de ingestao
 app.include_router(ingestion_router)
 
+# NOTA: Endpoints /enrich/* ficam na VPS, não no RunPod
+# Ver docs/VPS_ENRICH_INTEGRATION.md para detalhes
+
 
 # =============================================================================
 # ENDPOINTS

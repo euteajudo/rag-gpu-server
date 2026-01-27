@@ -25,6 +25,7 @@ from enum import Enum
 
 from .models import IngestRequest, ProcessedChunk, IngestStatus, IngestError
 from .quality_validator import QualityValidator
+from .markdown_sanitizer import MarkdownSanitizer
 from ..chunking.citation_extractor import extract_citations_from_chunk
 
 
@@ -426,6 +427,15 @@ class IngestionPipeline:
             doc_result = self.docling_converter.convert(pdf_path)
             markdown_content = doc_result.document.export_to_markdown()
 
+            # Sanitiza markdown removendo anomalias (<!-- image -->, etc.)
+            sanitizer = MarkdownSanitizer()
+            markdown_content, sanitization_report = sanitizer.sanitize(markdown_content)
+            if sanitization_report.anomalies_removed > 0:
+                logger.info(
+                    f"Fase 1.1b: Sanitização removeu {sanitization_report.anomalies_removed} anomalias: "
+                    f"{', '.join(sanitization_report.changes_made)}"
+                )
+
             # Valida qualidade do texto extraído
             quality_report = self._quality_validator.validate(markdown_content)
             logger.info(
@@ -463,6 +473,13 @@ class IngestionPipeline:
             doc_result_ocr = self.docling_converter_ocr.convert(pdf_path)
             markdown_content_ocr = doc_result_ocr.document.export_to_markdown()
             ocr_duration = round(time.perf_counter() - ocr_start, 2)
+
+            # Sanitiza markdown OCR
+            markdown_content_ocr, sanitization_report_ocr = sanitizer.sanitize(markdown_content_ocr)
+            if sanitization_report_ocr.anomalies_removed > 0:
+                logger.info(
+                    f"Fase 1.3b: Sanitização (OCR) removeu {sanitization_report_ocr.anomalies_removed} anomalias"
+                )
 
             # Valida qualidade do OCR
             quality_report_ocr = self._quality_validator.validate(markdown_content_ocr)
@@ -747,6 +764,11 @@ class IngestionPipeline:
             logger.info("Fase 5: Embeddings iniciando...")
 
             for chunk in materialized:
+                # Skip chunks marcados para nao indexar (pais de artigos splitados)
+                if getattr(chunk, '_skip_milvus_index', False):
+                    logger.debug(f"Skipping embedding for {chunk.chunk_id} (_skip_milvus_index=True)")
+                    continue
+
                 text_for_embedding = chunk.enriched_text or chunk.text
                 # Usa o embedder do GPU server (ja carregado)
                 embed_result = self.embedder.encode([text_for_embedding])
@@ -783,7 +805,13 @@ class IngestionPipeline:
     ) -> List[ProcessedChunk]:
         """Converte MaterializedChunk ou MaterializedAcordaoChunk para ProcessedChunk (Pydantic)."""
         chunks = []
+        skipped_count = 0
         for chunk in materialized:
+            # Skip chunks marcados para nao indexar (pais de artigos splitados)
+            if getattr(chunk, '_skip_milvus_index', False):
+                skipped_count += 1
+                continue
+
             if is_acordao:
                 # MaterializedAcordaoChunk
                 # Prepara aliases para acórdão
@@ -824,6 +852,9 @@ class IngestionPipeline:
                 chunk_citations = extract_citations_from_chunk(
                     text=chunk.text or "",
                     document_id=request.document_id,
+                    chunk_node_id=chunk.node_id,  # Remove self-loops
+                    parent_chunk_id=chunk.parent_chunk_id,  # Remove parent-loops
+                    document_type=request.tipo_documento,
                 )
 
                 # Prepara aliases (converte lista para JSON string se necessário)
@@ -872,6 +903,9 @@ class IngestionPipeline:
                 pc.thesis_vector = chunk._thesis_vector
 
             chunks.append(pc)
+
+        if skipped_count > 0:
+            logger.info(f"Skipped {skipped_count} parent chunks (_skip_milvus_index=True)")
 
         return chunks
 

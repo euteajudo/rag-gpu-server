@@ -253,35 +253,37 @@ class SpanParser:
     # Usado para parar captura em: Capítulo, Seção, Subseção
     ESTRUTURA_SUPERIOR = r'(?:CAP[ÍI]TULO|SE[ÇC][ÃA]O|SUBSE[ÇC][ÃA]O)'
 
-    # Artigo: "Art. 1º", "Art. 2o", "- Art. 10"
+    # Artigo: "Art. 1º", "Art. 2o", "- Art. 10", "11. Art. 56" (com prefixo numérico do Docling)
     # Captura: grupo 1 = número, resto = conteúdo (até próximo artigo ou estrutura superior)
     # NÃO para nos incisos/parágrafos - eles serão extraídos depois
+    # NOTA: Prefixo numérico (ex: "11.") é ignorado na captura - aparece quando Docling
+    #       interpreta artigos como itens de lista numerada
     PATTERN_ARTIGO = re.compile(
-        rf'^[-*]?\s*Art\.?\s*(\d+)[°ºo]?\s*[-.]?\s*(.+?)(?=\n[-*]?\s*Art\.?\s*\d+[°ºo]?(?:\s|[-.])|^{ESTRUTURA_SUPERIOR}|\Z)',
+        rf'^(?:\d+\.\s*)?[-*]?\s*Art\.?\s*(\d+)[°ºo]?\s*[-.]?\s*(.+?)(?=\n(?:\d+\.\s*)?[-*]?\s*Art\.?\s*\d+[°ºo]?(?:\s|[-.])|^{ESTRUTURA_SUPERIOR}|\Z)',
         re.IGNORECASE | re.MULTILINE | re.DOTALL
     )
 
-    # Parágrafo: "§ 1º", "§ 2o", "Parágrafo único", "- § 3º"
+    # Parágrafo: "§ 1º", "§ 2o", "Parágrafo único", "- § 3º", "12. § 1º" (com prefixo numérico)
     # NÃO para nos incisos/alíneas - eles serão extraídos depois
     PATTERN_PARAGRAFO = re.compile(
-        rf'^[-*]?\s*(?:§\s*(\d+)[°ºo]?|[Pp]ar[áa]grafo\s+[úu]nico)\s*[-.]?\s*(.+?)(?=\n[-*]?\s*§\s*\d+|\n[-*]?\s*Art\.?\s*\d+[°ºo]?|^{ESTRUTURA_SUPERIOR}|\Z)',
+        rf'^(?:\d+\.\s*)?[-*]?\s*(?:§\s*(\d+)[°ºo]?|[Pp]ar[áa]grafo\s+[úu]nico)\s*[-.]?\s*(.+?)(?=\n(?:\d+\.\s*)?[-*]?\s*§\s*\d+|\n(?:\d+\.\s*)?[-*]?\s*Art\.?\s*\d+[°ºo]?|^{ESTRUTURA_SUPERIOR}|\Z)',
         re.IGNORECASE | re.MULTILINE | re.DOTALL
     )
 
     # Numerais romanos: I-XX
     ROMAN_NUMERALS = r'(?:I{1,3}|IV|VI{0,3}|IX|X{1,3}|XI{1,3}|XIV|XV|XVI{0,3}|XIX|XX{0,3})'
 
-    # Inciso: "- I  -", "- II –", "III -", etc.
+    # Inciso: "- I  -", "- II –", "III -", "12. I -" (com prefixo numérico do Docling)
     # Formato Docling varia: "- I  -  texto" ou "III - texto" (com ou sem bullet)
     # NÃO para nas alíneas - elas serão extraídas depois
     PATTERN_INCISO = re.compile(
-        rf'^[-*]?\s*({ROMAN_NUMERALS})\s*[-–—]\s*(.+?)(?=\n[-*]?\s*{ROMAN_NUMERALS}\s*[-–—]|\n[-*]?\s*§\s*\d+|\n[-*]?\s*Art\.?\s*\d+[°ºo]?|\n{ESTRUTURA_SUPERIOR}|\Z)',
+        rf'^(?:\d+\.\s*)?[-*]?\s*({ROMAN_NUMERALS})\s*[-–—]\s*(.+?)(?=\n(?:\d+\.\s*)?[-*]?\s*{ROMAN_NUMERALS}\s*[-–—]|\n(?:\d+\.\s*)?[-*]?\s*§\s*\d+|\n(?:\d+\.\s*)?[-*]?\s*Art\.?\s*\d+[°ºo]?|\n{ESTRUTURA_SUPERIOR}|\Z)',
         re.MULTILINE | re.DOTALL
     )
 
-    # Alínea: "a)", "b)", "c)"
+    # Alínea: "a)", "b)", "c)", "12. a)" (com prefixo numérico do Docling)
     PATTERN_ALINEA = re.compile(
-        rf'^[-*]?\s*([a-z])\)\s*(.+?)(?=\n[-*]?\s*[a-z]\)|^[-*]?\s*{ROMAN_NUMERALS}\s*[-–]|^[-*]?\s*§|^[-*]?\s*Art\.?\s*\d+|^{ESTRUTURA_SUPERIOR}|\Z)',
+        rf'^(?:\d+\.\s*)?[-*]?\s*([a-z])\)\s*(.+?)(?=\n(?:\d+\.\s*)?[-*]?\s*[a-z]\)|^(?:\d+\.\s*)?[-*]?\s*{ROMAN_NUMERALS}\s*[-–]|^(?:\d+\.\s*)?[-*]?\s*§|^(?:\d+\.\s*)?[-*]?\s*Art\.?\s*\d+|^{ESTRUTURA_SUPERIOR}|\Z)',
         re.MULTILINE | re.DOTALL
     )
 
@@ -439,7 +441,9 @@ class SpanParser:
                 # Para no primeiro inciso, parágrafo, ou alínea
                 if re.match(r'^[-*]?\s*(§|[IVXLC]+\s*[-–]|[a-z]\))', line.strip(), re.IGNORECASE):
                     break
-                main_content.append(line)
+                # Remove prefixo numérico de lista do Docling (ex: "12. " antes de "I -")
+                clean_line = re.sub(r'^\d+\.\s*', '', line)
+                main_content.append(clean_line)
 
             text = '\n'.join(main_content).strip()
 
@@ -514,9 +518,11 @@ class SpanParser:
             content_lines = content.split('\n')
             main_content = []
             for line in content_lines:
-                if re.match(r'^[-*]?\s*([IVXLC]+\s*[-–]|[a-z]\))', line.strip()):
+                # Remove prefixo numérico do Docling antes de verificar
+                clean_line = re.sub(r'^\d+\.\s*', '', line)
+                if re.match(r'^[-*]?\s*([IVXLC]+\s*[-–]|[a-z]\))', clean_line.strip()):
                     break
-                main_content.append(line)
+                main_content.append(clean_line)
 
             clean_content = '\n'.join(main_content).strip()
 
@@ -549,9 +555,11 @@ class SpanParser:
             content_lines = content.split('\n')
             main_content = []
             for line in content_lines:
-                if re.match(r'^[-*]?\s*[a-z]\)', line.strip()):
+                # Remove prefixo numérico do Docling antes de verificar
+                clean_line = re.sub(r'^\d+\.\s*', '', line)
+                if re.match(r'^[-*]?\s*[a-z]\)', clean_line.strip()):
                     break
-                main_content.append(line)
+                main_content.append(clean_line)
 
             clean_content = '\n'.join(main_content).strip()
 
@@ -590,6 +598,9 @@ class SpanParser:
         for match in self.PATTERN_ALINEA.finditer(text):
             letra = match.group(1)
             content = match.group(2).strip() if match.group(2) else ""
+
+            # Remove prefixos numéricos do Docling do conteúdo
+            content = re.sub(r'^\d+\.\s*', '', content)
 
             span_id = f"ALI-{art_num}-{inciso}-{letra}"
 

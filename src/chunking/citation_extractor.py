@@ -713,10 +713,102 @@ class CitationExtractor:
         return self.to_json(refs)
 
 
+
+def normalize_citations(
+    citations: list[str | dict] | None,
+    chunk_node_id: str,
+    parent_chunk_id: str | None = None,
+    document_type: str | None = None,
+    device_type: str | None = None,
+) -> list[str]:
+    """
+    Normaliza citações removendo self-loops, parent-loops e duplicatas.
+
+    Args:
+        citations: Lista de citações (strings ou dicts com target_node_id)
+        chunk_node_id: Node ID do chunk atual (ex: "leis:LEI-14.133-2021#ART-006-P1")
+        parent_chunk_id: ID do chunk pai sem prefixo (ex: "LEI-14.133-2021#ART-006")
+        document_type: Tipo do documento (LEI, DECRETO, IN, ACORDAO, etc.)
+        device_type: Tipo do dispositivo (article, paragraph, inciso, alinea)
+
+    Returns:
+        Lista de target_node_ids normalizados (sem self-loops, sem parent-loops, sem duplicatas)
+
+    Regras aplicadas:
+    1. Remove valores vazios e None
+    2. Extrai target_node_id de dicts
+    3. Remove self-loops (citation == chunk_node_id)
+    4. Remove parent-loops (citation == parent_node_id)
+    5. Remove duplicatas preservando ordem
+    """
+    if not citations:
+        return []
+
+    # Mapeamento de document_type para prefixo
+    PREFIX_MAP = {
+        "LEI": "leis",
+        "DECRETO": "leis",
+        "IN": "leis",
+        "LC": "leis",
+        "ACORDAO": "acordaos",
+        "SUMULA": "sumulas",
+    }
+
+    # Calcula parent_node_id se parent_chunk_id foi fornecido
+    parent_node_id = None
+    if parent_chunk_id:
+        # Determina o prefixo
+        prefix = None
+        if document_type:
+            prefix = PREFIX_MAP.get(document_type.upper(), "leis")
+        else:
+            # Tenta inferir do chunk_node_id
+            if chunk_node_id and ":" in chunk_node_id:
+                prefix = chunk_node_id.split(":")[0]
+
+        if prefix:
+            parent_node_id = f"{prefix}:{parent_chunk_id}"
+
+    seen = set()
+    normalized = []
+
+    for citation in citations:
+        # Extrai target_node_id
+        if isinstance(citation, dict):
+            target = citation.get("target_node_id")
+        else:
+            target = citation
+
+        # Pula valores vazios
+        if not target or (isinstance(target, str) and not target.strip()):
+            continue
+
+        target = target.strip()
+
+        # Pula self-loop
+        if target == chunk_node_id:
+            continue
+
+        # Pula parent-loop
+        if parent_node_id and target == parent_node_id:
+            continue
+
+        # Pula duplicatas
+        if target in seen:
+            continue
+
+        seen.add(target)
+        normalized.append(target)
+
+    return normalized
+
 def extract_citations_from_chunk(
     text: str,
     document_id: Optional[str] = None,
     known_documents: Optional[dict[str, str]] = None,
+    chunk_node_id: Optional[str] = None,
+    parent_chunk_id: Optional[str] = None,
+    document_type: Optional[str] = None,
 ) -> list[str]:
     """
     Função utilitária para extrair citações de um chunk.
@@ -725,9 +817,12 @@ def extract_citations_from_chunk(
         text: Texto do chunk
         document_id: ID do documento atual
         known_documents: Dicionário de nomes conhecidos -> doc_id
+        chunk_node_id: Node ID do chunk (para remover self-loops)
+        parent_chunk_id: ID do chunk pai (para remover parent-loops)
+        document_type: Tipo do documento (LEI, DECRETO, etc.)
 
     Returns:
-        Lista de target_node_ids encontrados
+        Lista de target_node_ids encontrados (sem self-loops e parent-loops)
     """
     extractor = CitationExtractor(
         current_document_id=document_id,
@@ -737,4 +832,12 @@ def extract_citations_from_chunk(
     refs = extractor.extract(text)
 
     # Retorna lista de target_node_ids (sem None)
-    return [ref.target_node_id for ref in refs if ref.target_node_id]
+    citations = [ref.target_node_id for ref in refs if ref.target_node_id]
+    if chunk_node_id:
+        citations = normalize_citations(
+            citations=citations,
+            chunk_node_id=chunk_node_id,
+            parent_chunk_id=parent_chunk_id,
+            document_type=document_type,
+        )
+    return citations

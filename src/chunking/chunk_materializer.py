@@ -306,10 +306,47 @@ from datetime import datetime
 from typing import Optional
 from enum import Enum
 import logging
+import re
 
 from .chunk_models import LegalChunk, ChunkLevel
 
 logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# CONFIGURAÇÃO DE SPLITTING PARA ARTIGOS GRANDES
+# ==============================================================================
+# Quando um artigo ultrapassa SPLIT_THRESHOLD_CHARS, ele é dividido em subchunks
+# menores (PART) que são indexados como filhos do artigo pai canônico.
+#
+# Hierarquia resultante:
+#   leis:DOC#ART-005           (pai canônico - texto completo, NÃO indexado no Milvus)
+#   leis:DOC#ART-005-P1        (parte 1 - indexada)
+#   leis:DOC#ART-005-P2        (parte 2 - indexada)
+#   leis:DOC#ART-005-P3        (parte 3 - indexada)
+#
+# O artigo pai mantém integridade para navegação e citações, mas os subchunks
+# são o que efetivamente vai para o Milvus para retrieval.
+# ==============================================================================
+
+SPLIT_THRESHOLD_CHARS: int = 8000    # Artigo > 8k chars será splitado
+TARGET_CHUNK_CHARS: int = 4000       # Tamanho alvo de cada subchunk
+OVERLAP_CHARS: int = 300             # Overlap entre subchunks para contexto
+
+# Marcadores jurídicos para split (ordem de preferência)
+LEGAL_MARKERS = [
+    r'(?:^|\n)\s*§\s*\d+[º°]?',           # Parágrafos: § 1º, § 2º
+    r'(?:^|\n)\s*Parágrafo\s+único',      # Parágrafo único
+    r'(?:^|\n)\s*[IVXLCDM]+\s*[-–—]',     # Incisos romanos: I -, II -, III -
+    r'(?:^|\n)\s*[a-z]\)\s',              # Alíneas: a), b), c)
+    r'(?:^|\n)\s*\d+\)\s',                # Itens numerados: 1), 2), 3)
+    r'(?:^|\n)\s*Art\.\s*\d+',            # Referência a outros artigos
+]
+
+# Regex para encontrar quebras de parágrafo
+PARAGRAPH_BREAK = re.compile(r'\n\s*\n')
+
+# Regex para encontrar fim de sentença
+SENTENCE_END = re.compile(r'[.;:]\s+')
 
 
 class NodeIdValidationError(Exception):
@@ -327,6 +364,7 @@ class DeviceType(str, Enum):
     PARAGRAPH = "paragraph"
     INCISO = "inciso"
     ALINEA = "alinea"
+    PART = "part"  # Subchunk de artigo grande (ART-005-P1, ART-005-P2, etc.)
 
 
 @dataclass
@@ -521,6 +559,9 @@ class ChunkMaterializer:
         """
         Materializa um ArticleChunk em chunks pai e filhos.
 
+        Se o artigo exceder SPLIT_THRESHOLD_CHARS (8000), usa _materialize_large_article
+        para criar subchunks (PART) em vez de indexar o artigo inteiro.
+
         Args:
             article_chunk: ArticleChunk extraído
             parsed_doc: Documento parseado (para reconstruir texto dos filhos)
@@ -529,6 +570,14 @@ class ChunkMaterializer:
         Returns:
             Lista de MaterializedChunk (1 pai + N filhos)
         """
+        # Verifica se precisa splittar artigo grande
+        if self._should_split_article(article_chunk.text):
+            logger.info(
+                f"Artigo {article_chunk.article_id} com {len(article_chunk.text)} chars "
+                f"excede threshold de {SPLIT_THRESHOLD_CHARS}, splitando..."
+            )
+            return self._materialize_large_article(article_chunk, parsed_doc, include_children)
+
         chunks = []
 
         # 1. Chunk pai (ARTICLE)
@@ -645,6 +694,278 @@ class ChunkMaterializer:
 
         return citations
 
+    # ==========================================================================
+    # SPLITTING DE ARTIGOS GRANDES
+    # ==========================================================================
+
+    def _should_split_article(self, text: str) -> bool:
+        """Verifica se o artigo precisa ser splitado."""
+        return len(text) > SPLIT_THRESHOLD_CHARS
+
+    def _find_best_split_point(self, text: str, target_pos: int, window: int = 500) -> int:
+        """
+        Encontra o melhor ponto de split próximo à posição alvo.
+
+        Ordem de preferência:
+        1. Marcadores jurídicos (§, inciso, alínea)
+        2. Quebras de parágrafo
+        3. Fim de sentença
+
+        Args:
+            text: Texto a ser splitado
+            target_pos: Posição alvo para o split
+            window: Janela de busca ao redor da posição alvo
+
+        Returns:
+            Posição do melhor ponto de split
+        """
+        start = max(0, target_pos - window)
+        end = min(len(text), target_pos + window)
+        search_region = text[start:end]
+
+        # 1. Tentar marcadores jurídicos
+        for pattern in LEGAL_MARKERS:
+            matches = list(re.finditer(pattern, search_region))
+            if matches:
+                # Pega o match mais próximo do target
+                best_match = min(matches, key=lambda m: abs((start + m.start()) - target_pos))
+                return start + best_match.start()
+
+        # 2. Tentar quebra de parágrafo
+        para_matches = list(PARAGRAPH_BREAK.finditer(search_region))
+        if para_matches:
+            best_match = min(para_matches, key=lambda m: abs((start + m.start()) - target_pos))
+            return start + best_match.end()
+
+        # 3. Tentar fim de sentença
+        sent_matches = list(SENTENCE_END.finditer(search_region))
+        if sent_matches:
+            best_match = min(sent_matches, key=lambda m: abs((start + m.start()) - target_pos))
+            return start + best_match.end()
+
+        # 4. Fallback: posição alvo exata (evita cortar no meio de palavra)
+        space_pos = text.rfind(' ', target_pos - 50, target_pos + 50)
+        if space_pos != -1:
+            return space_pos + 1
+
+        return target_pos
+
+    def _split_large_article(self, text: str, article_id: str) -> list[dict]:
+        """
+        Divide artigo grande em subchunks com overlap.
+
+        Args:
+            text: Texto completo do artigo
+            article_id: ID do artigo (ex: ART-005)
+
+        Returns:
+            Lista de dicts com:
+            - part_num: Número da parte (1, 2, 3...)
+            - span_id: ID do subchunk (ex: ART-005-P1)
+            - text: Texto do subchunk
+            - start_pos: Posição inicial no texto original
+            - end_pos: Posição final no texto original
+        """
+        parts = []
+        pos = 0
+        part_num = 1
+
+        while pos < len(text):
+            # Calcula posição final alvo
+            end_target = pos + TARGET_CHUNK_CHARS
+
+            if end_target >= len(text):
+                # Último chunk - pega o resto
+                chunk_text = text[pos:]
+            else:
+                # Encontra melhor ponto de split
+                split_pos = self._find_best_split_point(text, end_target)
+                chunk_text = text[pos:split_pos]
+
+            # Evita chunks muito pequenos no final
+            if len(chunk_text.strip()) < 100 and parts:
+                # Anexa ao chunk anterior
+                parts[-1]["text"] += "\n" + chunk_text
+                parts[-1]["end_pos"] = len(text)
+                break
+
+            part_span_id = f"{article_id}-P{part_num}"
+
+            parts.append({
+                "part_num": part_num,
+                "span_id": part_span_id,
+                "text": chunk_text.strip(),
+                "start_pos": pos,
+                "end_pos": pos + len(chunk_text),
+            })
+
+            # Avança posição com overlap
+            if end_target >= len(text):
+                break
+
+            pos = self._find_best_split_point(text, end_target) - OVERLAP_CHARS
+            pos = max(pos, parts[-1]["end_pos"] - OVERLAP_CHARS)  # Garante progresso
+            part_num += 1
+
+            # Segurança: limite de 50 partes
+            if part_num > 50:
+                logger.warning(
+                    f"Artigo {article_id} excedeu limite de 50 partes, "
+                    f"truncando em {len(text)} chars"
+                )
+                break
+
+        logger.info(
+            f"Artigo {article_id} splitado em {len(parts)} partes "
+            f"(original: {len(text)} chars)"
+        )
+
+        return parts
+
+    def _materialize_large_article(
+        self,
+        article_chunk,
+        parsed_doc,
+        include_children: bool = True
+    ) -> list[MaterializedChunk]:
+        """
+        Materializa artigo grande em pai canônico + subchunks (PART).
+
+        O pai canônico é criado com `_skip_milvus_index=True` para indicar
+        que não deve ser indexado diretamente (apenas os PARTs são indexados).
+
+        Args:
+            article_chunk: ArticleChunk com texto grande
+            parsed_doc: Documento parseado
+            include_children: Se True, também gera PAR/INC como antes
+
+        Returns:
+            Lista com: [pai_canônico, part1, part2, ..., paragraphs, incisos]
+        """
+        chunks = []
+
+        # 1. Pai canônico (NÃO indexado no Milvus, apenas para navegação)
+        parent_chunk_id = f"{self.document_id}#{article_chunk.article_id}"
+        parent_node_id = f"leis:{parent_chunk_id}"
+
+        parent = MaterializedChunk(
+            node_id=parent_node_id,
+            chunk_id=parent_chunk_id,
+            parent_chunk_id="",  # Artigo não tem pai
+            span_id=article_chunk.article_id,
+            device_type=DeviceType.ARTICLE,
+            chunk_level=ChunkLevel.ARTICLE,
+            text=article_chunk.text,
+            document_id=self.document_id,
+            tipo_documento=self.tipo_documento,
+            numero=self.numero,
+            ano=self.ano,
+            article_number=article_chunk.article_number,
+            citations=article_chunk.citations,
+            metadata=self.metadata,
+        )
+        parent.validate()
+        # Marca que este chunk não deve ser indexado no Milvus
+        parent._skip_milvus_index = True
+        chunks.append(parent)
+
+        # 2. Subchunks (PART) - estes SÃO indexados
+        parts = self._split_large_article(article_chunk.text, article_chunk.article_id)
+
+        for part in parts:
+            part_chunk_id = f"{self.document_id}#{part['span_id']}"
+            part_node_id = f"leis:{part_chunk_id}"
+
+            part_chunk = MaterializedChunk(
+                node_id=part_node_id,
+                chunk_id=part_chunk_id,
+                parent_chunk_id=parent_chunk_id,  # Aponta para o pai canônico
+                span_id=part["span_id"],
+                device_type=DeviceType.PART,
+                chunk_level=ChunkLevel.DEVICE,  # Filhos são DEVICE level
+                text=part["text"],
+                document_id=self.document_id,
+                tipo_documento=self.tipo_documento,
+                numero=self.numero,
+                ano=self.ano,
+                article_number=article_chunk.article_number,
+                # Citations inclui o artigo pai + o span da parte
+                citations=[article_chunk.article_id, part["span_id"]],
+                metadata=self.metadata,
+            )
+            part_chunk.validate()
+            chunks.append(part_chunk)
+
+        # 3. Filhos estruturais (PARAGRAPH, INCISO) - se existirem
+        if include_children:
+            # Parágrafos
+            for par_id in article_chunk.paragrafo_ids:
+                par_span = parsed_doc.get_span(par_id)
+                if not par_span:
+                    continue
+
+                child_chunk_id = f"{self.document_id}#{par_id}"
+                child_node_id = f"leis:{child_chunk_id}"
+
+                child = MaterializedChunk(
+                    node_id=child_node_id,
+                    chunk_id=child_chunk_id,
+                    parent_chunk_id=parent_chunk_id,
+                    span_id=par_id,
+                    device_type=DeviceType.PARAGRAPH,
+                    chunk_level=ChunkLevel.DEVICE,
+                    text=par_span.text,
+                    document_id=self.document_id,
+                    tipo_documento=self.tipo_documento,
+                    numero=self.numero,
+                    ano=self.ano,
+                    article_number=article_chunk.article_number,
+                    citations=[par_id],
+                    metadata=self.metadata,
+                )
+                child.validate()
+                chunks.append(child)
+
+            # Incisos
+            for inc_id in article_chunk.inciso_ids:
+                inc_span = parsed_doc.get_span(inc_id)
+                if not inc_span:
+                    continue
+
+                child_chunk_id = f"{self.document_id}#{inc_id}"
+                child_node_id = f"leis:{child_chunk_id}"
+
+                inc_text = self._reconstruct_inciso_text(inc_id, parsed_doc)
+                inc_citations = self._get_inciso_citations(inc_id, parsed_doc)
+
+                child = MaterializedChunk(
+                    node_id=child_node_id,
+                    chunk_id=child_chunk_id,
+                    parent_chunk_id=parent_chunk_id,
+                    span_id=inc_id,
+                    device_type=DeviceType.INCISO,
+                    chunk_level=ChunkLevel.DEVICE,
+                    text=inc_text,
+                    document_id=self.document_id,
+                    tipo_documento=self.tipo_documento,
+                    numero=self.numero,
+                    ano=self.ano,
+                    article_number=article_chunk.article_number,
+                    citations=inc_citations,
+                    metadata=self.metadata,
+                )
+                child.validate()
+                chunks.append(child)
+
+        logger.info(
+            f"Artigo grande {article_chunk.article_id} materializado: "
+            f"1 pai + {len(parts)} partes + "
+            f"{len(article_chunk.paragrafo_ids)} PAR + "
+            f"{len(article_chunk.inciso_ids)} INC"
+        )
+
+        return chunks
+
     def materialize_all(
         self,
         article_chunks: list,  # list[ArticleChunk]
@@ -665,7 +986,35 @@ class ChunkMaterializer:
             )
             all_chunks.extend(chunks)
 
+        # Log estatísticas
+        result = MaterializationResult.from_chunks(all_chunks, self.document_id)
+        logger.info(
+            f"Materialização completa para {self.document_id}: "
+            f"{result.total_chunks} chunks total "
+            f"({result.article_chunks} artigos, {result.part_chunks} partes, "
+            f"{result.paragraph_chunks} parágrafos, {result.inciso_chunks} incisos)"
+        )
+        if result.split_articles > 0:
+            logger.info(
+                f"  → {result.split_articles} artigos grandes foram splitados em partes"
+            )
+
         return all_chunks
+
+    def materialize_all_with_result(
+        self,
+        article_chunks: list,  # list[ArticleChunk]
+        parsed_doc,
+        include_children: bool = True
+    ) -> "MaterializationResult":
+        """
+        Materializa todos os ArticleChunks e retorna resultado com estatísticas.
+
+        Returns:
+            MaterializationResult com chunks e estatísticas
+        """
+        chunks = self.materialize_all(article_chunks, parsed_doc, include_children)
+        return MaterializationResult.from_chunks(chunks, self.document_id)
 
 
 @dataclass
@@ -679,6 +1028,8 @@ class MaterializationResult:
     article_chunks: int = 0
     paragraph_chunks: int = 0
     inciso_chunks: int = 0
+    part_chunks: int = 0  # Subchunks de artigos grandes
+    split_articles: int = 0  # Quantidade de artigos que foram splitados
 
     # Metadados
     document_id: str = ""
@@ -692,6 +1043,46 @@ class MaterializationResult:
                 "articles": self.article_chunks,
                 "paragraphs": self.paragraph_chunks,
                 "incisos": self.inciso_chunks,
+                "parts": self.part_chunks,
             },
+            "split_articles": self.split_articles,
             "ingestion_timestamp": self.ingestion_timestamp,
         }
+
+    @classmethod
+    def from_chunks(
+        cls,
+        chunks: list[MaterializedChunk],
+        document_id: str = ""
+    ) -> "MaterializationResult":
+        """Cria MaterializationResult a partir de lista de chunks."""
+        article_chunks = 0
+        paragraph_chunks = 0
+        inciso_chunks = 0
+        part_chunks = 0
+        split_articles = set()
+
+        for chunk in chunks:
+            if chunk.device_type == DeviceType.ARTICLE:
+                article_chunks += 1
+                # Verifica se é artigo splitado (tem _skip_milvus_index)
+                if getattr(chunk, '_skip_milvus_index', False):
+                    split_articles.add(chunk.chunk_id)
+            elif chunk.device_type == DeviceType.PARAGRAPH:
+                paragraph_chunks += 1
+            elif chunk.device_type == DeviceType.INCISO:
+                inciso_chunks += 1
+            elif chunk.device_type == DeviceType.PART:
+                part_chunks += 1
+
+        return cls(
+            chunks=chunks,
+            total_chunks=len(chunks),
+            article_chunks=article_chunks,
+            paragraph_chunks=paragraph_chunks,
+            inciso_chunks=inciso_chunks,
+            part_chunks=part_chunks,
+            split_articles=len(split_articles),
+            document_id=document_id,
+            ingestion_timestamp=datetime.utcnow().isoformat(),
+        )
