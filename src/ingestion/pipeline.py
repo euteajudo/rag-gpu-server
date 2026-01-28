@@ -814,6 +814,15 @@ class IngestionPipeline:
 
             if is_acordao:
                 # MaterializedAcordaoChunk
+                # Extrai citações do texto (remove self-loops e parent-loops)
+                acordao_citations = extract_citations_from_chunk(
+                    text=chunk.text or "",
+                    document_id=request.document_id,
+                    chunk_node_id=chunk.node_id,  # Remove self-loops
+                    parent_chunk_id=chunk.parent_chunk_id if hasattr(chunk, "parent_chunk_id") else None,
+                    document_type="ACORDAO",
+                )
+
                 # Prepara aliases para acórdão
                 acordao_aliases = getattr(chunk, "aliases", "[]")
                 acordao_sparse_source = getattr(chunk, "sparse_source", "") or chunk.enriched_text or chunk.text or ""
@@ -842,7 +851,7 @@ class IngestionPipeline:
                     relator=(getattr(chunk, "relator", None) or request.relator) or "",
                     data_sessao=(getattr(chunk, "data_sessao", None) or request.data_sessao) or "",
                     unidade_tecnica=(getattr(chunk, "unidade_tecnica", None) or request.unidade_tecnica) or "",
-                    citations=[chunk.acordao_id] if hasattr(chunk, "acordao_id") else [],
+                    citations=acordao_citations,  # Citações extraídas do texto (sem self-loops)
                     aliases=acordao_aliases,
                     sparse_source=acordao_sparse_source,
                 )
