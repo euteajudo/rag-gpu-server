@@ -1048,6 +1048,20 @@ sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
 
 ### 2026-01-28
 
+- **ArticleValidator - Validação de Artigos Pós-Docling**
+  - Novo módulo `src/ingestion/article_validator.py`
+  - Detecta gaps na sequência de artigos (artigos faltando)
+  - Detecta artigos duplicados
+  - Detecta artigos splitados (ART-006-P1, P2, P3...)
+  - Gera `chunks_manifest` para validação pós-Milvus
+  - Status: `passed`, `warning` (coverage >= 95%), `failed`
+  - Novos parâmetros no endpoint `/ingest`:
+    - `validate_articles`: habilita validação
+    - `expected_first_article`: primeiro artigo esperado
+    - `expected_last_article`: último artigo esperado
+  - Resposta inclui `validation_docling` com resultado completo
+  - 7 testes unitários em `tests/test_article_validator.py`
+
 - **CitationExtractor - Prefixo e Formato de Acórdãos**
   - Citações de acórdãos agora usam prefixo `acordaos:` (antes: `leis:`)
   - Formato doc_id: `AC-2450-2025` (antes: `ACORDAO-2.450-2025`)

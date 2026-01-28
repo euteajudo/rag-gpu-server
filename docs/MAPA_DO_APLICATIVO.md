@@ -106,6 +106,7 @@ rag-gpu-server/
 │   │   ├── router.py           # Endpoint /ingest
 │   │   ├── pipeline.py         # Pipeline completo (5 fases)
 │   │   ├── models.py           # Modelos Pydantic
+│   │   ├── article_validator.py # Validação de artigos pós-Docling
 │   │   └── quality_validator.py # Validação de qualidade
 │   │
 │   ├── parsing/                # Parsing de documentos legais
@@ -250,6 +251,18 @@ PDF → Fase 1 → Fase 2 → Fase 3 → Fase 4 → Fase 5 → Chunks
 | Parent-child | `MaterializedChunk` | chunk_id, parent_chunk_id |
 | Tipos | `DeviceType` | ARTICLE, PARAGRAPH, INCISO, ALINEA |
 | Metadados | `ChunkMetadata` | schema_version, document_hash |
+
+#### ArticleValidator (`src/ingestion/article_validator.py`)
+
+| Funcionalidade | Localização | Descrição |
+|----------------|-------------|-----------|
+| Validador | `ArticleValidator` | Valida sequência de artigos extraídos |
+| Padrão Artigo | `ARTICLE_PATTERN` | Regex `^ART-(\d+)(?:-P(\d+))?$` |
+| Gaps | `missing_articles` | Artigos faltando na sequência |
+| Duplicatas | `duplicate_articles` | Artigos repetidos |
+| Splits | `split_articles` | Artigos divididos (ART-006-P1, P2...) |
+| Manifesto | `chunks_manifest` | Lista de span_ids para validação pós-Milvus |
+| Status | `status` | passed, warning (>=95%), failed |
 
 ---
 
@@ -420,6 +433,11 @@ tipo_documento: IN
 numero: 65
 ano: 2021
 
+# Parâmetros opcionais de validação de artigos:
+validate_articles: true          # Habilita validação
+expected_first_article: 1        # Primeiro artigo esperado
+expected_last_article: 18        # Último artigo esperado
+
 Response:
 {
   "success": true,
@@ -428,7 +446,15 @@ Response:
   "total_chunks": 47,
   "phases": [...],
   "chunks": [...],
-  "document_hash": "abc123..."
+  "document_hash": "abc123...",
+  "validation_docling": {
+    "status": "passed",
+    "found_articles": ["1", "2", ..., "18"],
+    "missing_articles": [],
+    "split_articles": [],
+    "coverage_percent": 100.0,
+    "chunks_manifest": ["ART-001", "PAR-001-1", ...]
+  }
 }
 ```
 
