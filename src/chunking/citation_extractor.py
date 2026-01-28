@@ -388,13 +388,20 @@ class CitationExtractor:
         if not span_ref:
             span_ref = self._extract_device_reference(full_text, match.end())
 
-        # Monta target_node_id
+        # Monta target_node_id com prefixo correto baseado no tipo
+        # Mapeamento de tipo para prefixo de collection
+        PREFIX_MAP = {
+            NormativeType.ACORDAO: "acordaos",
+            # Todos os outros usam "leis" (leis, decretos, INs, portarias, etc.)
+        }
+        prefix = PREFIX_MAP.get(norm_type, "leis")
+
         target_node_id = None
         if doc_id:
             if span_ref:
-                target_node_id = f"leis:{doc_id}#{span_ref}"
+                target_node_id = f"{prefix}:{doc_id}#{span_ref}"
             else:
-                target_node_id = f"leis:{doc_id}"
+                target_node_id = f"{prefix}:{doc_id}"
 
         # Calcula confiança e detecta ambiguidade
         confidence, is_ambiguous = self._calculate_confidence(
@@ -542,6 +549,15 @@ class CitationExtractor:
 
         type_prefix = norm_type.value
         number_clean = number.replace(".", "").lstrip("0") or number
+
+        # Tratamento especial para ACORDAO: usa "AC" e não aplica ponto de milhar
+        if norm_type == NormativeType.ACORDAO:
+            parts = ["AC", number_clean]
+            if year:
+                parts.append(str(year))
+            # Formato: AC-NUMERO-ANO (ex: AC-2450-2025)
+            # Nota: colegiado (P, 1C, 2C) não é capturado pelo regex atual
+            return "-".join(parts)
 
         # Busca ano canônico na tabela
         canonical_key = (type_prefix, number_clean)

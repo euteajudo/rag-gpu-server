@@ -291,3 +291,59 @@ Docling: online
 
 **Servidor pronto para nova ingestão de acordãos!**
 
+---
+
+### CORREÇÃO ADICIONAL: Prefixo e Formato de Citações de Acórdãos
+
+**Data:** 2026-01-28 01:30 UTC
+
+#### Problemas Encontrados
+
+1. **Prefixo errado:** Citações de acórdãos usavam `leis:` ao invés de `acordaos:`
+2. **Formato errado:** doc_id era `ACORDAO-1.234-2020` ao invés de `AC-1234-2020`
+
+#### Correções Aplicadas
+
+**Arquivo:** `src/chunking/citation_extractor.py`
+
+1. **Prefixo correto no target_node_id:**
+```python
+# Mapeamento de tipo para prefixo de collection
+PREFIX_MAP = {
+    NormativeType.ACORDAO: "acordaos",
+    # Todos os outros usam "leis"
+}
+prefix = PREFIX_MAP.get(norm_type, "leis")
+target_node_id = f"{prefix}:{doc_id}"
+```
+
+2. **Formato correto do doc_id para acórdãos:**
+```python
+# Tratamento especial para ACORDAO: usa "AC" e não aplica ponto de milhar
+if norm_type == NormativeType.ACORDAO:
+    parts = ["AC", number_clean]
+    if year:
+        parts.append(str(year))
+    return "-".join(parts)  # Ex: AC-2450-2025
+```
+
+#### Resultado dos Testes
+
+```
+Texto: "nos termos do Acórdão nº 2450/2025-P"
+  type: ACORDAO
+  doc_id: AC-2450-2025
+  target_node_id: acordaos:AC-2450-2025
+
+Texto: "art. 18 da Lei 14.133/2021"
+  type: LEI
+  doc_id: LEI-14.133-2021
+  target_node_id: leis:LEI-14.133-2021#ART-018
+```
+
+#### Status
+
+- ✅ Servidor reiniciado e saudável
+- ✅ Citações de acórdãos agora usam prefixo `acordaos:`
+- ✅ Formato AC-NUMERO-ANO compatível com Milvus
+
