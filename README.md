@@ -996,6 +996,35 @@ sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
 
 ## Histórico de Mudanças
 
+### 2026-01-28
+
+- **CitationExtractor - Prefixo e Formato de Acórdãos**
+  - Citações de acórdãos agora usam prefixo `acordaos:` (antes: `leis:`)
+  - Formato doc_id: `AC-2450-2025` (antes: `ACORDAO-2.450-2025`)
+  - Adicionado `PREFIX_MAP` para mapear tipo de norma → prefixo de collection
+  - Tratamento especial em `_build_doc_id()` para tipo ACORDAO
+
+- **Pipeline - Remoção de Self-Loop em Acordãos**
+  - Corrigido bug onde `citations=[chunk.acordao_id]` criava self-loop
+  - Agora usa `extract_citations_from_chunk()` igual às leis
+  - Citações extraídas do texto real, não do ID do próprio documento
+
+- **Normalização de Document ID**
+  - Novo módulo `src/utils/normalization.py`
+  - `normalize_document_id()`: LEI-14133-2021 → LEI-14.133-2021
+  - `normalize_node_id()`: normaliza node_ids completos com prefixo
+  - Números >= 1000 recebem ponto de milhar (exceto anos)
+  - Integrado ao CitationExtractor para consistência
+
+- **Script de Inicialização**
+  - Criado `start_server.sh` com auto-detecção de modelo vLLM
+  - Configura automaticamente `VLLM_MODEL`, `VLLM_BASE_URL`, `GPU_API_KEYS`
+  - Health check após startup
+
+- **VLLMClient - Correção de URL Padrão**
+  - `VLLM_BASE_URL` default alterado de `8000` para `8002`
+  - Evita conflito com porta do próprio GPU server
+
 ### 2025-01-27
 
 - **SpanParser - Prefixos Numéricos do Docling**
