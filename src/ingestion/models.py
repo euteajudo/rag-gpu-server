@@ -45,6 +45,11 @@ class IngestRequest(BaseModel):
     skip_embeddings: bool = Field(False, description="Pular geração de embeddings")
     max_articles: Optional[int] = Field(None, description="Limite de artigos (para debug)")
 
+    # Validação de artigos
+    validate_articles: bool = Field(False, description="Habilita validação de artigos")
+    expected_first_article: Optional[int] = Field(None, description="Primeiro artigo esperado (ex: 1)")
+    expected_last_article: Optional[int] = Field(None, description="Último artigo esperado (ex: 193)")
+
     # PDF será enviado como multipart/form-data
 
 
@@ -153,6 +158,15 @@ class IngestResponse(BaseModel):
     articles_extracted: int = 0
     paragraphs_extracted: int = 0
     incisos_extracted: int = 0
+
+    # Validação de artigos (Fase Docling)
+    validation_docling: Optional[dict] = Field(None, description="Resultado da validação de artigos")
+
+    # Hash do documento
+    document_hash: str = Field("", description="Hash do documento para deduplicação")
+
+    # Tempo total (alias para compatibilidade)
+    total_time_seconds: float = Field(0.0, description="Tempo total em segundos")
 
     class Config:
         json_schema_extra = {

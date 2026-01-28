@@ -26,6 +26,7 @@ from enum import Enum
 from .models import IngestRequest, ProcessedChunk, IngestStatus, IngestError
 from .quality_validator import QualityValidator
 from .markdown_sanitizer import MarkdownSanitizer
+from .article_validator import ArticleValidator
 from ..chunking.citation_extractor import extract_citations_from_chunk
 
 
@@ -54,6 +55,8 @@ class PipelineResult:
     quality_score: float = 0.0
     quality_issues: List[str] = field(default_factory=list)
     ocr_fallback_used: bool = False
+    # Validação de artigos (Fase Docling)
+    validation_docling: Optional[dict] = None
 
 
 class IngestionPipeline:
@@ -386,6 +389,21 @@ class IngestionPipeline:
                     if result.status == IngestStatus.FAILED:
                         return result
                     report_progress("embedding", 0.95)
+
+                # Fase 6: Validacao de artigos (se habilitada ou sempre para gerar manifesto)
+                if not is_acordao:
+                    validator = ArticleValidator(
+                        validate_enabled=request.validate_articles,
+                        expected_first=request.expected_first_article,
+                        expected_last=request.expected_last_article,
+                    )
+                    validation_result = validator.validate(materialized)
+                    result.validation_docling = validation_result.to_dict()
+                    logger.info(
+                        f"Validacao de artigos: {validation_result.total_found} encontrados, "
+                        f"{len(validation_result.missing_articles)} faltando, "
+                        f"status={validation_result.status}"
+                    )
 
                 # Converte para ProcessedChunk - 95% a 100%
                 report_progress("finalizing", 0.95)

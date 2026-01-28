@@ -93,6 +93,8 @@ def _set_task_result(task_id: str, result: PipelineResult):
                 "total_time_seconds": result.total_time_seconds,
                 "chunks": [c.model_dump() for c in result.chunks],
                 "document_hash": result.document_hash,
+                # Validacao de artigos (Fase Docling)
+                "validation_docling": result.validation_docling,
             }
 
 
@@ -136,6 +138,7 @@ class IngestResponse(BaseModel):
     total_time_seconds: float = 0.0
     chunks: List[dict] = []
     document_hash: str = ""
+    validation_docling: Optional[dict] = None
 
 
 def _background_process(task_id: str, pdf_content: bytes, request: IngestRequest):
@@ -186,6 +189,10 @@ async def ingest_pdf(
     skip_embeddings: bool = Form(False, description="Pular geracao de embeddings"),
     skip_enrichment: bool = Form(False, description="Pular enriquecimento LLM (enriquecer apos indexacao)"),
     max_articles: Optional[int] = Form(None, description="Limite de artigos (debug)"),
+    # Validacao de artigos
+    validate_articles: bool = Form(False, description="Habilita validacao de artigos"),
+    expected_first_article: Optional[int] = Form(None, description="Primeiro artigo esperado (ex: 1)"),
+    expected_last_article: Optional[int] = Form(None, description="Ultimo artigo esperado (ex: 193)"),
 ):
     """
     Inicia processamento de um PDF em background.
@@ -225,6 +232,10 @@ async def ingest_pdf(
         skip_embeddings=skip_embeddings,
         skip_enrichment=skip_enrichment,
         max_articles=max_articles,
+        # Validacao de artigos
+        validate_articles=validate_articles,
+        expected_first_article=expected_first_article,
+        expected_last_article=expected_last_article,
     )
 
     # Gera task_id
