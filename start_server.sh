@@ -6,6 +6,7 @@
 # - GPU_API_KEYS: Chave de API para VPS
 # - VLLM_BASE_URL: URL do servidor vLLM
 # - VLLM_MODEL: Nome do modelo (auto-detectado do vLLM)
+# - DISABLE_DOCS: Se "true", desabilita /docs, /redoc, /openapi.json (seguranca)
 
 cd /workspace/rag-gpu-server
 
@@ -18,6 +19,9 @@ sleep 2
 # ============================================================
 export GPU_API_KEYS="${GPU_API_KEYS:-vg_gpu_internal_2025}"
 export VLLM_BASE_URL="${VLLM_BASE_URL:-http://localhost:8002/v1}"
+
+# Seguranca: desabilitar documentacao em producao
+# export DISABLE_DOCS=true  # Descomente para desabilitar /docs, /redoc
 
 # Auto-detecta o modelo do vLLM se nao estiver definido
 if [ -z "$VLLM_MODEL" ]; then

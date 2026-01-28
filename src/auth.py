@@ -37,16 +37,23 @@ else:
 
 API_KEY_HEADER = "X-GPU-API-Key"
 
+# Desabilitar documentacao em producao (DISABLE_DOCS=true)
+DISABLE_DOCS = os.getenv("DISABLE_DOCS", "false").lower() in ("true", "1", "yes")
+
 # Endpoints publicos (nao precisam de auth)
+# Se DISABLE_DOCS=true, docs/redoc/openapi.json NAO sao publicos (retornam 404)
 PUBLIC_ENDPOINTS = {
     "/",
     "/health",
     "/healthz",
     "/readyz",
-    "/docs",
-    "/openapi.json",
-    "/redoc",
 }
+
+# Adiciona endpoints de documentacao apenas se nao estiver desabilitado
+if not DISABLE_DOCS:
+    PUBLIC_ENDPOINTS.update({"/docs", "/openapi.json", "/redoc"})
+else:
+    logger.warning("Documentacao desabilitada (DISABLE_DOCS=true) - /docs, /redoc, /openapi.json inacessiveis")
 
 
 def get_client_ip(request: Request) -> str:
@@ -94,6 +101,14 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         client_ip = get_client_ip(request)
+
+        # Se documentacao desabilitada, retorna 404 para endpoints de docs
+        # (nao revela que existem - melhor seguranca)
+        if DISABLE_DOCS and path in {"/docs", "/redoc", "/openapi.json"}:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Not Found"},
+            )
 
         # Endpoints publicos nao precisam de auth
         if path in PUBLIC_ENDPOINTS:

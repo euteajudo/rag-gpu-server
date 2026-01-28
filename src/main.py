@@ -36,7 +36,7 @@ from .batch_collector import (
     create_embed_batch_processor,
     create_rerank_batch_processor,
 )
-from .auth import APIKeyAuthMiddleware
+from .auth import APIKeyAuthMiddleware, DISABLE_DOCS
 from .ingestion.router import router as ingestion_router
 from .middleware.rate_limit import RateLimitMiddleware, InMemoryRateLimiter
 
@@ -312,6 +312,10 @@ app = FastAPI(
     description="Servidor GPU para embeddings (BGE-M3) e reranking (BGE-Reranker)",
     version="1.0.0",
     lifespan=lifespan,
+    # Desabilita documentacao se DISABLE_DOCS=true
+    docs_url=None if DISABLE_DOCS else "/docs",
+    redoc_url=None if DISABLE_DOCS else "/redoc",
+    openapi_url=None if DISABLE_DOCS else "/openapi.json",
 )
 
 # =============================================================================
