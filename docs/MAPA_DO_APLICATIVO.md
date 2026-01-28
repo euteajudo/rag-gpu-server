@@ -1,7 +1,7 @@
 # 🗺️ Mapa do Aplicativo - RAG GPU Server
 
 > **Repositório**: https://github.com/euteajudo/rag-gpu-server
-> **Última Atualização**: 17/01/2025
+> **Última Atualização**: 28/01/2026
 > **Status**: Produção (RunPod A40 48GB)
 
 Este documento serve como guia de navegação para desenvolvedores que precisam entender a estrutura do código e localizar funcionalidades específicas.
@@ -250,6 +250,115 @@ PDF → Fase 1 → Fase 2 → Fase 3 → Fase 4 → Fase 5 → Chunks
 | Parent-child | `MaterializedChunk` | chunk_id, parent_chunk_id |
 | Tipos | `DeviceType` | ARTICLE, PARAGRAPH, INCISO, ALINEA |
 | Metadados | `ChunkMetadata` | schema_version, document_hash |
+
+---
+
+## 🔄 Arquitetura de Enriquecimento
+
+O enriquecimento de chunks adiciona contexto semântico (context_header, thesis_text, synthetic_questions) para melhorar a qualidade da busca. A arquitetura difere entre **Normas** e **Acordãos**.
+
+### Comparativo: Normas vs Acordãos
+
+| Aspecto | Normas (Leis/Decretos/INs) | Acordãos (TCU) |
+|---------|---------------------------|----------------|
+| **Orquestração** | VPS (Celery workers) | GPU Server (pipeline.py) |
+| **Quando executa** | Após inserção no Milvus/Neo4j | Durante ingestão |
+| **Parâmetro** | Sempre separado | `skip_enrichment` (checkbox) |
+| **Trabalho GPU** | vLLM + BGE-M3 | vLLM + BGE-M3 |
+
+### Pipeline de Normas (Enrichment Pós-Indexação)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         INGESTÃO (GPU Server)                                │
+│  PDF → Docling → SpanParser → ArticleOrchestrator → Materializer → Embeddings│
+└─────────────────────────────────────┬────────────────────────────────────────┘
+                                      │ Chunks (sem enrichment)
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              VPS                                             │
+│  1. Insere chunks no Milvus                                                  │
+│  2. Cria nodes/edges no Neo4j                                                │
+│  3. Dispara Celery tasks para enrichment                                     │
+└─────────────────────────────────────┬────────────────────────────────────────┘
+                                      │
+                    ┌─────────────────┴─────────────────┐
+                    │                                   │
+                    ▼                                   ▼
+┌───────────────────────────────┐    ┌────────────────────────────────────────┐
+│  VPS: Celery (Orquestração)   │    │        GPU Server (Trabalho Pesado)    │
+│                               │    │                                        │
+│  Fila: llm_enrich (6 workers) │───►│  vLLM (Qwen3-8B-AWQ)                   │
+│  • Lê chunk do Milvus         │    │  • Gera context_header                 │
+│  • Chama vLLM via HTTP        │    │  • Gera thesis_text                    │
+│  • Dispara embed_and_store    │    │  • Gera synthetic_questions            │
+│                               │    │                                        │
+│  Fila: embed_store (2 workers)│───►│  BGE-M3                                │
+│  • Recebe enrichment          │    │  • Gera embeddings do enriched_text    │
+│  • Chama BGE-M3 via HTTP      │    │  • Retorna dense + sparse vectors      │
+│  • Atualiza chunk no Milvus   │    │                                        │
+└───────────────────────────────┘    └────────────────────────────────────────┘
+```
+
+### Pipeline de Acordãos (Enrichment Durante Ingestão)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         GPU Server (pipeline.py)                             │
+│                                                                              │
+│  PDF → Docling → AcordaoParser → AcordaoChunker                              │
+│                                       │                                      │
+│                                       ▼                                      │
+│                          ┌────────────────────────┐                          │
+│                          │  Enrichment (se ativo) │                          │
+│                          │                        │                          │
+│                          │  vLLM (Qwen3-8B-AWQ)   │                          │
+│                          │  • context_header      │                          │
+│                          │  • thesis_text         │                          │
+│                          │  • synthetic_questions │                          │
+│                          └────────────────────────┘                          │
+│                                       │                                      │
+│                                       ▼                                      │
+│                          BGE-M3 (Embeddings)                                 │
+│                                       │                                      │
+└───────────────────────────────────────┼──────────────────────────────────────┘
+                                        │ Chunks (JÁ enriquecidos)
+                                        ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              VPS                                             │
+│  1. Insere chunks no Milvus (já com enriched_text)                           │
+│  2. Cria nodes/edges no Neo4j                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Módulos de Enrichment
+
+| Módulo | Localização | Descrição |
+|--------|-------------|-----------|
+| ChunkEnricher | `src/enrichment/chunk_enricher.py` | Classe principal de enriquecimento |
+| Celery App | `src/enrichment/celery_app.py` | Configuração Celery (broker Redis) |
+| Tasks | `src/enrichment/tasks.py` | Tasks `enrich_chunk_llm` e `embed_and_store` |
+| Prompts | `src/chunking/enrichment_prompts.py` | Prompts para geração de contexto |
+
+### Parâmetro `skip_enrichment`
+
+```python
+# No endpoint /ingest (router.py)
+skip_enrichment: bool = Form(False, description="Pular enriquecimento LLM")
+
+# Efeito por tipo de documento:
+# - Acordãos: Se True, pula enrichment no pipeline (pode enriquecer depois via Celery)
+# - Normas: Não afeta (enrichment sempre via Celery após indexação)
+```
+
+### Onde o Trabalho GPU Acontece
+
+**Importante**: Independente de onde está a orquestração, o trabalho pesado SEMPRE acontece no GPU Server:
+
+| Operação | Orquestrador | Executor (GPU) |
+|----------|--------------|----------------|
+| LLM (gerar contexto) | VPS Celery ou GPU pipeline | vLLM no RunPod |
+| Embeddings | VPS Celery ou GPU pipeline | BGE-M3 no RunPod |
 
 ---
 

@@ -60,6 +60,56 @@ Servidor GPU para embeddings (BGE-M3), reranking (BGE-Reranker) e LLM (vLLM) do 
 
 ---
 
+## Arquitetura de Enriquecimento
+
+O enriquecimento adiciona contexto semântico aos chunks (context_header, thesis_text, synthetic_questions). A arquitetura difere entre tipos de documentos:
+
+### Normas (Leis/Decretos/INs)
+
+```
+GPU Server                           VPS (Celery)                    GPU Server
+───────────                          ────────────                    ───────────
+Ingestão:                            Pós-indexação:                  Trabalho pesado:
+PDF → Chunks → Embeddings ──────────► Milvus/Neo4j
+                                          │
+                                          ▼
+                                     Celery tasks ──────────────────► vLLM (Qwen3)
+                                     (llm_enrich)                     │
+                                          │                           ▼
+                                          │                          context_header
+                                          │                          thesis_text
+                                          ▼
+                                     Celery tasks ──────────────────► BGE-M3
+                                     (embed_store)                    │
+                                          │                           ▼
+                                          ▼                          embeddings
+                                     Atualiza Milvus
+```
+
+### Acordãos (TCU)
+
+```
+GPU Server (tudo junto)
+───────────────────────
+PDF → AcordaoChunker → Enrichment (vLLM) → Embeddings (BGE-M3) → Retorna para VPS
+                            │                     │
+                            ▼                     ▼
+                       Qwen3-8B              BGE-M3
+```
+
+### Resumo
+
+| Aspecto | Normas | Acordãos |
+|---------|--------|----------|
+| Orquestração enrichment | VPS (Celery) | GPU Server (pipeline) |
+| Quando enriquece | Após Milvus/Neo4j | Durante ingestão |
+| Checkbox `skip_enrichment` | Não afeta | Pula para enriquecer depois |
+| **Trabalho GPU** | **Sempre RunPod** | **Sempre RunPod** |
+
+> **Nota**: Independente de onde está a orquestração, o trabalho pesado (vLLM e BGE-M3) sempre acontece no GPU Server.
+
+---
+
 ## Endpoints do GPU Server
 
 | Endpoint | Método | Descrição |
