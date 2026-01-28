@@ -1048,6 +1048,12 @@ sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
 
 ### 2026-01-28
 
+- **Segurança - Opção DISABLE_DOCS**
+  - Nova variável de ambiente `DISABLE_DOCS` (true/false)
+  - Quando ativo, desabilita `/docs`, `/redoc`, `/openapi.json`
+  - Endpoints de documentação retornam 404 (não revela existência)
+  - Uso: `DISABLE_DOCS=true ./start_server.sh`
+
 - **ArticleValidator - Validação de Artigos Pós-Docling**
   - Novo módulo `src/ingestion/article_validator.py`
   - Detecta gaps na sequência de artigos (artigos faltando)
