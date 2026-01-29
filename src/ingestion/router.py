@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .models import IngestRequest, ProcessedChunk, IngestStatus, IngestError
 from .pipeline import get_pipeline, PipelineResult
+from utils.normalization import normalize_document_id
 
 logger = logging.getLogger(__name__)
 
@@ -214,9 +215,13 @@ async def ingest_pdf(
     logger.info(f"Recebido PDF: {file.filename} ({len(pdf_content)} bytes)")
     logger.info(f"Documento: {document_id} ({tipo_documento} {numero}/{ano})")
 
-    # Cria request
+    # Cria request (normaliza document_id para formato canonico com ponto de milhar)
+    normalized_doc_id = normalize_document_id(document_id)
+    if normalized_doc_id != document_id:
+        logger.info(f"Document ID normalizado: {document_id} -> {normalized_doc_id}")
+
     request = IngestRequest(
-        document_id=document_id,
+        document_id=normalized_doc_id,
         tipo_documento=tipo_documento,
         numero=numero,
         ano=ano,
@@ -239,13 +244,13 @@ async def ingest_pdf(
     )
 
     # Gera task_id
-    task_id = _generate_task_id(document_id, pdf_content)
+    task_id = _generate_task_id(normalized_doc_id, pdf_content)
 
     # Registra task
     with _tasks_lock:
         _tasks[task_id] = TaskInfo(
             task_id=task_id,
-            document_id=document_id,
+            document_id=normalized_doc_id,
             status="processing",
             progress=0.0,
             current_phase="queued",
@@ -260,11 +265,11 @@ async def ingest_pdf(
     )
     thread.start()
 
-    logger.info(f"Task {task_id} iniciada para {document_id}")
+    logger.info(f"Task {task_id} iniciada para {normalized_doc_id}")
 
     return IngestStartResponse(
         task_id=task_id,
-        document_id=document_id,
+        document_id=normalized_doc_id,
         message="Processamento iniciado em background. Use GET /ingest/status/{task_id} para acompanhar.",
     )
 
