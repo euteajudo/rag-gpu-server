@@ -191,22 +191,33 @@ class ArticleValidator:
             ))
 
         # Gerar lista de artigos esperados
-        if self.validate_enabled and self.expected_first and self.expected_last:
-            result.expected_articles = [
-                str(i) for i in range(self.expected_first, self.expected_last + 1)
-            ]
-        elif result.first_article and result.last_article:
-            # Inferir do range encontrado
-            result.expected_articles = [
-                str(i) for i in range(result.first_article, result.last_article + 1)
-            ]
+        # IMPORTANTE: Só inferir o range se a validação estiver EXPLICITAMENTE habilitada
+        # Caso contrário, reporta apenas estatísticas sem calcular "faltando"
+        if self.validate_enabled:
+            if self.expected_first and self.expected_last:
+                # Usuário especificou o range esperado
+                result.expected_articles = [
+                    str(i) for i in range(self.expected_first, self.expected_last + 1)
+                ]
+            elif result.first_article and result.last_article:
+                # Inferir do range encontrado (apenas com validação habilitada)
+                result.expected_articles = [
+                    str(i) for i in range(result.first_article, result.last_article + 1)
+                ]
+        # Se validate_enabled=False, expected_articles fica vazio e não calcula gaps
 
         # Detectar gaps (artigos faltando na sequencia)
-        expected_set = set(result.expected_articles)
-        found_set = set(result.found_articles)
-        missing = expected_set - found_set
-        result.missing_articles = sorted(missing, key=lambda x: int(x))
-        result.has_gaps = len(result.missing_articles) > 0
+        # Só calcula gaps se há artigos esperados definidos
+        if result.expected_articles:
+            expected_set = set(result.expected_articles)
+            found_set = set(result.found_articles)
+            missing = expected_set - found_set
+            result.missing_articles = sorted(missing, key=lambda x: int(x))
+            result.has_gaps = len(result.missing_articles) > 0
+        else:
+            # Sem validação explícita, não reporta gaps
+            result.missing_articles = []
+            result.has_gaps = False
 
         # Calcular cobertura
         if result.expected_articles:
