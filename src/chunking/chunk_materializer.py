@@ -419,6 +419,8 @@ class MaterializedChunk:
     # Conteúdo
     text: str
     enriched_text: str = ""
+    parent_text: str = ""  # Texto do artigo pai (caput) para dispositivos filhos
+    retrieval_text: str = ""  # Texto determinístico para embedding (sem LLM)
 
     # Contexto
     context_header: str = ""
@@ -526,6 +528,154 @@ class MaterializedChunk:
         }
 
 
+# ==============================================================================
+# RETRIEVAL TEXT DETERMINÍSTICO
+# ==============================================================================
+# Função que constrói texto para embedding de forma 100% determinística,
+# sem depender de LLM para enriquecimento. Usa apenas:
+# - Metadados confiáveis (document_id, article_number, device_type)
+# - Texto original do dispositivo (chunk.text)
+# - Texto do artigo pai - caput (parent_text)
+#
+# Formato:
+#   {document_id} | Art. {article_number} | {device_type_label}
+#   [CAPUT] {parent_text truncado}
+#   [DISPOSITIVO] {chunk.text}
+# ==============================================================================
+
+# Constantes para truncamento do caput (evita contexto muito longo)
+CAPUT_HEAD_CHARS: int = 600   # Primeiros 600 chars do caput (tema principal)
+CAPUT_TAIL_CHARS: int = 200   # Últimos 200 chars do caput (condições finais)
+
+# Mapeamento de device_type para label legível
+DEVICE_TYPE_LABELS = {
+    DeviceType.ARTICLE: "Artigo",
+    DeviceType.PARAGRAPH: "Parágrafo",
+    DeviceType.INCISO: "Inciso",
+    DeviceType.ALINEA: "Alínea",
+    DeviceType.PART: "Parte",
+}
+
+
+def build_retrieval_text(
+    document_id: str,
+    article_number: str,
+    device_type: DeviceType,
+    text: str,
+    parent_text: str = "",
+    span_id: str = "",
+) -> str:
+    """
+    Constrói texto determinístico para embedding sem dependência de LLM.
+
+    Esta função gera um texto estruturado para o campo dense_vector
+    que captura semântica de forma confiável usando apenas dados conhecidos.
+
+    Args:
+        document_id: ID do documento (ex: "IN-58-2022", "LEI-14133-2021")
+        article_number: Número do artigo (ex: "14", "5")
+        device_type: Tipo do dispositivo (ARTICLE, PARAGRAPH, INCISO, etc)
+        text: Texto original do chunk
+        parent_text: Texto do artigo pai (caput) - para dispositivos filhos
+        span_id: ID do span (ex: "INC-014-I") - para label mais específico
+
+    Returns:
+        Texto estruturado para embedding:
+        ```
+        IN-58-2022 | Art. 14 | Inciso I
+        I - contratação direta por inexigibilidade...
+        [CONTEXTO] Art. 14. A elaboração do ETP é facultada...
+        ```
+
+        IMPORTANTE: O dispositivo vem PRIMEIRO para ter mais peso no embedding.
+        O caput do pai vem depois como [CONTEXTO] para evitar que vetores
+        de dispositivos do mesmo artigo fiquem muito similares.
+
+    Example:
+        >>> text = build_retrieval_text(
+        ...     document_id="IN-58-2022",
+        ...     article_number="14",
+        ...     device_type=DeviceType.INCISO,
+        ...     text="I - contratação direta por inexigibilidade...",
+        ...     parent_text="Art. 14. A elaboração do ETP é facultada...",
+        ...     span_id="INC-014-I"
+        ... )
+        >>> print(text[:50])
+        'IN-58-2022 | Art. 14 | Inciso I'
+    """
+    lines = []
+
+    # 1. Cabeçalho com metadados
+    device_label = DEVICE_TYPE_LABELS.get(device_type, device_type.value.capitalize())
+
+    # Extrai identificador específico do span_id para dispositivos filhos
+    specific_id = ""
+    if device_type == DeviceType.INCISO and span_id:
+        # INC-014-I -> I
+        parts = span_id.split("-")
+        if len(parts) >= 3:
+            specific_id = f" {parts[-1]}"  # " I", " II", etc.
+    elif device_type == DeviceType.PARAGRAPH and span_id:
+        # PAR-014-1 -> § 1º, PAR-014-UNICO -> § único
+        parts = span_id.split("-")
+        if len(parts) >= 3:
+            par_num = parts[-1]
+            if par_num.upper() == "UNICO":
+                specific_id = " único"
+            else:
+                specific_id = f" {par_num}º"
+    elif device_type == DeviceType.ALINEA and span_id:
+        # ALI-014-I-a -> a)
+        parts = span_id.split("-")
+        if len(parts) >= 4:
+            specific_id = f" {parts[-1]})"
+
+    header = f"{document_id} | Art. {article_number} | {device_label}{specific_id}"
+    lines.append(header)
+
+    # 2. Texto do dispositivo PRIMEIRO (destaque - mais peso no embedding)
+    lines.append(text)
+
+    # 3. Caput do artigo pai como CONTEXTO (se disponível e não for o próprio artigo)
+    # Vem DEPOIS para não "diluir" a especificidade do dispositivo
+    if parent_text and device_type != DeviceType.ARTICLE:
+        truncated_caput = _truncate_head_tail(
+            parent_text,
+            head_chars=CAPUT_HEAD_CHARS,
+            tail_chars=CAPUT_TAIL_CHARS
+        )
+        lines.append(f"[CONTEXTO] {truncated_caput}")
+
+    return "\n".join(lines)
+
+
+def _truncate_head_tail(text: str, head_chars: int, tail_chars: int) -> str:
+    """
+    Trunca texto mantendo início e fim, similar à estratégia do GraphRetriever.
+
+    Args:
+        text: Texto a truncar
+        head_chars: Caracteres a manter do início
+        tail_chars: Caracteres a manter do fim
+
+    Returns:
+        Texto truncado com "..." no meio se necessário
+    """
+    if len(text) <= head_chars + tail_chars:
+        return text
+
+    head = text[:head_chars].rstrip()
+    tail = text[-tail_chars:].lstrip()
+
+    # Tenta não cortar no meio de palavra
+    if head and not head[-1].isspace() and not head.endswith(('.', ',', ';', ':')):
+        last_space = head.rfind(' ')
+        if last_space > head_chars - 100:  # Não recua muito
+            head = head[:last_space]
+
+    return f"{head} ... {tail}"
+
+
 class ChunkMaterializer:
     """
     Materializa ArticleChunk em chunks indexáveis com parent-child.
@@ -584,6 +734,19 @@ class ChunkMaterializer:
         parent_chunk_id = f"{self.document_id}#{article_chunk.article_id}"
         parent_node_id = f"leis:{parent_chunk_id}"
 
+        # Texto do artigo (caput) - será usado como parent_text para filhos
+        article_caput = article_chunk.text
+
+        # Constrói retrieval_text determinístico para o artigo
+        article_retrieval_text = build_retrieval_text(
+            document_id=self.document_id,
+            article_number=article_chunk.article_number,
+            device_type=DeviceType.ARTICLE,
+            text=article_caput,
+            parent_text="",  # Artigo não tem pai
+            span_id=article_chunk.article_id,
+        )
+
         parent = MaterializedChunk(
             node_id=parent_node_id,
             chunk_id=parent_chunk_id,
@@ -592,6 +755,7 @@ class ChunkMaterializer:
             device_type=DeviceType.ARTICLE,
             chunk_level=ChunkLevel.ARTICLE,
             text=article_chunk.text,
+            retrieval_text=article_retrieval_text,
             document_id=self.document_id,
             tipo_documento=self.tipo_documento,
             numero=self.numero,
@@ -616,6 +780,16 @@ class ChunkMaterializer:
             child_chunk_id = f"{self.document_id}#{par_id}"
             child_node_id = f"leis:{child_chunk_id}"
 
+            # Constrói retrieval_text determinístico para o parágrafo
+            par_retrieval_text = build_retrieval_text(
+                document_id=self.document_id,
+                article_number=article_chunk.article_number,
+                device_type=DeviceType.PARAGRAPH,
+                text=par_span.text,
+                parent_text=article_caput,  # Caput do artigo pai
+                span_id=par_id,
+            )
+
             child = MaterializedChunk(
                 node_id=child_node_id,
                 chunk_id=child_chunk_id,
@@ -624,6 +798,8 @@ class ChunkMaterializer:
                 device_type=DeviceType.PARAGRAPH,
                 chunk_level=ChunkLevel.DEVICE,
                 text=par_span.text,
+                parent_text=article_caput,  # Caput do artigo pai
+                retrieval_text=par_retrieval_text,
                 document_id=self.document_id,
                 tipo_documento=self.tipo_documento,
                 numero=self.numero,
@@ -655,6 +831,16 @@ class ChunkMaterializer:
             else:
                 correct_parent_chunk_id = parent_chunk_id  # Fallback para artigo
 
+            # Constrói retrieval_text determinístico para o inciso
+            inc_retrieval_text = build_retrieval_text(
+                document_id=self.document_id,
+                article_number=article_chunk.article_number,
+                device_type=DeviceType.INCISO,
+                text=inc_text,
+                parent_text=article_caput,  # Caput do artigo pai
+                span_id=inc_id,
+            )
+
             child = MaterializedChunk(
                 node_id=child_node_id,
                 chunk_id=child_chunk_id,
@@ -663,6 +849,8 @@ class ChunkMaterializer:
                 device_type=DeviceType.INCISO,
                 chunk_level=ChunkLevel.DEVICE,
                 text=inc_text,
+                parent_text=article_caput,  # Caput do artigo pai
+                retrieval_text=inc_retrieval_text,
                 document_id=self.document_id,
                 tipo_documento=self.tipo_documento,
                 numero=self.numero,
@@ -850,9 +1038,22 @@ class ChunkMaterializer:
         """
         chunks = []
 
+        # Texto do artigo (caput) - será usado como parent_text para filhos
+        article_caput = article_chunk.text
+
         # 1. Pai canônico (NÃO indexado no Milvus, apenas para navegação)
         parent_chunk_id = f"{self.document_id}#{article_chunk.article_id}"
         parent_node_id = f"leis:{parent_chunk_id}"
+
+        # Constrói retrieval_text determinístico para o artigo pai
+        article_retrieval_text = build_retrieval_text(
+            document_id=self.document_id,
+            article_number=article_chunk.article_number,
+            device_type=DeviceType.ARTICLE,
+            text=article_caput,
+            parent_text="",  # Artigo não tem pai
+            span_id=article_chunk.article_id,
+        )
 
         parent = MaterializedChunk(
             node_id=parent_node_id,
@@ -862,6 +1063,7 @@ class ChunkMaterializer:
             device_type=DeviceType.ARTICLE,
             chunk_level=ChunkLevel.ARTICLE,
             text=article_chunk.text,
+            retrieval_text=article_retrieval_text,
             document_id=self.document_id,
             tipo_documento=self.tipo_documento,
             numero=self.numero,
@@ -882,6 +1084,16 @@ class ChunkMaterializer:
             part_chunk_id = f"{self.document_id}#{part['span_id']}"
             part_node_id = f"leis:{part_chunk_id}"
 
+            # Constrói retrieval_text determinístico para a parte
+            part_retrieval_text = build_retrieval_text(
+                document_id=self.document_id,
+                article_number=article_chunk.article_number,
+                device_type=DeviceType.PART,
+                text=part["text"],
+                parent_text=article_caput,  # Caput do artigo pai
+                span_id=part["span_id"],
+            )
+
             part_chunk = MaterializedChunk(
                 node_id=part_node_id,
                 chunk_id=part_chunk_id,
@@ -890,6 +1102,8 @@ class ChunkMaterializer:
                 device_type=DeviceType.PART,
                 chunk_level=ChunkLevel.DEVICE,  # Filhos são DEVICE level
                 text=part["text"],
+                parent_text=article_caput,  # Caput do artigo pai
+                retrieval_text=part_retrieval_text,
                 document_id=self.document_id,
                 tipo_documento=self.tipo_documento,
                 numero=self.numero,
@@ -913,6 +1127,16 @@ class ChunkMaterializer:
                 child_chunk_id = f"{self.document_id}#{par_id}"
                 child_node_id = f"leis:{child_chunk_id}"
 
+                # Constrói retrieval_text determinístico para o parágrafo
+                par_retrieval_text = build_retrieval_text(
+                    document_id=self.document_id,
+                    article_number=article_chunk.article_number,
+                    device_type=DeviceType.PARAGRAPH,
+                    text=par_span.text,
+                    parent_text=article_caput,
+                    span_id=par_id,
+                )
+
                 child = MaterializedChunk(
                     node_id=child_node_id,
                     chunk_id=child_chunk_id,
@@ -921,6 +1145,8 @@ class ChunkMaterializer:
                     device_type=DeviceType.PARAGRAPH,
                     chunk_level=ChunkLevel.DEVICE,
                     text=par_span.text,
+                    parent_text=article_caput,
+                    retrieval_text=par_retrieval_text,
                     document_id=self.document_id,
                     tipo_documento=self.tipo_documento,
                     numero=self.numero,
@@ -950,6 +1176,16 @@ class ChunkMaterializer:
                 else:
                     correct_parent_chunk_id = parent_chunk_id  # Fallback para artigo
 
+                # Constrói retrieval_text determinístico para o inciso
+                inc_retrieval_text = build_retrieval_text(
+                    document_id=self.document_id,
+                    article_number=article_chunk.article_number,
+                    device_type=DeviceType.INCISO,
+                    text=inc_text,
+                    parent_text=article_caput,
+                    span_id=inc_id,
+                )
+
                 child = MaterializedChunk(
                     node_id=child_node_id,
                     chunk_id=child_chunk_id,
@@ -958,6 +1194,8 @@ class ChunkMaterializer:
                     device_type=DeviceType.INCISO,
                     chunk_level=ChunkLevel.DEVICE,
                     text=inc_text,
+                    parent_text=article_caput,
+                    retrieval_text=inc_retrieval_text,
                     document_id=self.document_id,
                     tipo_documento=self.tipo_documento,
                     numero=self.numero,
