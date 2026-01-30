@@ -1,9 +1,25 @@
 """
 Prompts para Enriquecimento de Chunks com LLM.
 
-Este módulo implementa a técnica de Contextual Retrieval da Anthropic,
-enriquecendo chunks de documentos legais com metadados gerados por LLM
-para melhorar a qualidade da busca semântica.
+===========================================================================
+DEPRECATED / CÓDIGO LEGADO - NÃO USAR EM CÓDIGO NOVO
+===========================================================================
+Este módulo foi descontinuado em favor do retrieval_text determinístico.
+
+Motivo da descontinuação:
+- Custo: chamadas LLM por chunk
+- Não-determinístico: resultados variam entre execuções
+- Complexidade desnecessária para o caso de uso atual
+
+Estratégia atual:
+- retrieval_text determinístico em chunk_materializer.build_retrieval_text()
+- Sem dependência de LLM para gerar embeddings
+
+Este arquivo será removido em versão futura.
+===========================================================================
+
+Implementava a técnica de Contextual Retrieval da Anthropic,
+enriquecendo chunks de documentos legais com metadados gerados por LLM.
 
 Referência: https://www.anthropic.com/news/contextual-retrieval
 

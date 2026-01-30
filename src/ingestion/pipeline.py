@@ -787,8 +787,8 @@ class IngestionPipeline:
                     logger.debug(f"Skipping embedding for {chunk.chunk_id} (_skip_milvus_index=True)")
                     continue
 
-                # Prioridade: retrieval_text (determinístico) > enriched_text (LLM) > text (original)
-                text_for_embedding = getattr(chunk, 'retrieval_text', '') or chunk.enriched_text or chunk.text
+                # retrieval_text determinístico para embeddings, fallback para text (legados)
+                text_for_embedding = getattr(chunk, 'retrieval_text', '') or chunk.text
                 # Usa o embedder do GPU server (ja carregado)
                 embed_result = self.embedder.encode([text_for_embedding])
 

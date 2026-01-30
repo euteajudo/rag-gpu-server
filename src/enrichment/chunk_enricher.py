@@ -1,7 +1,25 @@
 """
 ChunkEnricher - Enriquece chunks com contexto usando LLM.
 
-Adiciona campos de enriquecimento a MaterializedChunk:
+===========================================================================
+DEPRECATED / CÓDIGO LEGADO - NÃO USAR EM CÓDIGO NOVO
+===========================================================================
+Este módulo foi descontinuado em favor do retrieval_text determinístico.
+
+Motivo da descontinuação:
+- Custo: 3+ chamadas LLM por chunk
+- Não-determinístico: resultados variam entre execuções
+- Lento: adiciona latência significativa ao pipeline
+
+Estratégia atual (retrieval_text):
+- 100% determinístico, sem LLM
+- Texto construído em chunk_materializer.build_retrieval_text()
+- Pipeline usa: retrieval_text → text (fallback legados)
+
+Este arquivo será removido em versão futura.
+===========================================================================
+
+Campos que eram adicionados a MaterializedChunk (agora não usados):
 - context_header
 - thesis_text
 - thesis_type
