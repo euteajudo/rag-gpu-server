@@ -907,8 +907,10 @@ class IngestionPipeline:
                     device_type=chunk.device_type.value if hasattr(chunk.device_type, "value") else str(chunk.device_type),
                     chunk_level=chunk.chunk_level.name.lower() if hasattr(chunk.chunk_level, "name") else str(chunk.chunk_level),
                     text=chunk.text or "",
-                    enriched_text=chunk.enriched_text or chunk.text or "",
-                    context_header=chunk.context_header or "",
+                    parent_text=getattr(chunk, 'parent_text', '') or "",
+                    retrieval_text=getattr(chunk, 'retrieval_text', '') or "",
+                    enriched_text=chunk.enriched_text or "",  # Deprecated
+                    context_header=chunk.context_header or "",  # Deprecated
                     thesis_text=chunk.thesis_text or "",
                     thesis_type=chunk.thesis_type or "",
                     synthetic_questions="",

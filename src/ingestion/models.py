@@ -66,8 +66,10 @@ class ProcessedChunk(BaseModel):
 
     # Conteúdo
     text: str = Field(..., description="Texto original do dispositivo")
-    enriched_text: str = Field("", description="Texto enriquecido para embedding")
-    context_header: str = Field("", description="Frase de contexto")
+    parent_text: str = Field("", description="Texto do artigo pai (caput) para dispositivos filhos")
+    retrieval_text: str = Field("", description="Texto determinístico para embedding")
+    enriched_text: str = Field("", description="[DEPRECATED] Texto enriquecido por LLM")
+    context_header: str = Field("", description="[DEPRECATED] Frase de contexto")
     thesis_text: str = Field("", description="Resumo/tese do dispositivo")
     thesis_type: str = Field("", description="Tipo: definicao, procedimento, etc")
     synthetic_questions: str = Field("", description="Perguntas relacionadas")
