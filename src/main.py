@@ -47,6 +47,114 @@ try:
 except ImportError:
     PYNVML_AVAILABLE = False
 
+
+# =============================================================================
+# PR12: SCHEMA VALIDATION GUARDRAIL
+# =============================================================================
+
+def validate_milvus_schema_pr13(
+    collection_name: str = "leis_v4",
+    milvus_host: str = "localhost",
+    milvus_port: int = 19530,
+) -> dict:
+    """
+    Valida que a collection Milvus tem os campos PR13 (canonical offsets).
+
+    PR13 requer:
+    - canonical_start (INT64): offset início no canonical_text
+    - canonical_end (INT64): offset fim no canonical_text
+    - canonical_hash (VARCHAR 64): SHA256 anti-mismatch
+
+    Args:
+        collection_name: Nome da collection a validar
+        milvus_host: Host do Milvus
+        milvus_port: Porta do Milvus
+
+    Returns:
+        Dict com status da validação
+
+    Raises:
+        RuntimeError: Se collection existe mas falta campos PR13
+    """
+    try:
+        from pymilvus import connections, Collection, utility
+    except ImportError:
+        # pymilvus não instalado - não é obrigatório para GPU Server
+        return {
+            "status": "skipped",
+            "reason": "pymilvus not installed",
+            "collection": collection_name,
+        }
+
+    PR13_REQUIRED_FIELDS = ["canonical_start", "canonical_end", "canonical_hash"]
+
+    try:
+        # Conecta ao Milvus
+        connections.connect(
+            alias="schema_check",
+            host=milvus_host,
+            port=milvus_port,
+            timeout=10,
+        )
+
+        # Verifica se collection existe
+        if not utility.has_collection(collection_name, using="schema_check"):
+            connections.disconnect("schema_check")
+            return {
+                "status": "ok",
+                "reason": "collection_not_exists",
+                "collection": collection_name,
+                "message": f"Collection '{collection_name}' não existe ainda. "
+                           "Execute recreate_leis_v4_pr12.py para criar.",
+            }
+
+        # Collection existe - verifica campos
+        col = Collection(collection_name, using="schema_check")
+        field_names = [f.name for f in col.schema.fields]
+
+        # Verifica campos PR13
+        missing_fields = [f for f in PR13_REQUIRED_FIELDS if f not in field_names]
+
+        connections.disconnect("schema_check")
+
+        if missing_fields:
+            # ERRO CRÍTICO: Collection existe mas falta campos PR13
+            raise RuntimeError(
+                f"\n"
+                f"{'=' * 70}\n"
+                f"ERRO PR12: Collection '{collection_name}' sem campos PR13!\n"
+                f"{'=' * 70}\n"
+                f"\n"
+                f"Campos obrigatórios ausentes: {missing_fields}\n"
+                f"\n"
+                f"Para corrigir, execute:\n"
+                f"  python scripts/recreate_leis_v4_pr12.py --dry-run  # Verificar\n"
+                f"  python scripts/recreate_leis_v4_pr12.py --force    # Recriar (PERDE DADOS)\n"
+                f"\n"
+                f"Ou migre os dados manualmente antes de recriar.\n"
+                f"{'=' * 70}\n"
+            )
+
+        return {
+            "status": "ok",
+            "reason": "schema_valid",
+            "collection": collection_name,
+            "pr13_fields": PR13_REQUIRED_FIELDS,
+            "total_fields": len(field_names),
+        }
+
+    except RuntimeError:
+        # Re-raise RuntimeError (é o erro intencional de schema inválido)
+        raise
+    except Exception as e:
+        # Outros erros (conexão, timeout, etc) - não são fatais
+        return {
+            "status": "warning",
+            "reason": "connection_error",
+            "collection": collection_name,
+            "error": str(e),
+        }
+
 def get_gpu_hardware_metrics() -> dict:
     """
     Obtém métricas de hardware da GPU via pynvml.
@@ -269,6 +377,29 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Docling warmup falhou (continuando sem pre-carga): {e}")
 
     logger.info("=== Modelos carregados! ===")
+
+    # PR12: Valida schema Milvus (se disponível)
+    logger.info("Validando schema Milvus PR13...")
+    try:
+        milvus_host = config.milvus_host if hasattr(config, "milvus_host") else "localhost"
+        milvus_port = config.milvus_port if hasattr(config, "milvus_port") else 19530
+
+        schema_result = validate_milvus_schema_pr13(
+            collection_name="leis_v4",
+            milvus_host=milvus_host,
+            milvus_port=milvus_port,
+        )
+
+        if schema_result["status"] == "ok":
+            logger.info(f"Schema PR13 válido: {schema_result.get('reason', 'ok')}")
+        elif schema_result["status"] == "skipped":
+            logger.info(f"Validação de schema pulada: {schema_result.get('reason', 'unknown')}")
+        else:
+            logger.warning(f"Validação de schema: {schema_result}")
+    except RuntimeError as e:
+        # Schema inválido - erro fatal
+        logger.error(str(e))
+        raise
 
     # Inicializa Batch Collectors
     logger.info("Iniciando Batch Collectors...")

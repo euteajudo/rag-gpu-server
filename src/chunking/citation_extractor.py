@@ -39,6 +39,7 @@ from typing import Optional, Callable
 from enum import Enum
 
 from src.utils.normalization import normalize_document_id
+from src.chunking.rel_type_classifier import classify_rel_type, classify_rel_type_from_match
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,9 @@ class NormativeReference:
     method: str = "regex"             # "regex" ou "llm"
     confidence: float = 1.0           # 0.0 a 1.0 - confiança na extração
     is_ambiguous: bool = False        # True se a referência é ambígua/incompleta
+    # PR5: Classificação de rel_type
+    rel_type: str = "CITA"            # Tipo de relacionamento (CITA, ALTERA_EXPRESSAMENTE, etc)
+    rel_type_confidence: float = 0.0  # 0.0 a 1.0 - confiança na classificação do rel_type
 
     def to_dict(self) -> dict:
         """Converte para dicionário serializável."""
@@ -193,6 +197,9 @@ class NormativeReference:
             "target_node_id": self.target_node_id,
             "method": self.method,
             "confidence": self.confidence,
+            # PR5: rel_type classification
+            "rel_type": self.rel_type,
+            "rel_type_confidence": self.rel_type_confidence,
         }
 
 
@@ -411,6 +418,13 @@ class CitationExtractor:
             norm_type=norm_type
         )
 
+        # PR5: Classifica tipo de relacionamento baseado no contexto
+        rel_type, rel_type_confidence = classify_rel_type(
+            text=full_text,
+            start=match.start(),
+            end=match.end(),
+        )
+
         return NormativeReference(
             raw=raw.strip(),
             type=norm_type.value,
@@ -420,6 +434,8 @@ class CitationExtractor:
             method="regex",
             confidence=confidence,
             is_ambiguous=is_ambiguous,
+            rel_type=rel_type,
+            rel_type_confidence=rel_type_confidence,
         )
 
     def _calculate_confidence(
@@ -518,6 +534,13 @@ class CitationExtractor:
             confidence = 0.9 if self.current_document_id else 0.5
             is_ambiguous = not self.current_document_id
 
+            # PR5: Classifica tipo de relacionamento baseado no contexto
+            rel_type, rel_type_confidence = classify_rel_type(
+                text=text,
+                start=match.start(),
+                end=match.end(),
+            )
+
             references.append(NormativeReference(
                 raw=raw.strip(),
                 type=NormativeType.INTERNO.value,
@@ -527,6 +550,8 @@ class CitationExtractor:
                 method="regex",
                 confidence=confidence,
                 is_ambiguous=is_ambiguous,
+                rel_type=rel_type,
+                rel_type_confidence=rel_type_confidence,
             ))
 
         return references
@@ -826,6 +851,93 @@ def normalize_citations(
 
     return normalized
 
+
+def normalize_citations_with_rel_type(
+    citations: list[dict] | None,
+    chunk_node_id: str,
+    parent_chunk_id: str | None = None,
+    document_type: str | None = None,
+) -> list[dict]:
+    """
+    PR5: Normaliza citações preservando rel_type e rel_type_confidence.
+
+    Similar a normalize_citations() mas mantém a estrutura de dicts
+    com os campos de classificação.
+
+    Args:
+        citations: Lista de dicts com {target_node_id, rel_type, rel_type_confidence}
+        chunk_node_id: Node ID do chunk atual
+        parent_chunk_id: ID do chunk pai sem prefixo
+        document_type: Tipo do documento (LEI, DECRETO, etc.)
+
+    Returns:
+        Lista de dicts normalizados (sem self-loops, sem parent-loops, sem duplicatas)
+    """
+    if not citations:
+        return []
+
+    # Mapeamento de document_type para prefixo
+    PREFIX_MAP = {
+        "LEI": "leis",
+        "DECRETO": "leis",
+        "IN": "leis",
+        "LC": "leis",
+        "ACORDAO": "acordaos",
+        "SUMULA": "sumulas",
+    }
+
+    # Calcula parent_node_id se parent_chunk_id foi fornecido
+    parent_node_id = None
+    if parent_chunk_id:
+        prefix = None
+        if document_type:
+            prefix = PREFIX_MAP.get(document_type.upper(), "leis")
+        else:
+            if chunk_node_id and ":" in chunk_node_id:
+                prefix = chunk_node_id.split(":")[0]
+
+        if prefix:
+            parent_node_id = f"{prefix}:{parent_chunk_id}"
+
+    seen = set()
+    normalized = []
+
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+
+        target = citation.get("target_node_id")
+
+        # Pula valores vazios
+        if not target or (isinstance(target, str) and not target.strip()):
+            continue
+
+        target = target.strip()
+
+        # Pula self-loop
+        if target == chunk_node_id:
+            continue
+
+        # Pula parent-loop
+        if parent_node_id and target == parent_node_id:
+            continue
+
+        # Pula duplicatas
+        if target in seen:
+            continue
+
+        seen.add(target)
+
+        # Preserva estrutura completa com rel_type
+        normalized.append({
+            "target_node_id": target,
+            "rel_type": citation.get("rel_type", "CITA"),
+            "rel_type_confidence": citation.get("rel_type_confidence", 0.0),
+        })
+
+    return normalized
+
+
 def extract_citations_from_chunk(
     text: str,
     document_id: Optional[str] = None,
@@ -833,9 +945,11 @@ def extract_citations_from_chunk(
     chunk_node_id: Optional[str] = None,
     parent_chunk_id: Optional[str] = None,
     document_type: Optional[str] = None,
-) -> list[str]:
+) -> list[dict]:
     """
     Função utilitária para extrair citações de um chunk.
+
+    PR5: Agora retorna dicts com rel_type e rel_type_confidence.
 
     Args:
         text: Texto do chunk
@@ -846,7 +960,8 @@ def extract_citations_from_chunk(
         document_type: Tipo do documento (LEI, DECRETO, etc.)
 
     Returns:
-        Lista de target_node_ids encontrados (sem self-loops e parent-loops)
+        Lista de dicts com citações:
+        [{"target_node_id": "...", "rel_type": "CITA", "rel_type_confidence": 0.85}, ...]
     """
     extractor = CitationExtractor(
         current_document_id=document_id,
@@ -855,10 +970,18 @@ def extract_citations_from_chunk(
 
     refs = extractor.extract(text)
 
-    # Retorna lista de target_node_ids (sem None)
-    citations = [ref.target_node_id for ref in refs if ref.target_node_id]
+    # PR5: Retorna dicts com rel_type info (sem None)
+    citations = [
+        {
+            "target_node_id": ref.target_node_id,
+            "rel_type": ref.rel_type,
+            "rel_type_confidence": ref.rel_type_confidence,
+        }
+        for ref in refs if ref.target_node_id
+    ]
+
     if chunk_node_id:
-        citations = normalize_citations(
+        citations = normalize_citations_with_rel_type(
             citations=citations,
             chunk_node_id=chunk_node_id,
             parent_chunk_id=parent_chunk_id,

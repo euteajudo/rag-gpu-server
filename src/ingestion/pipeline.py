@@ -741,7 +741,7 @@ class IngestionPipeline:
         phase_start = time.perf_counter()
         try:
             logger.info("Fase 4: ChunkMaterializer iniciando...")
-            from ..chunking import ChunkMaterializer, ChunkMetadata
+            from ..chunking import ChunkMaterializer, ChunkMetadata, extract_offsets_from_parsed_doc
 
             metadata = ChunkMetadata(
                 schema_version="1.0.0",
@@ -750,12 +750,18 @@ class IngestionPipeline:
                 document_hash=result.document_hash,
             )
 
+            # PR13: Extrai offsets canônicos do ParsedDocument
+            offsets_map, canonical_hash = extract_offsets_from_parsed_doc(parsed_doc)
+            logger.info(f"PR13: Extraídos offsets de {len(offsets_map)} spans (hash: {canonical_hash[:16]}...)")
+
             materializer = ChunkMaterializer(
                 document_id=request.document_id,
                 tipo_documento=request.tipo_documento,
                 numero=request.numero,
                 ano=request.ano,
                 metadata=metadata,
+                offsets_map=offsets_map,
+                canonical_hash=canonical_hash,
             )
             materialized = materializer.materialize_all(article_chunks, parsed_doc)
 
@@ -873,6 +879,10 @@ class IngestionPipeline:
                     citations=acordao_citations,  # Citações extraídas do texto (sem self-loops)
                     aliases=acordao_aliases,
                     sparse_source=acordao_sparse_source,
+                    # PR13: Offsets canônicos (zero fallback find)
+                    canonical_start=getattr(chunk, 'canonical_start', -1),
+                    canonical_end=getattr(chunk, 'canonical_end', -1),
+                    canonical_hash=getattr(chunk, 'canonical_hash', ''),
                 )
             else:
                 # MaterializedChunk (leis/decretos)
@@ -922,6 +932,10 @@ class IngestionPipeline:
                     citations=chunk_citations,  # Lista de target_node_ids citados
                     aliases=chunk_aliases,
                     sparse_source=chunk_sparse_source,
+                    # PR13: Offsets canônicos (zero fallback find)
+                    canonical_start=getattr(chunk, 'canonical_start', -1),
+                    canonical_end=getattr(chunk, 'canonical_end', -1),
+                    canonical_hash=getattr(chunk, 'canonical_hash', ''),
                 )
 
             # Adiciona vetores se foram gerados

@@ -94,12 +94,24 @@ class ProcessedChunk(BaseModel):
     thesis_vector: Optional[list[float]] = Field(None, description="Embedding da thesis")
 
     # Proveniência
-    citations: list[str] = Field(default_factory=list, description="Spans citados")
+    # PR5: citations agora inclui rel_type e rel_type_confidence
+    # Formato: [{"target_node_id": "...", "rel_type": "CITA", "rel_type_confidence": 0.85}, ...]
+    # Ou formato legado: ["target_node_id1", "target_node_id2", ...]
+    citations: list = Field(default_factory=list, description="Citações com rel_type")
     schema_version: str = Field("1.0.0")
 
     # Campos adicionais para Milvus leis_v4
     aliases: str = Field("", description="Aliases/termos alternativos do chunk")
     sparse_source: str = Field("", description="Texto fonte para sparse embedding")
+
+    # PR13: Offsets verdadeiros no canonical_text (zero fallback find)
+    # Quando canonical_hash == hash_atual E start/end >= 0:
+    #   → usa slicing puro: canonical_text[start:end]
+    # Caso contrário:
+    #   → fallback best-effort via find()
+    canonical_start: int = Field(-1, description="Offset início no canonical_text (-1 se desconhecido)")
+    canonical_end: int = Field(-1, description="Offset fim no canonical_text (-1 se desconhecido)")
+    canonical_hash: str = Field("", description="SHA256 do canonical_text para anti-mismatch")
 
     class Config:
         json_schema_extra = {
@@ -125,6 +137,9 @@ class ProcessedChunk(BaseModel):
                 "sparse_vector": {1234: 0.5, 5678: 0.3},
                 "citations": ["ART-005"],
                 "schema_version": "1.0.0",
+                "canonical_start": 245,
+                "canonical_end": 412,
+                "canonical_hash": "abc123def456...",
             }
         }
 

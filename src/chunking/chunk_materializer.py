@@ -449,6 +449,15 @@ class MaterializedChunk:
     dense_vector: Optional[list[float]] = None
     sparse_vector: Optional[dict[int, float]] = None
 
+    # PR13: Offsets verdadeiros no canonical_text (zero fallback find)
+    # Quando canonical_hash == hash_atual E start/end >= 0:
+    #   → usa slicing puro: canonical_text[start:end]
+    # Caso contrário:
+    #   → fallback best-effort via find()
+    canonical_start: int = -1  # Offset início no canonical_text (-1 se desconhecido)
+    canonical_end: int = -1    # Offset fim no canonical_text (-1 se desconhecido)
+    canonical_hash: str = ""   # SHA256 do canonical_text para anti-mismatch
+
     def validate(self) -> None:
         """
         Valida consistência do node_id.
@@ -522,6 +531,11 @@ class MaterializedChunk:
             # Aliases
             "aliases": self.aliases,
             "sparse_source": self.sparse_source,
+
+            # PR13: Offsets verdadeiros (zero fallback find)
+            "canonical_start": self.canonical_start,
+            "canonical_end": self.canonical_end,
+            "canonical_hash": self.canonical_hash,
 
             # Proveniência
             **self.metadata.to_dict(),
@@ -684,6 +698,10 @@ class ChunkMaterializer:
     - 1 chunk ARTICLE (pai) com texto completo
     - N chunks PARAGRAPH (filhos) para cada parágrafo
     - M chunks INCISO (filhos) para cada inciso
+
+    PR13: Suporta offsets canônicos para slicing direto (zero fallback find).
+    Se offsets_map e canonical_hash forem fornecidos, os chunks materializados
+    terão canonical_start, canonical_end e canonical_hash preenchidos.
     """
 
     def __init__(
@@ -692,13 +710,30 @@ class ChunkMaterializer:
         tipo_documento: str = "",
         numero: str = "",
         ano: int = 0,
-        metadata: Optional[ChunkMetadata] = None
+        metadata: Optional[ChunkMetadata] = None,
+        offsets_map: Optional[dict[str, tuple[int, int]]] = None,
+        canonical_hash: str = "",
     ):
+        """
+        Inicializa o ChunkMaterializer.
+
+        Args:
+            document_id: ID do documento (ex: "IN-65-2021")
+            tipo_documento: Tipo do documento (ex: "IN", "LEI")
+            numero: Número do documento
+            ano: Ano do documento
+            metadata: Metadados de proveniência
+            offsets_map: PR13 - Mapa span_id → (start, end) para offsets canônicos
+            canonical_hash: PR13 - SHA256 do canonical_text para anti-mismatch
+        """
         self.document_id = document_id
         self.tipo_documento = tipo_documento
         self.numero = numero
         self.ano = ano
         self.metadata = metadata or ChunkMetadata()
+        # PR13: Offsets canônicos
+        self.offsets_map = offsets_map or {}
+        self.canonical_hash = canonical_hash
 
     def materialize_article(
         self,
@@ -747,6 +782,9 @@ class ChunkMaterializer:
             span_id=article_chunk.article_id,
         )
 
+        # PR13: Obtém offsets canônicos para o artigo
+        art_start, art_end, art_hash = self._get_canonical_offsets(article_chunk.article_id)
+
         parent = MaterializedChunk(
             node_id=parent_node_id,
             chunk_id=parent_chunk_id,
@@ -763,6 +801,9 @@ class ChunkMaterializer:
             article_number=article_chunk.article_number,
             citations=article_chunk.citations,
             metadata=self.metadata,
+            canonical_start=art_start,
+            canonical_end=art_end,
+            canonical_hash=art_hash,
         )
         # Validação obrigatória - aborta se node_id inconsistente
         parent.validate()
@@ -790,6 +831,9 @@ class ChunkMaterializer:
                 span_id=par_id,
             )
 
+            # PR13: Obtém offsets canônicos para o parágrafo
+            par_start, par_end, par_hash = self._get_canonical_offsets(par_id)
+
             child = MaterializedChunk(
                 node_id=child_node_id,
                 chunk_id=child_chunk_id,
@@ -807,6 +851,9 @@ class ChunkMaterializer:
                 article_number=article_chunk.article_number,
                 citations=[par_id],
                 metadata=self.metadata,
+                canonical_start=par_start,
+                canonical_end=par_end,
+                canonical_hash=par_hash,
             )
             # Validação obrigatória - aborta se node_id inconsistente
             child.validate()
@@ -841,6 +888,9 @@ class ChunkMaterializer:
                 span_id=inc_id,
             )
 
+            # PR13: Obtém offsets canônicos para o inciso
+            inc_start, inc_end, inc_hash = self._get_canonical_offsets(inc_id)
+
             child = MaterializedChunk(
                 node_id=child_node_id,
                 chunk_id=child_chunk_id,
@@ -858,6 +908,9 @@ class ChunkMaterializer:
                 article_number=article_chunk.article_number,
                 citations=inc_citations,
                 metadata=self.metadata,
+                canonical_start=inc_start,
+                canonical_end=inc_end,
+                canonical_hash=inc_hash,
             )
             # Validação obrigatória - aborta se node_id inconsistente
             child.validate()
@@ -887,6 +940,26 @@ class ChunkMaterializer:
             citations.append(child.span_id)
 
         return citations
+
+    def _get_canonical_offsets(self, span_id: str) -> tuple[int, int, str]:
+        """
+        Obtém offsets canônicos para um span_id (PR13).
+
+        Busca no offsets_map e retorna:
+        - (start, end, hash) se encontrado
+        - (-1, -1, "") se não encontrado ou offsets_map vazio
+
+        Args:
+            span_id: ID do span (ex: "ART-005", "PAR-005-1")
+
+        Returns:
+            Tupla (canonical_start, canonical_end, canonical_hash)
+        """
+        if not self.offsets_map or span_id not in self.offsets_map:
+            return (-1, -1, "")
+
+        start, end = self.offsets_map[span_id]
+        return (start, end, self.canonical_hash)
 
     # ==========================================================================
     # SPLITTING DE ARTIGOS GRANDES
@@ -1055,6 +1128,9 @@ class ChunkMaterializer:
             span_id=article_chunk.article_id,
         )
 
+        # PR13: Obtém offsets canônicos para o artigo
+        art_start, art_end, art_hash = self._get_canonical_offsets(article_chunk.article_id)
+
         parent = MaterializedChunk(
             node_id=parent_node_id,
             chunk_id=parent_chunk_id,
@@ -1071,6 +1147,9 @@ class ChunkMaterializer:
             article_number=article_chunk.article_number,
             citations=article_chunk.citations,
             metadata=self.metadata,
+            canonical_start=art_start,
+            canonical_end=art_end,
+            canonical_hash=art_hash,
         )
         parent.validate()
         # Marca que este chunk não deve ser indexado no Milvus
@@ -1137,6 +1216,9 @@ class ChunkMaterializer:
                     span_id=par_id,
                 )
 
+                # PR13: Obtém offsets canônicos para o parágrafo
+                par_start, par_end, par_hash = self._get_canonical_offsets(par_id)
+
                 child = MaterializedChunk(
                     node_id=child_node_id,
                     chunk_id=child_chunk_id,
@@ -1154,6 +1236,9 @@ class ChunkMaterializer:
                     article_number=article_chunk.article_number,
                     citations=[par_id],
                     metadata=self.metadata,
+                    canonical_start=par_start,
+                    canonical_end=par_end,
+                    canonical_hash=par_hash,
                 )
                 child.validate()
                 chunks.append(child)
@@ -1186,6 +1271,9 @@ class ChunkMaterializer:
                     span_id=inc_id,
                 )
 
+                # PR13: Obtém offsets canônicos para o inciso
+                inc_start, inc_end, inc_hash = self._get_canonical_offsets(inc_id)
+
                 child = MaterializedChunk(
                     node_id=child_node_id,
                     chunk_id=child_chunk_id,
@@ -1203,6 +1291,9 @@ class ChunkMaterializer:
                     article_number=article_chunk.article_number,
                     citations=inc_citations,
                     metadata=self.metadata,
+                    canonical_start=inc_start,
+                    canonical_end=inc_end,
+                    canonical_hash=inc_hash,
                 )
                 child.validate()
                 chunks.append(child)

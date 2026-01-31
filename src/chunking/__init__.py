@@ -213,6 +213,15 @@ from .citation_extractor import (
     NormativeReference,
 )
 
+# PR13: Offsets canônicos (zero fallback find)
+from .canonical_offsets import (
+    extract_offsets_from_parsed_doc,
+    normalize_canonical_text,
+    compute_canonical_hash,
+    validate_offsets_hash,
+    extract_snippet_by_offsets,
+)
+
 __all__ = [
     # Modelos
     "LegalChunk",
@@ -241,4 +250,10 @@ __all__ = [
     "CitationExtractor",
     "extract_citations_from_chunk",
     "NormativeReference",
+    # PR13: Offsets canônicos
+    "extract_offsets_from_parsed_doc",
+    "normalize_canonical_text",
+    "compute_canonical_hash",
+    "validate_offsets_hash",
+    "extract_snippet_by_offsets",
 ]
