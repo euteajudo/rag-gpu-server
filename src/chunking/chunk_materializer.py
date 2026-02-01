@@ -916,10 +916,12 @@ class ChunkMaterializer:
                 # Inciso direto sob artigo
                 inc_parent_start, inc_parent_end = art_start, art_end
 
+            # NOTA: Usa inc_span.text (original) para busca, não inc_text (reconstruído com alíneas)
+            # O texto reconstruído inclui formatação que não existe no canonical_text
             inc_start, inc_end, inc_hash = self._resolve_child_offset_strict(
                 span_id=inc_id,
                 device_type="inciso",
-                chunk_text=inc_text,
+                chunk_text=inc_span.text,  # Texto original do span, não reconstruído
                 parent_start=inc_parent_start,
                 parent_end=inc_parent_end,
             )
@@ -1339,8 +1341,14 @@ class ChunkMaterializer:
                     span_id=par_id,
                 )
 
-                # PR13: Obtém offsets canônicos para o parágrafo
-                par_start, par_end, par_hash = self._get_canonical_offsets(par_id)
+                # PR13 STRICT: Resolve offsets para o parágrafo
+                par_start, par_end, par_hash = self._resolve_child_offset_strict(
+                    span_id=par_id,
+                    device_type="paragraph",
+                    chunk_text=par_span.text,
+                    parent_start=art_start,
+                    parent_end=art_end,
+                )
 
                 child = MaterializedChunk(
                     node_id=child_node_id,
@@ -1394,8 +1402,25 @@ class ChunkMaterializer:
                     span_id=inc_id,
                 )
 
-                # PR13: Obtém offsets canônicos para o inciso
-                inc_start, inc_end, inc_hash = self._get_canonical_offsets(inc_id)
+                # PR13 STRICT: Resolve offsets para o inciso
+                # NOTA: Usa inc_span.text (original) para busca, não inc_text (reconstruído)
+                # Inciso pode estar sob parágrafo ou diretamente sob artigo
+                if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
+                    par_offsets = self._get_resolved_child_offset(inc_span.parent_id)
+                    if par_offsets:
+                        inc_parent_start, inc_parent_end = par_offsets
+                    else:
+                        inc_parent_start, inc_parent_end = art_start, art_end
+                else:
+                    inc_parent_start, inc_parent_end = art_start, art_end
+
+                inc_start, inc_end, inc_hash = self._resolve_child_offset_strict(
+                    span_id=inc_id,
+                    device_type="inciso",
+                    chunk_text=inc_span.text,  # Texto original, não reconstruído
+                    parent_start=inc_parent_start,
+                    parent_end=inc_parent_end,
+                )
 
                 child = MaterializedChunk(
                     node_id=child_node_id,
