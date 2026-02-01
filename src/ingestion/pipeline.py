@@ -1044,6 +1044,7 @@ class IngestionPipeline:
         try:
             logger.info("Fase 4: ChunkMaterializer iniciando...")
             from ..chunking import ChunkMaterializer, ChunkMetadata, extract_offsets_from_parsed_doc
+            from ..chunking.canonical_offsets import normalize_canonical_text
 
             metadata = ChunkMetadata(
                 schema_version="1.0.0",
@@ -1056,6 +1057,11 @@ class IngestionPipeline:
             offsets_map, canonical_hash = extract_offsets_from_parsed_doc(parsed_doc)
             logger.info(f"PR13: Extraídos offsets de {len(offsets_map)} spans (hash: {canonical_hash[:16]}...)")
 
+            # PR13 STRICT: Normaliza canonical_text para resolução determinística de offsets
+            source_text = getattr(parsed_doc, 'source_text', '') or ''
+            canonical_text = normalize_canonical_text(source_text)
+            logger.info(f"PR13: canonical_text com {len(canonical_text)} chars para resolução de offsets")
+
             materializer = ChunkMaterializer(
                 document_id=request.document_id,
                 tipo_documento=request.tipo_documento,
@@ -1064,6 +1070,7 @@ class IngestionPipeline:
                 metadata=metadata,
                 offsets_map=offsets_map,
                 canonical_hash=canonical_hash,
+                canonical_text=canonical_text,
             )
             materialized = materializer.materialize_all(article_chunks, parsed_doc)
 

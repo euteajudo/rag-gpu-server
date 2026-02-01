@@ -309,6 +309,7 @@ import logging
 import re
 
 from .chunk_models import LegalChunk, ChunkLevel
+from .canonical_offsets import resolve_child_offsets, OffsetResolutionError
 
 logger = logging.getLogger(__name__)
 
@@ -713,6 +714,7 @@ class ChunkMaterializer:
         metadata: Optional[ChunkMetadata] = None,
         offsets_map: Optional[dict[str, tuple[int, int]]] = None,
         canonical_hash: str = "",
+        canonical_text: str = "",
     ):
         """
         Inicializa o ChunkMaterializer.
@@ -723,8 +725,9 @@ class ChunkMaterializer:
             numero: Número do documento
             ano: Ano do documento
             metadata: Metadados de proveniência
-            offsets_map: PR13 - Mapa span_id → (start, end) para offsets canônicos
+            offsets_map: PR13 - Mapa span_id → (start, end) para offsets canônicos (artigos)
             canonical_hash: PR13 - SHA256 do canonical_text para anti-mismatch
+            canonical_text: PR13 STRICT - Texto canônico completo para resolução de offsets de filhos
         """
         self.document_id = document_id
         self.tipo_documento = tipo_documento
@@ -734,6 +737,10 @@ class ChunkMaterializer:
         # PR13: Offsets canônicos
         self.offsets_map = offsets_map or {}
         self.canonical_hash = canonical_hash
+        # PR13 STRICT: Texto canônico para resolução de offsets de filhos
+        self.canonical_text = canonical_text
+        # Cache de offsets resolvidos (para hierarquia PAR -> INC)
+        self._resolved_child_offsets: dict[str, tuple[int, int]] = {}
 
     def materialize_article(
         self,
@@ -831,8 +838,14 @@ class ChunkMaterializer:
                 span_id=par_id,
             )
 
-            # PR13: Obtém offsets canônicos para o parágrafo
-            par_start, par_end, par_hash = self._get_canonical_offsets(par_id)
+            # PR13 STRICT: Resolve offsets para o parágrafo
+            par_start, par_end, par_hash = self._resolve_child_offset_strict(
+                span_id=par_id,
+                device_type="paragraph",
+                chunk_text=par_span.text,
+                parent_start=art_start,
+                parent_end=art_end,
+            )
 
             child = MaterializedChunk(
                 node_id=child_node_id,
@@ -888,8 +901,28 @@ class ChunkMaterializer:
                 span_id=inc_id,
             )
 
-            # PR13: Obtém offsets canônicos para o inciso
-            inc_start, inc_end, inc_hash = self._get_canonical_offsets(inc_id)
+            # PR13 STRICT: Resolve offsets para o inciso
+            # Inciso pode estar sob parágrafo ou diretamente sob artigo
+            # Busca no range do pai correto
+            if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
+                # Inciso sob parágrafo - busca no range do parágrafo
+                par_offsets = self._get_resolved_child_offset(inc_span.parent_id)
+                if par_offsets:
+                    inc_parent_start, inc_parent_end = par_offsets
+                else:
+                    # Fallback para range do artigo
+                    inc_parent_start, inc_parent_end = art_start, art_end
+            else:
+                # Inciso direto sob artigo
+                inc_parent_start, inc_parent_end = art_start, art_end
+
+            inc_start, inc_end, inc_hash = self._resolve_child_offset_strict(
+                span_id=inc_id,
+                device_type="inciso",
+                chunk_text=inc_text,
+                parent_start=inc_parent_start,
+                parent_end=inc_parent_end,
+            )
 
             child = MaterializedChunk(
                 node_id=child_node_id,
@@ -960,6 +993,96 @@ class ChunkMaterializer:
 
         start, end = self.offsets_map[span_id]
         return (start, end, self.canonical_hash)
+
+    def _resolve_child_offset_strict(
+        self,
+        span_id: str,
+        device_type: str,
+        chunk_text: str,
+        parent_start: int,
+        parent_end: int,
+    ) -> tuple[int, int, str]:
+        """
+        Resolve offsets de um chunk filho de forma determinística (PR13 STRICT).
+
+        Busca chunk_text dentro do range do pai no canonical_text.
+        - Se não encontrado → OffsetResolutionError (ABORT)
+        - Se múltiplas ocorrências → OffsetResolutionError (ABORT)
+        - Se encontrado exatamente uma vez → retorna (start, end, hash)
+
+        Args:
+            span_id: ID do span (ex: "PAR-005-1")
+            device_type: Tipo do dispositivo (ex: "paragraph", "inciso")
+            chunk_text: Texto do chunk a localizar
+            parent_start: Offset início do pai no canonical_text
+            parent_end: Offset fim do pai no canonical_text
+
+        Returns:
+            Tupla (canonical_start, canonical_end, canonical_hash)
+
+        Raises:
+            OffsetResolutionError: Se chunk não encontrado ou ambíguo
+        """
+        # Primeiro, verifica se já existe no offsets_map (do SpanParser)
+        if self.offsets_map and span_id in self.offsets_map:
+            start, end = self.offsets_map[span_id]
+            # Armazena no cache para uso por filhos
+            self._resolved_child_offsets[span_id] = (start, end)
+            return (start, end, self.canonical_hash)
+
+        # Verifica se temos canonical_text para resolução
+        if not self.canonical_text:
+            raise OffsetResolutionError(
+                f"canonical_text não fornecido para resolver offsets de '{span_id}'",
+                document_id=self.document_id,
+                span_id=span_id,
+                device_type=device_type,
+                reason="NO_CANONICAL_TEXT",
+            )
+
+        # Resolve usando busca determinística no canonical_text
+        child_start, child_end = resolve_child_offsets(
+            canonical_text=self.canonical_text,
+            parent_start=parent_start,
+            parent_end=parent_end,
+            chunk_text=chunk_text,
+            document_id=self.document_id,
+            span_id=span_id,
+            device_type=device_type,
+        )
+
+        # Armazena no cache para uso por filhos (ex: inciso busca offset do parágrafo pai)
+        self._resolved_child_offsets[span_id] = (child_start, child_end)
+
+        logger.debug(
+            f"PR13 STRICT: Offset resolvido para {span_id} ({device_type}): "
+            f"[{child_start}:{child_end}]"
+        )
+
+        return (child_start, child_end, self.canonical_hash)
+
+    def _get_resolved_child_offset(self, span_id: str) -> Optional[tuple[int, int]]:
+        """
+        Obtém offset já resolvido de um filho (do cache).
+
+        Usado para hierarquia: quando um inciso está sob um parágrafo,
+        precisamos do range do parágrafo para buscar o inciso.
+
+        Args:
+            span_id: ID do span (ex: "PAR-005-1")
+
+        Returns:
+            Tupla (start, end) se encontrado no cache, None caso contrário
+        """
+        # Primeiro verifica no cache de resolvidos
+        if span_id in self._resolved_child_offsets:
+            return self._resolved_child_offsets[span_id]
+
+        # Fallback para offsets_map do SpanParser
+        if self.offsets_map and span_id in self.offsets_map:
+            return self.offsets_map[span_id]
+
+        return None
 
     # ==========================================================================
     # SPLITTING DE ARTIGOS GRANDES
