@@ -902,19 +902,11 @@ class ChunkMaterializer:
             )
 
             # PR13 STRICT: Resolve offsets para o inciso
-            # Inciso pode estar sob parágrafo ou diretamente sob artigo
-            # Busca no range do pai correto
-            if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
-                # Inciso sob parágrafo - busca no range do parágrafo
-                par_offsets = self._get_resolved_child_offset(inc_span.parent_id)
-                if par_offsets:
-                    inc_parent_start, inc_parent_end = par_offsets
-                else:
-                    # Fallback para range do artigo
-                    inc_parent_start, inc_parent_end = art_start, art_end
-            else:
-                # Inciso direto sob artigo
-                inc_parent_start, inc_parent_end = art_start, art_end
+            # IMPORTANTE: Sempre busca no range do ARTIGO, não do parágrafo!
+            # Motivo: O texto do parágrafo (do SpanParser) contém apenas o caput,
+            # não os incisos. Os incisos estão no texto do artigo, após o parágrafo.
+            # O parent_node_id continua apontando para o parágrafo (hierarquia lógica),
+            # mas o offset é resolvido dentro do artigo (posição física no texto).
 
             # NOTA: Usa inc_span.text (original) para busca, não inc_text (reconstruído com alíneas)
             # O texto reconstruído inclui formatação que não existe no canonical_text
@@ -922,8 +914,8 @@ class ChunkMaterializer:
                 span_id=inc_id,
                 device_type="inciso",
                 chunk_text=inc_span.text,  # Texto original do span, não reconstruído
-                parent_start=inc_parent_start,
-                parent_end=inc_parent_end,
+                parent_start=art_start,    # Sempre busca no artigo
+                parent_end=art_end,
             )
 
             child = MaterializedChunk(
@@ -1403,23 +1395,15 @@ class ChunkMaterializer:
                 )
 
                 # PR13 STRICT: Resolve offsets para o inciso
+                # IMPORTANTE: Sempre busca no range do ARTIGO, não do parágrafo!
+                # O texto do parágrafo contém apenas o caput, não os incisos.
                 # NOTA: Usa inc_span.text (original) para busca, não inc_text (reconstruído)
-                # Inciso pode estar sob parágrafo ou diretamente sob artigo
-                if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
-                    par_offsets = self._get_resolved_child_offset(inc_span.parent_id)
-                    if par_offsets:
-                        inc_parent_start, inc_parent_end = par_offsets
-                    else:
-                        inc_parent_start, inc_parent_end = art_start, art_end
-                else:
-                    inc_parent_start, inc_parent_end = art_start, art_end
-
                 inc_start, inc_end, inc_hash = self._resolve_child_offset_strict(
                     span_id=inc_id,
                     device_type="inciso",
                     chunk_text=inc_span.text,  # Texto original, não reconstruído
-                    parent_start=inc_parent_start,
-                    parent_end=inc_parent_end,
+                    parent_start=art_start,    # Sempre busca no artigo
+                    parent_end=art_end,
                 )
 
                 child = MaterializedChunk(

@@ -316,6 +316,24 @@ def resolve_child_offsets(
             reason = "NOT_FOUND"
             hint = "Texto não existe no range do pai"
 
+        # Log detalhado para debug
+        logger.error(
+            f"Offset NOT_FOUND debug: span_id={span_id}, "
+            f"parent_range=[{parent_start}:{parent_end}] ({parent_end - parent_start} chars), "
+            f"search_text[:80]={repr(search_text[:80])}"
+        )
+        # Tenta encontrar substring similar
+        if len(search_text) > 20:
+            prefix = search_text[:20]
+            if prefix in parent_text:
+                pos = parent_text.find(prefix)
+                logger.error(
+                    f"  HINT: Prefixo '{prefix}' encontrado em pos={pos}. "
+                    f"Contexto: ...{repr(parent_text[max(0,pos-10):pos+50])}..."
+                )
+            else:
+                logger.error(f"  HINT: Prefixo '{prefix}' NÃO encontrado no parent_text")
+
         raise OffsetResolutionError(
             f"Chunk '{span_id}' não encontrado no range do pai. {hint}. "
             f"chunk_text[0:50]='{search_text[:50]}...'",
