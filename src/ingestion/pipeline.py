@@ -18,7 +18,8 @@ import time
 import hashlib
 import logging
 import tempfile
-from typing import Optional, List
+import uuid
+from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +29,7 @@ from .quality_validator import QualityValidator
 from .markdown_sanitizer import MarkdownSanitizer
 from .article_validator import ArticleValidator
 from ..chunking.citation_extractor import extract_citations_from_chunk
+from ..chunking.canonical_offsets import normalize_canonical_text, compute_canonical_hash
 
 
 class ExtractionMethod(str, Enum):
@@ -57,6 +59,10 @@ class PipelineResult:
     ocr_fallback_used: bool = False
     # Validação de artigos (Fase Docling)
     validation_docling: Optional[dict] = None
+    # PR13: Ingest run ID para rastreabilidade
+    ingest_run_id: str = ""
+    # PR13: Canonical hash para validação de offsets
+    canonical_hash: str = ""
 
 
 class IngestionPipeline:
@@ -185,6 +191,17 @@ class IngestionPipeline:
             logger.info("BGE-M3 Embedder inicializado")
         return self._embedder
 
+    # === Artifacts Uploader (PR13/Etapa 4) ===
+    _artifacts_uploader = None
+
+    @property
+    def artifacts_uploader(self):
+        """Uploader para enviar artifacts para a VPS."""
+        if self._artifacts_uploader is None:
+            from ..sinks.artifacts_uploader import get_artifacts_uploader
+            self._artifacts_uploader = get_artifacts_uploader()
+        return self._artifacts_uploader
+
     # === Acórdãos TCU ===
     _acordao_parser = None
     _acordao_chunker = None
@@ -303,13 +320,18 @@ class IngestionPipeline:
                     logger.warning(f"Erro no progress_callback: {e}")
 
         start_time = time.perf_counter()
+
+        # Gera ingest_run_id único para rastreabilidade
+        ingest_run_id = str(uuid.uuid4())
+
         result = PipelineResult(
             status=IngestStatus.PROCESSING,
             document_id=request.document_id,
+            ingest_run_id=ingest_run_id,
         )
         report_progress("initializing", 0.05)
 
-        # Calcula hash do documento
+        # Calcula hash do documento (SHA256 do PDF original)
         result.document_hash = hashlib.sha256(pdf_content).hexdigest()
 
         try:
@@ -366,8 +388,20 @@ class IngestionPipeline:
                         return result
                     report_progress("parsing", 0.45)
 
-                    # Fase 3: ArticleOrchestrator (LLM extraction) - 45% a 70%
-                    report_progress("extraction", 0.45)
+                    # Fase 2.5: Upload de Artifacts para VPS (PR13/Etapa 4) - 45% a 47%
+                    report_progress("artifacts_upload", 0.45)
+                    artifacts_result = self._phase_artifacts_upload(
+                        pdf_content=pdf_content,
+                        parsed_doc=parsed_doc,
+                        request=request,
+                        result=result,
+                    )
+                    if result.status == IngestStatus.FAILED:
+                        return result
+                    report_progress("artifacts_upload", 0.47)
+
+                    # Fase 3: ArticleOrchestrator (LLM extraction) - 47% a 70%
+                    report_progress("extraction", 0.47)
                     article_chunks = self._phase_extraction(parsed_doc, result, request.max_articles)
                     if result.status == IngestStatus.FAILED:
                         return result
@@ -382,12 +416,14 @@ class IngestionPipeline:
                         return result
                     report_progress("materialization", 0.75)
 
-                # Fase 5: Embeddings (se nao pular) - 75% a 95%
+                # Fase 5: Embeddings (se nao pular) - 75% a 90%
                 if not request.skip_embeddings:
                     report_progress("embedding", 0.75)
                     self._phase_embeddings(materialized, result)
                     if result.status == IngestStatus.FAILED:
                         return result
+                    report_progress("embedding", 0.90)
+
                     report_progress("embedding", 0.95)
 
                 # Fase 6: Validacao de artigos (se habilitada ou sempre para gerar manifesto)
@@ -597,6 +633,138 @@ class IngestionPipeline:
             result.status = IngestStatus.FAILED
             result.errors.append(IngestError(phase="parsing", message=str(e)))
             return None
+
+    def _phase_artifacts_upload(
+        self,
+        pdf_content: bytes,
+        parsed_doc,
+        request: IngestRequest,
+        result: PipelineResult,
+    ) -> bool:
+        """
+        Fase 2.5: Upload de Artifacts para VPS (PR13/Etapa 4).
+
+        Envia PDF, canonical.md e offsets.json para a VPS antes de
+        continuar com o pipeline. Isso garante que as evidências
+        estejam armazenadas antes dos chunks irem para o Milvus.
+
+        Se o upload falhar, o pipeline é abortado para evitar
+        chunks órfãos no Milvus sem evidência correspondente.
+
+        Args:
+            pdf_content: Bytes do PDF original
+            parsed_doc: ParsedDocument com source_text (canonical markdown)
+            request: Metadados do documento
+            result: PipelineResult em construção
+
+        Returns:
+            True se upload OK ou uploader não configurado, False se falhou
+        """
+        phase_start = time.perf_counter()
+
+        try:
+            # Verifica se uploader está configurado
+            uploader = self.artifacts_uploader
+            if not uploader.is_configured():
+                logger.info("Fase 2.5: Artifacts uploader não configurado, pulando upload")
+                result.phases.append({
+                    "name": "artifacts_upload",
+                    "duration_seconds": 0.0,
+                    "output": "Skipped (uploader não configurado)",
+                    "success": True,
+                    "skipped": True,
+                })
+                return True
+
+            logger.info("Fase 2.5: Artifacts upload iniciando...")
+
+            # Extrai canonical markdown e normaliza
+            canonical_md = parsed_doc.source_text or result.markdown_content
+            canonical_md_normalized = normalize_canonical_text(canonical_md)
+
+            # Computa hashes
+            sha256_canonical = compute_canonical_hash(canonical_md_normalized)
+            result.canonical_hash = sha256_canonical
+
+            # Extrai offsets de todos os spans
+            from ..chunking.canonical_offsets import extract_offsets_from_parsed_doc
+            offsets_map, _ = extract_offsets_from_parsed_doc(parsed_doc)
+
+            # Converte offsets para formato JSON-serializable
+            from ..sinks.artifacts_uploader import (
+                ArtifactMetadata,
+                prepare_offsets_map,
+                compute_sha256,
+            )
+
+            offsets_json = prepare_offsets_map(offsets_map)
+
+            # Prepara metadados
+            # document_version como timestamp Unix (inteiro)
+            metadata = ArtifactMetadata(
+                document_id=request.document_id,
+                tipo_documento=request.tipo_documento,
+                numero=request.numero,
+                ano=request.ano,
+                sha256_source=result.document_hash,
+                sha256_canonical_md=sha256_canonical,
+                canonical_hash=sha256_canonical,
+                ingest_run_id=result.ingest_run_id,
+                pipeline_version="1.0.0",
+                document_version=str(int(datetime.utcnow().timestamp())),
+            )
+
+            # Faz upload
+            upload_result = uploader.upload(
+                pdf_content=pdf_content,
+                canonical_md=canonical_md_normalized,
+                offsets_json=offsets_json,
+                metadata=metadata,
+            )
+
+            duration = round(time.perf_counter() - phase_start, 2)
+
+            if upload_result.success:
+                result.phases.append({
+                    "name": "artifacts_upload",
+                    "duration_seconds": duration,
+                    "output": f"Artifacts uploaded: {upload_result.message}",
+                    "storage_paths": upload_result.storage_paths,
+                    "retries": upload_result.retries,
+                    "success": True,
+                })
+                logger.info(
+                    f"Fase 2.5: Artifacts upload concluido em {duration}s "
+                    f"(retries={upload_result.retries})"
+                )
+                return True
+            else:
+                # Upload falhou - continua pipeline com warning (não aborta mais)
+                result.phases.append({
+                    "name": "artifacts_upload",
+                    "duration_seconds": duration,
+                    "output": f"WARNING: {upload_result.error}",
+                    "retries": upload_result.retries,
+                    "success": False,
+                })
+                logger.warning(
+                    f"Fase 2.5: Artifacts upload FALHOU em {duration}s - "
+                    f"continuando pipeline (chunks serão inseridos no Milvus)"
+                )
+                # Retorna True para continuar o pipeline
+                return True
+
+        except Exception as e:
+            duration = round(time.perf_counter() - phase_start, 2)
+            logger.warning(f"Erro no artifacts upload (continuando): {e}")
+            result.phases.append({
+                "name": "artifacts_upload",
+                "duration_seconds": duration,
+                "output": f"WARNING: {str(e)}",
+                "success": False,
+            })
+            # Retorna True para continuar o pipeline
+            return True
 
     def _phase_parsing_acordao(self, result: PipelineResult, request: IngestRequest):
         """Fase 2A: AcordaoSpanParser - Markdown -> ParsedAcordao"""
@@ -820,6 +988,138 @@ class IngestionPipeline:
             logger.error(f"Erro nos embeddings: {e}", exc_info=True)
             result.status = IngestStatus.FAILED
             result.errors.append(IngestError(phase="embedding", message=str(e)))
+
+    def _phase_milvus_sink(self, materialized, request: IngestRequest, result: PipelineResult):
+        """Fase 5.5: Inserir chunks no Milvus remoto (se MILVUS_HOST configurado)."""
+        phase_start = time.perf_counter()
+        try:
+            from pymilvus import connections, Collection
+
+            milvus_host = os.getenv("MILVUS_HOST", "127.0.0.1")
+            milvus_port = int(os.getenv("MILVUS_PORT", "19530"))
+            collection_name = os.getenv("MILVUS_COLLECTION", "leis_v4")
+
+            logger.info(f"Fase 5.5: Milvus Sink iniciando ({milvus_host}:{milvus_port}/{collection_name})...")
+
+            # Conecta ao Milvus
+            connections.connect(
+                alias="ingest",
+                host=milvus_host,
+                port=milvus_port,
+            )
+            collection = Collection(collection_name, using="ingest")
+            collection.load()
+
+            # Prepara dados no formato do schema leis_v4
+            data_list = []
+            for chunk in materialized:
+                # Skip chunks marcados para nao indexar
+                if getattr(chunk, '_skip_milvus_index', False):
+                    continue
+
+                chunk_id = chunk.chunk_id
+                # Adiciona @P00 se não tiver parte
+                if '@P' not in chunk_id:
+                    node_id_base = f"{chunk_id}@P00"
+                else:
+                    node_id_base = chunk_id
+                # Adiciona prefixo leis: para o node_id físico
+                node_id = f"leis:{node_id_base}"
+                # logical_node_id é sem @Pxx mas com prefixo leis:
+                logical_node_id_base = node_id_base.split('@P')[0] if '@P' in node_id_base else node_id_base
+                logical_node_id = f"leis:{logical_node_id_base}"
+
+                # Prepara parent_node_id (com prefixo leis:)
+                parent_chunk_id = getattr(chunk, 'parent_chunk_id', '') or ''
+                if parent_chunk_id:
+                    if '@P' not in parent_chunk_id:
+                        parent_node_id = f"leis:{parent_chunk_id}@P00"
+                    else:
+                        parent_node_id = f"leis:{parent_chunk_id}"
+                else:
+                    parent_node_id = ""
+
+                # Extrai citações para has_citations e citations_count
+                citations = getattr(chunk, 'citations', []) or []
+                has_citations = len(citations) > 0
+                citations_count = len(citations)
+
+                # Device type - manter como "article", "paragraph", etc. conforme schema
+                device_type = getattr(chunk, 'device_type', 'article')
+
+                # Prepara aliases como JSON string
+                aliases = getattr(chunk, 'aliases', []) or []
+                import json
+                aliases_str = json.dumps(aliases, ensure_ascii=False)
+
+                data = {
+                    "node_id": node_id,
+                    "logical_node_id": logical_node_id,
+                    "span_id": getattr(chunk, 'span_id', ''),
+                    "parent_node_id": parent_node_id,
+                    "device_type": device_type,
+                    "chunk_level": getattr(chunk, 'chunk_level', 'article'),
+                    "part_index": 0,
+                    "part_total": 1,
+                    "chunk_id": chunk_id,
+                    "ingest_run_id": result.ingest_run_id or '',
+                    "text": chunk.text,
+                    "retrieval_text": getattr(chunk, 'retrieval_text', chunk.text),
+                    "document_id": request.document_id,
+                    "tipo_documento": request.tipo_documento,
+                    "numero": request.numero,
+                    "ano": request.ano,
+                    "article_number": getattr(chunk, 'article_number', '') or '',
+                    "aliases": aliases_str,
+                    "canonical_start": getattr(chunk, 'canonical_start', -1),
+                    "canonical_end": getattr(chunk, 'canonical_end', -1),
+                    "canonical_hash": getattr(chunk, 'canonical_hash', '') or result.canonical_hash or '',
+                    "dense_vector": getattr(chunk, '_dense_vector', [0.0] * 1024),
+                    "sparse_vector": getattr(chunk, '_sparse_vector', {}),
+                    "has_citations": has_citations,
+                    "citations_count": citations_count,
+                }
+                data_list.append(data)
+
+            # Insere em batch
+            if data_list:
+                # Delete existentes
+                node_ids = [d["node_id"] for d in data_list]
+                ids_str = ", ".join([f'"{nid}"' for nid in node_ids[:100]])  # Limita para evitar query muito longa
+                try:
+                    collection.delete(expr=f"node_id in [{ids_str}]")
+                except Exception as del_err:
+                    logger.warning(f"Erro ao deletar chunks existentes: {del_err}")
+
+                # Insert batch
+                collection.insert(data_list)
+                inserted = len(data_list)
+                logger.info(f"Milvus: {inserted} chunks inseridos")
+            else:
+                inserted = 0
+
+            # Desconecta
+            connections.disconnect("ingest")
+
+            duration = round(time.perf_counter() - phase_start, 2)
+            result.phases.append({
+                "name": "milvus_sink",
+                "duration_seconds": duration,
+                "output": f"Inseridos {inserted} chunks no Milvus ({milvus_host})",
+                "success": True,
+            })
+            logger.info(f"Fase 5.5: Milvus Sink concluido em {duration}s - {inserted} chunks inseridos")
+
+        except Exception as e:
+            logger.error(f"Erro no Milvus Sink: {e}", exc_info=True)
+            # Nao falha o pipeline se Milvus falhar - apenas loga warning
+            result.phases.append({
+                "name": "milvus_sink",
+                "duration_seconds": round(time.perf_counter() - phase_start, 2),
+                "output": f"FALHA: {str(e)[:200]}",
+                "success": False,
+            })
+            logger.warning(f"Milvus Sink falhou mas pipeline continua: {e}")
 
     def _to_processed_chunks(
         self,
