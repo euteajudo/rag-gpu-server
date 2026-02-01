@@ -57,9 +57,9 @@ class ProcessedChunk(BaseModel):
     """Chunk processado, pronto para indexação."""
 
     # Identificação
-    node_id: str = Field(..., description="PK canônica: leis:DOC#SPAN_ID")
+    node_id: str = Field(..., description="PK física: leis:DOC#SPAN_ID@Pxx")
     chunk_id: str = Field(..., description="ID único: DOC#SPAN_ID")
-    parent_chunk_id: str = Field("", description="ID do chunk pai (vazio se artigo)")
+    parent_node_id: str = Field("", description="ID lógico do pai: leis:DOC#SPAN_ID (sem @Pxx, vazio se artigo)")
     span_id: str = Field(..., description="ID do span: ART-005, PAR-005-1, etc")
     device_type: str = Field(..., description="article, paragraph, inciso, alinea")
     chunk_level: str = Field(..., description="article ou device")
@@ -118,7 +118,7 @@ class ProcessedChunk(BaseModel):
             "example": {
                 "node_id": "leis:LEI-123-2006#ART-005",
                 "chunk_id": "LEI-123-2006#ART-005",
-                "parent_chunk_id": "",
+                "parent_node_id": "",
                 "span_id": "ART-005",
                 "device_type": "article",
                 "chunk_level": "article",

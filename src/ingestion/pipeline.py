@@ -1029,15 +1029,9 @@ class IngestionPipeline:
                 logical_node_id_base = node_id_base.split('@P')[0] if '@P' in node_id_base else node_id_base
                 logical_node_id = f"leis:{logical_node_id_base}"
 
-                # Prepara parent_node_id (com prefixo leis:)
-                parent_chunk_id = getattr(chunk, 'parent_chunk_id', '') or ''
-                if parent_chunk_id:
-                    if '@P' not in parent_chunk_id:
-                        parent_node_id = f"leis:{parent_chunk_id}@P00"
-                    else:
-                        parent_node_id = f"leis:{parent_chunk_id}"
-                else:
-                    parent_node_id = ""
+                # PR13: parent_node_id já vem pronto do MaterializedChunk
+                # Formato: "leis:DOC#SPAN_ID" para filhos, "" para artigos
+                parent_node_id = getattr(chunk, 'parent_node_id', '') or ''
 
                 # Extrai citações para has_citations e citations_count
                 citations = getattr(chunk, 'citations', []) or []
@@ -1144,7 +1138,7 @@ class IngestionPipeline:
                     text=chunk.text or "",
                     document_id=request.document_id,
                     chunk_node_id=chunk.node_id,  # Remove self-loops
-                    parent_chunk_id=chunk.parent_chunk_id if hasattr(chunk, "parent_chunk_id") else None,
+                    parent_chunk_id=chunk.parent_node_id if hasattr(chunk, "parent_node_id") else None,
                     document_type="ACORDAO",
                 )
 
@@ -1155,7 +1149,7 @@ class IngestionPipeline:
                 pc = ProcessedChunk(
                     node_id=chunk.node_id,
                     chunk_id=chunk.chunk_id,
-                    parent_chunk_id=chunk.parent_chunk_id or "",
+                    parent_node_id=chunk.parent_node_id or "",
                     span_id=chunk.span_id,
                     device_type=chunk.device_type,
                     chunk_level="acordao_span",  # Nível específico para acórdãos
@@ -1191,7 +1185,7 @@ class IngestionPipeline:
                     text=chunk.text or "",
                     document_id=request.document_id,
                     chunk_node_id=chunk.node_id,  # Remove self-loops
-                    parent_chunk_id=chunk.parent_chunk_id,  # Remove parent-loops
+                    parent_chunk_id=chunk.parent_node_id,  # Remove parent-loops
                     document_type=request.tipo_documento,
                 )
 
@@ -1212,7 +1206,7 @@ class IngestionPipeline:
                 pc = ProcessedChunk(
                     node_id=chunk.node_id,
                     chunk_id=chunk.chunk_id,
-                    parent_chunk_id=chunk.parent_chunk_id or "",
+                    parent_node_id=chunk.parent_node_id or "",
                     span_id=chunk.span_id,
                     device_type=chunk.device_type.value if hasattr(chunk.device_type, "value") else str(chunk.device_type),
                     chunk_level=chunk.chunk_level.name.lower() if hasattr(chunk.chunk_level, "name") else str(chunk.chunk_level),
