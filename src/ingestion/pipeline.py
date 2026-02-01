@@ -57,18 +57,26 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
     Invariantes:
     1. node_id DEVE começar com "leis:" e NÃO conter "@P"
     2. parent_node_id (quando não vazio) DEVE começar com "leis:" e NÃO conter "@P"
-    3. canonical_start, canonical_end, canonical_hash DEVEM estar presentes
+    3. Filhos devem ter parent_node_id
+    4. PR13 trio deve ser coerente (sentinela ou válido, nunca misturado)
+    5. EVIDENCE CHUNKS (article/paragraph/inciso/alinea) DEVEM ter offsets válidos
+       - Sentinela (-1,-1,"") é PROIBIDO para evidence
+       - Evidence sem offset = snippet não determinístico = ABORT
 
     Raises:
         ContractViolationError: Se qualquer invariante for violada (aborta pipeline)
     """
     violations = []
 
+    # Device types que são "evidence" (aparecem no Evidence Drawer)
+    EVIDENCE_DEVICE_TYPES = {"article", "paragraph", "inciso", "alinea"}
+
     for i, chunk in enumerate(chunks):
         node_id = chunk.node_id or ""
         parent_node_id = chunk.parent_node_id or ""
         device_type = chunk.device_type or ""
         span_id = chunk.span_id or ""
+        is_evidence = device_type in EVIDENCE_DEVICE_TYPES
 
         # Invariante 1: node_id deve começar com "leis:"
         if not node_id.startswith("leis:"):
@@ -100,9 +108,7 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
                 f"[{span_id}] {device_type} sem parent_node_id (obrigatório para filhos)"
             )
 
-        # Invariante 6: PR13 trio deve ser coerente (nunca misturado)
-        # - Sentinela: start=-1, end=-1, hash="" (todos juntos)
-        # - Conhecido: start>=0, end>=start, hash!="" (todos válidos)
+        # Invariante 6: PR13 trio - campos devem existir e ser coerentes
         c_start = getattr(chunk, 'canonical_start', None)
         c_end = getattr(chunk, 'canonical_end', None)
         c_hash = getattr(chunk, 'canonical_hash', None)
@@ -118,28 +124,55 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
         # Se campos existem, validar coerência do trio
         if c_start is not None and c_end is not None and c_hash is not None:
             is_sentinel = (c_start == -1 and c_end == -1 and c_hash == "")
-            is_valid = (c_start >= 0 and c_end >= c_start and c_hash != "")
+            is_valid_offset = (c_start >= 0 and c_end > c_start and c_hash != "")
 
-            if not is_sentinel and not is_valid:
-                # Trio inconsistente - nem sentinela nem válido
+            # Trio deve ser sentinela OU válido, nunca misturado
+            if not is_sentinel and not is_valid_offset:
                 violations.append(
                     f"[{span_id}] PR13 trio incoerente: start={c_start}, end={c_end}, "
-                    f"hash={'\"\"' if c_hash == '' else c_hash[:16]+'...'} "
-                    f"(esperado: sentinela [-1,-1,''] ou válido [>=0,>=start,hash])"
+                    f"hash={repr(c_hash[:16]) if c_hash else repr('')} "
+                    f"(esperado: sentinela [-1,-1,''] ou válido [>=0,>start,hash])"
+                )
+
+            # INVARIANTE 7 (CRÍTICA): Evidence chunks DEVEM ter offsets válidos
+            # Sentinela é PROIBIDO para evidence - snippet não seria determinístico
+            if is_evidence and is_sentinel:
+                violations.append(
+                    f"[{span_id}] EVIDENCE SEM OFFSET: document_id={document_id}, "
+                    f"node_id={node_id}, device_type={device_type} - "
+                    f"Evidence requer offsets válidos para snippet determinístico. "
+                    f"Sentinela (-1,-1,'') é PROIBIDO para evidence chunks."
                 )
 
     if violations:
+        # Contagem por tipo de violação para diagnóstico
+        evidence_offset_violations = [v for v in violations if "EVIDENCE SEM OFFSET" in v]
+        other_violations = [v for v in violations if "EVIDENCE SEM OFFSET" not in v]
+
         error_msg = (
             f"ABORT: {len(violations)} violações de contrato no documento '{document_id}':\n"
-            + "\n".join(f"  • {v}" for v in violations[:10])  # Mostra até 10
         )
-        if len(violations) > 10:
-            error_msg += f"\n  ... e mais {len(violations) - 10} violações"
+
+        if evidence_offset_violations:
+            error_msg += f"\n  ⛔ {len(evidence_offset_violations)} chunks evidence SEM OFFSETS VÁLIDOS:\n"
+            for v in evidence_offset_violations[:5]:
+                error_msg += f"     • {v}\n"
+            if len(evidence_offset_violations) > 5:
+                error_msg += f"     ... e mais {len(evidence_offset_violations) - 5} chunks evidence sem offset\n"
+            error_msg += "\n  💡 CAUSA PROVÁVEL: SpanParser não fornece start_pos/end_pos para filhos (PAR/INC/ALI)\n"
+            error_msg += "  💡 SOLUÇÃO: Garantir que parsed_doc.spans inclui offsets para TODOS os spans\n"
+
+        if other_violations:
+            error_msg += f"\n  ⚠️  Outras violações ({len(other_violations)}):\n"
+            for v in other_violations[:5]:
+                error_msg += f"     • {v}\n"
+            if len(other_violations) > 5:
+                error_msg += f"     ... e mais {len(other_violations) - 5}\n"
 
         logger.error(error_msg)
         raise ContractViolationError(error_msg)
 
-    logger.info(f"✓ Invariantes validadas: {len(chunks)} chunks OK para '{document_id}'")
+    logger.info(f"✓ Invariantes validadas: {len(chunks)} chunks evidence com offsets OK para '{document_id}'")
 
 
 @dataclass
