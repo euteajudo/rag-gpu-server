@@ -53,7 +53,7 @@ A estratégia parent-child permite recuperação contextual expandida:
     │  Chunk PAI (ARTICLE)                                                  │
     │  ┌─────────────────────────────────────────────────────────────────┐  │
     │  │ chunk_id: "IN-65-2021#ART-005"                                  │  │
-    │  │ parent_chunk_id: ""  ← Artigo não tem pai                       │  │
+    │  │ parent_node_id: ""  ← Artigo não tem pai                        │  │
     │  │ span_id: "ART-005"                                              │  │
     │  │ device_type: ARTICLE                                            │  │
     │  │ text: "Art. 5º O estudo técnico preliminar..."                  │  │
@@ -70,8 +70,8 @@ A estratégia parent-child permite recuperação contextual expandida:
     │  │ IN-65-2021#     │  │ IN-65-2021#     │                             │
     │  │ PAR-005-1       │  │ INC-005-I       │                             │
     │  │                 │  │                 │                             │
-    │  │ parent_chunk_id:│  │ parent_chunk_id:│                             │
-    │  │ IN-65-2021#     │  │ IN-65-2021#     │                             │
+    │  │ parent_node_id: │  │ parent_node_id: │                             │
+    │  │ leis:IN-65-2021#│  │ leis:IN-65-2021#│                             │
     │  │ ART-005         │  │ ART-005         │                             │
     │  │                 │  │                 │                             │
     │  │ span_id:        │  │ span_id:        │                             │
@@ -97,8 +97,8 @@ Fluxo de Retrieval com Parent-Child:
     │     → INC-005-II (score: 0.95)                                          │
     │                    │                                                    │
     │                    ▼                                                    │
-    │  3. Sistema recupera chunk PAI via parent_chunk_id                      │
-    │     → Busca: parent_chunk_id == "IN-65-2021#ART-005"                    │
+    │  3. Sistema recupera chunk PAI via parent_node_id                       │
+    │     → Busca: node_id == "leis:IN-65-2021#ART-005" (parent_node_id)      │
     │     → Obtém: ART-005 (texto completo do artigo)                         │
     │                    │                                                    │
     │                    ▼                                                    │
@@ -149,7 +149,7 @@ MaterializedChunk (Campos Principais):
 | Campo              | Tipo          | Descrição                              |
 |--------------------|---------------|----------------------------------------|
 | chunk_id           | str           | ID único: "{doc}#{span}"               |
-| parent_chunk_id    | str           | ID do pai ("" para artigos)            |
+| parent_node_id     | str           | node_id do pai ("" para artigos)       |
 | span_id            | str           | ID do span: ART-005, PAR-005-1         |
 | device_type        | DeviceType    | ARTICLE, PARAGRAPH, INCISO, ALINEA     |
 | chunk_level        | ChunkLevel    | ARTICLE ou DEVICE                      |
@@ -409,7 +409,7 @@ class MaterializedChunk:
     # IDs
     node_id: str            # Ex: "leis:IN-65-2021#ART-005" (PK canônica para Milvus/Neo4j)
     chunk_id: str           # Ex: "IN-65-2021#ART-005" ou "IN-65-2021#PAR-005-1"
-    parent_chunk_id: str    # Ex: "" para artigos, "IN-65-2021#ART-005" para filhos
+    parent_node_id: str     # Ex: "" para artigos, "leis:IN-65-2021#ART-005" para filhos
     span_id: str            # Ex: "ART-005", "PAR-005-1", "INC-005-I"
 
     # Tipo
@@ -516,7 +516,7 @@ class MaterializedChunk:
             "article_number": self.article_number,
 
             # Campos dinâmicos (parent-child)
-            "parent_chunk_id": self.parent_chunk_id,
+            "parent_node_id": self.parent_node_id,
             "span_id": self.span_id,
             "device_type": self.device_type.value,
             "chunk_level": self.chunk_level.value,
@@ -788,7 +788,7 @@ class ChunkMaterializer:
         parent = MaterializedChunk(
             node_id=parent_node_id,
             chunk_id=parent_chunk_id,
-            parent_chunk_id="",  # Artigo não tem pai
+            parent_node_id="",  # Artigo não tem pai
             span_id=article_chunk.article_id,
             device_type=DeviceType.ARTICLE,
             chunk_level=ChunkLevel.ARTICLE,
@@ -837,7 +837,7 @@ class ChunkMaterializer:
             child = MaterializedChunk(
                 node_id=child_node_id,
                 chunk_id=child_chunk_id,
-                parent_chunk_id=parent_chunk_id,
+                parent_node_id=parent_node_id,  # node_id do artigo pai
                 span_id=par_id,
                 device_type=DeviceType.PARAGRAPH,
                 chunk_level=ChunkLevel.DEVICE,
@@ -872,11 +872,11 @@ class ChunkMaterializer:
             inc_text = self._reconstruct_inciso_text(inc_id, parsed_doc)
             inc_citations = self._get_inciso_citations(inc_id, parsed_doc)
 
-            # Determina parent_chunk_id correto: parágrafo (se existir) ou artigo
+            # Determina parent_node_id correto: parágrafo (se existir) ou artigo
             if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
-                correct_parent_chunk_id = f"{self.document_id}#{inc_span.parent_id}"
+                correct_parent_node_id = f"leis:{self.document_id}#{inc_span.parent_id}"
             else:
-                correct_parent_chunk_id = parent_chunk_id  # Fallback para artigo
+                correct_parent_node_id = parent_node_id  # Fallback para artigo
 
             # Constrói retrieval_text determinístico para o inciso
             inc_retrieval_text = build_retrieval_text(
@@ -894,7 +894,7 @@ class ChunkMaterializer:
             child = MaterializedChunk(
                 node_id=child_node_id,
                 chunk_id=child_chunk_id,
-                parent_chunk_id=correct_parent_chunk_id,
+                parent_node_id=correct_parent_node_id,  # node_id do pai (PAR ou ART)
                 span_id=inc_id,
                 device_type=DeviceType.INCISO,
                 chunk_level=ChunkLevel.DEVICE,
@@ -1134,7 +1134,7 @@ class ChunkMaterializer:
         parent = MaterializedChunk(
             node_id=parent_node_id,
             chunk_id=parent_chunk_id,
-            parent_chunk_id="",  # Artigo não tem pai
+            parent_node_id="",  # Artigo não tem pai
             span_id=article_chunk.article_id,
             device_type=DeviceType.ARTICLE,
             chunk_level=ChunkLevel.ARTICLE,
@@ -1176,7 +1176,7 @@ class ChunkMaterializer:
             part_chunk = MaterializedChunk(
                 node_id=part_node_id,
                 chunk_id=part_chunk_id,
-                parent_chunk_id=parent_chunk_id,  # Aponta para o pai canônico
+                parent_node_id=parent_node_id,  # node_id do pai canônico
                 span_id=part["span_id"],
                 device_type=DeviceType.PART,
                 chunk_level=ChunkLevel.DEVICE,  # Filhos são DEVICE level
@@ -1222,7 +1222,7 @@ class ChunkMaterializer:
                 child = MaterializedChunk(
                     node_id=child_node_id,
                     chunk_id=child_chunk_id,
-                    parent_chunk_id=parent_chunk_id,
+                    parent_node_id=parent_node_id,  # node_id do artigo pai
                     span_id=par_id,
                     device_type=DeviceType.PARAGRAPH,
                     chunk_level=ChunkLevel.DEVICE,
@@ -1255,11 +1255,11 @@ class ChunkMaterializer:
                 inc_text = self._reconstruct_inciso_text(inc_id, parsed_doc)
                 inc_citations = self._get_inciso_citations(inc_id, parsed_doc)
 
-                # Determina parent_chunk_id correto: parágrafo (se existir) ou artigo
+                # Determina parent_node_id correto: parágrafo (se existir) ou artigo
                 if inc_span.parent_id and inc_span.parent_id.startswith("PAR-"):
-                    correct_parent_chunk_id = f"{self.document_id}#{inc_span.parent_id}"
+                    correct_parent_node_id = f"leis:{self.document_id}#{inc_span.parent_id}"
                 else:
-                    correct_parent_chunk_id = parent_chunk_id  # Fallback para artigo
+                    correct_parent_node_id = parent_node_id  # Fallback para artigo
 
                 # Constrói retrieval_text determinístico para o inciso
                 inc_retrieval_text = build_retrieval_text(
@@ -1277,7 +1277,7 @@ class ChunkMaterializer:
                 child = MaterializedChunk(
                     node_id=child_node_id,
                     chunk_id=child_chunk_id,
-                    parent_chunk_id=correct_parent_chunk_id,
+                    parent_node_id=correct_parent_node_id,  # node_id do pai (PAR ou ART)
                     span_id=inc_id,
                     device_type=DeviceType.INCISO,
                     chunk_level=ChunkLevel.DEVICE,
