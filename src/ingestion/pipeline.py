@@ -100,14 +100,33 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
                 f"[{span_id}] {device_type} sem parent_node_id (obrigatório para filhos)"
             )
 
-        # Invariante 6: canonical_start/end/hash devem estar presentes
-        # (podem ser -1/"" para dispositivos filhos, mas o campo deve existir)
-        if not hasattr(chunk, 'canonical_start'):
-            violations.append(f"[{span_id}] campo canonical_start ausente")
-        if not hasattr(chunk, 'canonical_end'):
-            violations.append(f"[{span_id}] campo canonical_end ausente")
-        if not hasattr(chunk, 'canonical_hash'):
-            violations.append(f"[{span_id}] campo canonical_hash ausente")
+        # Invariante 6: PR13 trio deve ser coerente (nunca misturado)
+        # - Sentinela: start=-1, end=-1, hash="" (todos juntos)
+        # - Conhecido: start>=0, end>=start, hash!="" (todos válidos)
+        c_start = getattr(chunk, 'canonical_start', None)
+        c_end = getattr(chunk, 'canonical_end', None)
+        c_hash = getattr(chunk, 'canonical_hash', None)
+
+        # Campos devem existir
+        if c_start is None:
+            violations.append(f"[{span_id}] canonical_start ausente")
+        if c_end is None:
+            violations.append(f"[{span_id}] canonical_end ausente")
+        if c_hash is None:
+            violations.append(f"[{span_id}] canonical_hash ausente")
+
+        # Se campos existem, validar coerência do trio
+        if c_start is not None and c_end is not None and c_hash is not None:
+            is_sentinel = (c_start == -1 and c_end == -1 and c_hash == "")
+            is_valid = (c_start >= 0 and c_end >= c_start and c_hash != "")
+
+            if not is_sentinel and not is_valid:
+                # Trio inconsistente - nem sentinela nem válido
+                violations.append(
+                    f"[{span_id}] PR13 trio incoerente: start={c_start}, end={c_end}, "
+                    f"hash={'\"\"' if c_hash == '' else c_hash[:16]+'...'} "
+                    f"(esperado: sentinela [-1,-1,''] ou válido [>=0,>=start,hash])"
+                )
 
     if violations:
         error_msg = (
