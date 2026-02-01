@@ -41,6 +41,88 @@ class ExtractionMethod(str, Enum):
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# INVARIANTES DO CONTRATO RUNPOD → VPS
+# =============================================================================
+
+class ContractViolationError(Exception):
+    """Erro fatal: violação das invariantes do contrato RunPod → VPS."""
+    pass
+
+
+def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) -> None:
+    """
+    Valida invariantes do contrato antes de retornar para VPS.
+
+    Invariantes:
+    1. node_id DEVE começar com "leis:" e NÃO conter "@P"
+    2. parent_node_id (quando não vazio) DEVE começar com "leis:" e NÃO conter "@P"
+    3. canonical_start, canonical_end, canonical_hash DEVEM estar presentes
+
+    Raises:
+        ContractViolationError: Se qualquer invariante for violada (aborta pipeline)
+    """
+    violations = []
+
+    for i, chunk in enumerate(chunks):
+        node_id = chunk.node_id or ""
+        parent_node_id = chunk.parent_node_id or ""
+        device_type = chunk.device_type or ""
+        span_id = chunk.span_id or ""
+
+        # Invariante 1: node_id deve começar com "leis:"
+        if not node_id.startswith("leis:"):
+            violations.append(
+                f"[{span_id}] node_id sem prefixo 'leis:': '{node_id}'"
+            )
+
+        # Invariante 2: node_id não pode conter @Pxx
+        if "@P" in node_id:
+            violations.append(
+                f"[{span_id}] node_id contém @Pxx (proibido): '{node_id}'"
+            )
+
+        # Invariante 3: parent_node_id (quando não vazio) deve começar com "leis:"
+        if parent_node_id and not parent_node_id.startswith("leis:"):
+            violations.append(
+                f"[{span_id}] parent_node_id sem prefixo 'leis:': '{parent_node_id}'"
+            )
+
+        # Invariante 4: parent_node_id não pode conter @Pxx
+        if "@P" in parent_node_id:
+            violations.append(
+                f"[{span_id}] parent_node_id contém @Pxx (proibido): '{parent_node_id}'"
+            )
+
+        # Invariante 5: filhos (não-artigos) devem ter parent_node_id não vazio
+        if device_type in ("paragraph", "inciso", "alinea") and not parent_node_id:
+            violations.append(
+                f"[{span_id}] {device_type} sem parent_node_id (obrigatório para filhos)"
+            )
+
+        # Invariante 6: canonical_start/end/hash devem estar presentes
+        # (podem ser -1/"" para dispositivos filhos, mas o campo deve existir)
+        if not hasattr(chunk, 'canonical_start'):
+            violations.append(f"[{span_id}] campo canonical_start ausente")
+        if not hasattr(chunk, 'canonical_end'):
+            violations.append(f"[{span_id}] campo canonical_end ausente")
+        if not hasattr(chunk, 'canonical_hash'):
+            violations.append(f"[{span_id}] campo canonical_hash ausente")
+
+    if violations:
+        error_msg = (
+            f"ABORT: {len(violations)} violações de contrato no documento '{document_id}':\n"
+            + "\n".join(f"  • {v}" for v in violations[:10])  # Mostra até 10
+        )
+        if len(violations) > 10:
+            error_msg += f"\n  ... e mais {len(violations) - 10} violações"
+
+        logger.error(error_msg)
+        raise ContractViolationError(error_msg)
+
+    logger.info(f"✓ Invariantes validadas: {len(chunks)} chunks OK para '{document_id}'")
+
+
 @dataclass
 class PipelineResult:
     """Resultado do processamento do pipeline."""
@@ -1244,6 +1326,10 @@ class IngestionPipeline:
 
         if skipped_count > 0:
             logger.info(f"Skipped {skipped_count} parent chunks (_skip_milvus_index=True)")
+
+        # INVARIANTES: Valida contrato antes de retornar para VPS
+        # Aborta pipeline se qualquer invariante for violada
+        validate_chunk_invariants(chunks, request.document_id)
 
         return chunks
 
