@@ -169,7 +169,7 @@ done
 # Inicia GPU Server (porta 8000)
 echo "  - Iniciando GPU Server (porta 8000)..."
 cd $RAG_SERVER
-export $(cat $WORKSPACE/gpu-server.env | xargs)
+export $(grep -v '^#' $WORKSPACE/gpu-server.env | xargs)
 nohup python3 -m uvicorn src.main:app \
     --host 0.0.0.0 \
     --port 8000 \
