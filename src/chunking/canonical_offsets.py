@@ -294,13 +294,26 @@ def resolve_child_offsets(
     search_text = chunk_text.strip()
 
     # Busca todas as ocorrências dentro do pai
+    # IMPORTANTE: Usa word boundary para evitar falsos positivos
+    # Ex: "V - pesquisa" não deve casar com "IV - pesquisa"
     occurrences = []
     search_start = 0
     while True:
         pos = parent_text.find(search_text, search_start)
         if pos == -1:
             break
-        occurrences.append(pos)
+
+        # Verifica word boundary: o caractere antes do match deve ser
+        # início do texto, espaço, newline, ou caractere não-alfanumérico
+        # Isso evita que "V - " case com "IV - " (onde o V faz parte de IV)
+        is_word_boundary = (
+            pos == 0 or
+            not parent_text[pos - 1].isalnum()
+        )
+
+        if is_word_boundary:
+            occurrences.append(pos)
+
         search_start = pos + 1
 
     # Validação: exatamente UMA ocorrência
