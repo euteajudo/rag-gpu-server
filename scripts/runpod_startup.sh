@@ -148,6 +148,7 @@ sleep 2
 echo "  - Iniciando vLLM (porta 8002, 8K contexto, 65% GPU)..."
 nohup python3 -m vllm.entrypoints.openai.api_server \
     --model $SNAPSHOT_PATH \
+    --served-model-name "Qwen/Qwen3-8B-AWQ" \
     --host 0.0.0.0 \
     --port 8002 \
     --max-model-len 8192 \
