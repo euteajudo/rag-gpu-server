@@ -122,7 +122,7 @@ echo "[5/6] Criando configuração..."
 cat > $WORKSPACE/gpu-server.env << EOF
 # VectorGov GPU Server Configuration
 VLLM_MODEL=Qwen/Qwen3-8B-AWQ
-VLLM_BASE_URL=http://localhost:8001/v1
+VLLM_BASE_URL=http://localhost:8002/v1
 HF_HOME=$CACHE
 TRANSFORMERS_CACHE=$CACHE
 GPU_API_KEYS=vg_gpu_internal_2025
@@ -140,15 +140,16 @@ pkill -f "vllm" 2>/dev/null || true
 pkill -f "uvicorn.*main:app" 2>/dev/null || true
 sleep 2
 
-# Inicia vLLM (porta 8001)
+# Inicia vLLM (porta 8002)
 # IMPORTANTE: gpu-memory-utilization deve ser <= 0.65 para deixar espaço
 # para BGE-M3 (~2.5GB), Reranker (~2.5GB) e Docling (~1GB)
 # A40 48GB: 0.65 * 48 = 31.2GB para vLLM, ~12GB para outros modelos
-echo "  - Iniciando vLLM (porta 8001, 8K contexto, 65% GPU)..."
+# NOTA: Porta 8001 é usada pelo nginx, vLLM usa 8002
+echo "  - Iniciando vLLM (porta 8002, 8K contexto, 65% GPU)..."
 nohup python3 -m vllm.entrypoints.openai.api_server \
     --model $SNAPSHOT_PATH \
     --host 0.0.0.0 \
-    --port 8001 \
+    --port 8002 \
     --max-model-len 8192 \
     --gpu-memory-utilization 0.65 \
     --enable-prefix-caching \
@@ -157,7 +158,7 @@ nohup python3 -m vllm.entrypoints.openai.api_server \
 # Aguarda vLLM iniciar
 echo "  - Aguardando vLLM carregar modelo (pode demorar 1-2 min)..."
 for i in {1..60}; do
-    if curl -s http://localhost:8001/v1/models > /dev/null 2>&1; then
+    if curl -s http://localhost:8002/v1/models > /dev/null 2>&1; then
         echo "  - vLLM pronto!"
         break
     fi
@@ -191,10 +192,10 @@ echo "========================================"
 echo "Status dos serviços:"
 echo "========================================"
 
-if curl -s http://localhost:8001/v1/models > /dev/null 2>&1; then
-    echo "  ✓ vLLM (8001): OK"
+if curl -s http://localhost:8002/v1/models > /dev/null 2>&1; then
+    echo "  ✓ vLLM (8002): OK"
 else
-    echo "  ✗ vLLM (8001): AGUARDANDO (verificar $LOGS/vllm.log)"
+    echo "  ✗ vLLM (8002): AGUARDANDO (verificar $LOGS/vllm.log)"
 fi
 
 if curl -s http://localhost:8000/health > /dev/null 2>&1; then
@@ -209,7 +210,7 @@ echo "  - vLLM: tail -f $LOGS/vllm.log"
 echo "  - GPU Server: tail -f $LOGS/gpu_server.log"
 echo ""
 echo "Para testar:"
-echo "  - vLLM: curl http://localhost:8001/v1/models"
+echo "  - vLLM: curl http://localhost:8002/v1/models"
 echo "  - GPU Server: curl http://localhost:8000/health"
 echo ""
 echo "========================================"
