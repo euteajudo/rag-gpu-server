@@ -453,6 +453,7 @@ class SpanParser:
             # Limpa conteúdo (remove subdivisões que serão extraídas depois)
             content_lines = content.split('\n')
             main_content = []
+            caput_line_count = 0  # Conta linhas do caput para calcular caput_end_pos
             for line in content_lines:
                 # Para no primeiro inciso, parágrafo, ou alínea
                 if re.match(r'^[-*]?\s*(§|[IVXLC]+\s*[-–]|[a-z]\))', line.strip(), re.IGNORECASE):
@@ -460,6 +461,7 @@ class SpanParser:
                 # Remove prefixo numérico de lista do Docling (ex: "12. " antes de "I -")
                 clean_line = re.sub(r'^\d+\.\s*', '', line)
                 main_content.append(clean_line)
+                caput_line_count += 1
 
             text = '\n'.join(main_content).strip()
 
@@ -471,6 +473,21 @@ class SpanParser:
                 end_pos = matches[i + 1].start()
             else:
                 end_pos = len(markdown)
+
+            # PR13: caput_end_pos = posição onde termina o caput (antes dos filhos)
+            # Calcula encontrando o primeiro inciso/parágrafo no full_match
+            full_match_text = match.group(0)
+            caput_end_pos = match.end()  # Default: fim do match (se não tiver filhos)
+
+            # Procura primeiro filho (inciso ou parágrafo) no texto do match
+            first_child_pattern = re.search(
+                r'\n[-*]?\s*(§|[IVXLC]+\s*[-–])',
+                full_match_text,
+                re.IGNORECASE
+            )
+            if first_child_pattern:
+                # caput_end_pos = posição absoluta onde começa o primeiro filho
+                caput_end_pos = match.start() + first_child_pattern.start()
 
             # Gera span_id e identifier com sufixo letra se presente (ex: ART-337-E)
             if sufixo_letra:
@@ -490,6 +507,7 @@ class SpanParser:
                 parent_id=parent_id,
                 start_pos=match.start(),
                 end_pos=end_pos,
+                caput_end_pos=caput_end_pos,  # Fim real do caput (antes dos filhos)
                 metadata={"full_match": match.group(0)},
             )
             doc.add_span(span)

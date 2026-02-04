@@ -115,16 +115,22 @@ def extract_offsets_from_parsed_doc(
     offsets_map: Dict[str, Tuple[int, int]] = {}
 
     # Extrai offsets de cada span
+    # IMPORTANTE: offsets_map usa SEMPRE end_pos (structural range) para validação de hierarquia.
+    # O caput_end_pos é acessado diretamente do span quando necessário para indexação.
     for span in parsed_doc.spans:
         # Verifica se o span tem offsets válidos
         # NOTA: Não usar "or -1" pois start_pos=0 é válido (início do documento)
         start = getattr(span, 'start_pos', -1)
         if start is None:
             start = -1
+
         end = getattr(span, 'end_pos', -1)
         if end is None:
             end = -1
 
+        # Usa SEMPRE end_pos (structural range) para offsets_map
+        # Isso garante que filhos estejam dentro do range do pai na validação de hierarquia
+        # Para artigos, caput_end_pos é acessado diretamente do span para indexação
         if start >= 0 and end > start:
             offsets_map[span.span_id] = (start, end)
         else:

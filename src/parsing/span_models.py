@@ -245,8 +245,38 @@ class Span:
         identifier: Identificador legal (ex: "1º", "I", "a")
         parent_id: ID do span pai (ex: inciso aponta para artigo)
         start_pos: Posição inicial no texto original
-        end_pos: Posição final no texto original
+        end_pos: Posição final no texto original (STRUCTURAL range)
+        caput_end_pos: Fim do caput para artigos (CAPUT range), -1 se não aplicável
         metadata: Dados extras (título, contexto, etc.)
+
+    Semântica de Ranges para ARTIGOS:
+    =================================
+
+        Para artigos, existem DOIS ranges distintos com propósitos diferentes:
+
+        1. STRUCTURAL RANGE [start_pos : end_pos]
+           - Inclui caput + TODOS os filhos (PAR, INC, ALI)
+           - Usado para: validação de hierarquia (filhos dentro do pai)
+           - end_pos = início do próximo artigo ou fim do documento
+
+        2. CAPUT RANGE [start_pos : caput_end_pos]
+           - Inclui APENAS o caput (texto introdutório do artigo)
+           - Usado para: indexação no Milvus, evidence snippets
+           - caput_end_pos = posição antes do primeiro filho (INC ou PAR)
+
+        Exemplo:
+        --------
+            Art. 1º Este artigo estabelece:     ← start_pos=0
+                                                ← caput_end_pos=35 (fim do caput)
+            I - primeira regra;                 ← INC dentro do structural range
+            II - segunda regra.
+            § 1º Parágrafo complementar.        ← end_pos=120 (início do Art. 2º)
+
+        Invariantes:
+        -----------
+            - start_pos <= caput_end_pos <= end_pos
+            - Filhos (PAR/INC/ALI) têm: parent.start_pos < child.start_pos < child.end_pos <= parent.end_pos
+            - Chunk ART no Milvus: canonical_text[start_pos:caput_end_pos]
     """
 
     span_id: str
@@ -255,7 +285,8 @@ class Span:
     identifier: Optional[str] = None
     parent_id: Optional[str] = None
     start_pos: int = 0
-    end_pos: int = 0
+    end_pos: int = 0  # STRUCTURAL end (inclui filhos) - alias: structural_end_pos
+    caput_end_pos: int = -1  # CAPUT end (só caput, para indexação), -1 se não aplicável
     order: int = 0  # Ordem de inserção (para ordenação estável)
     metadata: dict = field(default_factory=dict)
 
@@ -279,6 +310,37 @@ class Span:
     def is_alinea(self) -> bool:
         return self.span_type == SpanType.ALINEA
 
+    # ==========================================================================
+    # Aliases semânticos para clareza de código (evita confusão de ranges)
+    # ==========================================================================
+
+    @property
+    def structural_end_pos(self) -> int:
+        """
+        Alias para end_pos - fim do STRUCTURAL range (inclui filhos).
+
+        Usado para: validação de hierarquia (filhos dentro do pai).
+        Para artigos: end_pos = início do próximo artigo.
+        """
+        return self.end_pos
+
+    @property
+    def has_caput_range(self) -> bool:
+        """True se o span tem caput_end_pos válido (artigos com filhos)."""
+        return self.caput_end_pos > 0 and self.caput_end_pos != self.end_pos
+
+    @property
+    def caput_length(self) -> int:
+        """Tamanho do caput em caracteres (0 se não aplicável)."""
+        if self.caput_end_pos > 0:
+            return self.caput_end_pos - self.start_pos
+        return 0
+
+    @property
+    def structural_length(self) -> int:
+        """Tamanho do structural range em caracteres."""
+        return self.end_pos - self.start_pos
+
     @property
     def article_number(self) -> Optional[str]:
         """Extrai número do artigo do span_id."""
@@ -293,7 +355,7 @@ class Span:
 
     def to_dict(self) -> dict:
         """Converte para dicionário."""
-        return {
+        result = {
             "span_id": self.span_id,
             "span_type": self.span_type.value,
             "text": self.text,
@@ -304,6 +366,10 @@ class Span:
             "order": self.order,
             "metadata": self.metadata,
         }
+        # Inclui caput_end_pos apenas para artigos
+        if self.caput_end_pos >= 0:
+            result["caput_end_pos"] = self.caput_end_pos
+        return result
 
     def __repr__(self) -> str:
         text_preview = self.text[:50] + "..." if len(self.text) > 50 else self.text

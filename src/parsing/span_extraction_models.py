@@ -237,6 +237,17 @@ class ArticleSpans(BaseModel):
         examples=[["PAR-001-1", "PAR-001-2", "PAR-001-UNICO"]]
     )
 
+    # Paginação para listas grandes (> 200 IDs)
+    has_more: bool = Field(
+        default=False,
+        description="True se há mais IDs além dos retornados (paginação)"
+    )
+
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Cursor para próxima página (último ID retornado)"
+    )
+
     @field_validator('article_id')
     @classmethod
     def validate_article_id(cls, v: str) -> str:

@@ -762,7 +762,11 @@ class ChunkMaterializer:
         """
         Materializa um ArticleChunk em chunks pai e filhos.
 
-        Se o artigo exceder SPLIT_THRESHOLD_CHARS (8000), usa _materialize_large_article
+        IMPORTANTE: O chunk do artigo contém APENAS o caput (sem filhos).
+        Os filhos (PAR/INC/ALI) são indexados como chunks separados.
+        Isso evita redundância e texto inflado.
+
+        Se o CAPUT exceder SPLIT_THRESHOLD_CHARS (8000), usa _materialize_large_article
         para criar subchunks (PART) em vez de indexar o artigo inteiro.
 
         Args:
@@ -773,10 +777,37 @@ class ChunkMaterializer:
         Returns:
             Lista de MaterializedChunk (1 pai + N filhos)
         """
-        # Verifica se precisa splittar artigo grande
-        if self._should_split_article(article_chunk.text):
+        # Obtém o span do artigo para acessar caput_end_pos
+        article_span = parsed_doc.get_span(article_chunk.article_id)
+
+        # Extrai apenas o texto do caput (sem filhos)
+        # Usa canonical_text[start_pos:caput_end_pos] se disponível
+        if (article_span
+            and article_span.caput_end_pos > 0
+            and self.canonical_text
+            and article_span.start_pos >= 0
+            and article_span.caput_end_pos <= len(self.canonical_text)):
+            # Extrai caput do texto canônico (determinístico)
+            article_caput = self.canonical_text[article_span.start_pos:article_span.caput_end_pos].strip()
+            logger.debug(
+                f"Artigo {article_chunk.article_id}: usando caput extraído "
+                f"[{article_span.start_pos}:{article_span.caput_end_pos}] = {len(article_caput)} chars"
+            )
+        else:
+            # Fallback: usa o texto do span (que já é só o caput pelo SpanParser)
+            if article_span:
+                article_caput = article_span.text
+            else:
+                # Último fallback: usa texto do ArticleChunk (pode incluir filhos)
+                article_caput = article_chunk.text
+                logger.warning(
+                    f"Artigo {article_chunk.article_id}: usando texto do ArticleChunk como fallback"
+                )
+
+        # Verifica se precisa splittar artigo grande (baseado no CAPUT, não texto inflado)
+        if self._should_split_article(article_caput):
             logger.info(
-                f"Artigo {article_chunk.article_id} com {len(article_chunk.text)} chars "
+                f"Artigo {article_chunk.article_id} com caput de {len(article_caput)} chars "
                 f"excede threshold de {SPLIT_THRESHOLD_CHARS}, splitando..."
             )
             return self._materialize_large_article(article_chunk, parsed_doc, include_children)
@@ -786,9 +817,6 @@ class ChunkMaterializer:
         # 1. Chunk pai (ARTICLE)
         parent_chunk_id = f"{self.document_id}#{article_chunk.article_id}"
         parent_node_id = f"leis:{parent_chunk_id}"
-
-        # Texto do artigo (caput) - será usado como parent_text para filhos
-        article_caput = article_chunk.text
 
         # Constrói retrieval_text determinístico para o artigo
         article_retrieval_text = build_retrieval_text(
@@ -800,8 +828,24 @@ class ChunkMaterializer:
             span_id=article_chunk.article_id,
         )
 
-        # PR13: Obtém offsets canônicos para o artigo
-        art_start, art_end, art_hash = self._get_canonical_offsets(article_chunk.article_id)
+        # PR13: Obtém offsets ESTRUTURAIS para validação de hierarquia (filhos dentro do pai)
+        art_start, art_structural_end, art_hash = self._get_canonical_offsets(article_chunk.article_id)
+
+        # Para o chunk ART, usa caput_end_pos para evidence/snippets (não inclui filhos)
+        # Filhos usam art_structural_end para validação
+        art_caput_end = art_structural_end  # Default: structural (se não tiver filhos)
+        if article_span and article_span.caput_end_pos > 0:
+            art_caput_end = article_span.caput_end_pos
+
+        # Log detalhado para ART com os três valores críticos
+        caput_len = art_caput_end - art_start if art_start >= 0 else 0
+        structural_len = art_structural_end - art_start if art_start >= 0 else 0
+        logger.info(
+            f"ART chunk offsets: node_id={parent_node_id}, "
+            f"start_pos={art_start}, "
+            f"caput_end_pos={art_caput_end} (caput_len={caput_len}), "
+            f"structural_end_pos={art_structural_end} (structural_len={structural_len})"
+        )
 
         parent = MaterializedChunk(
             node_id=parent_node_id,
@@ -810,7 +854,7 @@ class ChunkMaterializer:
             span_id=article_chunk.article_id,
             device_type=DeviceType.ARTICLE,
             chunk_level=ChunkLevel.ARTICLE,
-            text=article_chunk.text,
+            text=article_caput,  # Apenas o caput, sem filhos
             retrieval_text=article_retrieval_text,
             document_id=self.document_id,
             tipo_documento=self.tipo_documento,
@@ -820,9 +864,9 @@ class ChunkMaterializer:
             citations=article_chunk.citations,
             metadata=self.metadata,
             canonical_start=art_start,
-            canonical_end=art_end,
+            canonical_end=art_caput_end,  # CAPUT end para evidence/snippets
             canonical_hash=art_hash,
-            aliases=extract_aliases(article_chunk.text),
+            aliases=extract_aliases(article_caput),  # Extrai aliases apenas do caput
         )
         # Validação obrigatória - aborta se node_id inconsistente
         parent.validate()
@@ -851,12 +895,13 @@ class ChunkMaterializer:
             )
 
             # PR13 STRICT: Resolve offsets para o parágrafo
+            # Usa art_structural_end (não caput_end) para validação de hierarquia
             par_start, par_end, par_hash = self._resolve_child_offset_strict(
                 span_id=par_id,
                 device_type="paragraph",
                 chunk_text=par_span.text,
                 parent_start=art_start,
-                parent_end=art_end,
+                parent_end=art_structural_end,  # Structural range (inclui filhos)
             )
 
             child = MaterializedChunk(
@@ -923,12 +968,13 @@ class ChunkMaterializer:
 
             # NOTA: Usa inc_span.text (original) para busca, não inc_text (reconstruído com alíneas)
             # O texto reconstruído inclui formatação que não existe no canonical_text
+            # Usa art_structural_end (não caput_end) para validação de hierarquia
             inc_start, inc_end, inc_hash = self._resolve_child_offset_strict(
                 span_id=inc_id,
                 device_type="inciso",
                 chunk_text=inc_span.text,  # Texto original do span, não reconstruído
                 parent_start=art_start,    # Sempre busca no artigo
-                parent_end=art_end,
+                parent_end=art_structural_end,  # Structural range (inclui filhos)
             )
 
             child = MaterializedChunk(
@@ -1242,8 +1288,22 @@ class ChunkMaterializer:
         """
         chunks = []
 
-        # Texto do artigo (caput) - será usado como parent_text para filhos
-        article_caput = article_chunk.text
+        # Obtém o span do artigo para acessar caput_end_pos
+        article_span = parsed_doc.get_span(article_chunk.article_id)
+
+        # Extrai apenas o texto do caput (sem filhos) - PR13 caput_range
+        if (article_span
+            and article_span.caput_end_pos > 0
+            and self.canonical_text
+            and article_span.start_pos >= 0
+            and article_span.caput_end_pos <= len(self.canonical_text)):
+            article_caput = self.canonical_text[article_span.start_pos:article_span.caput_end_pos].strip()
+        else:
+            # Fallback: usa o texto do span
+            if article_span:
+                article_caput = article_span.text
+            else:
+                article_caput = article_chunk.text
 
         # 1. Pai canônico (NÃO indexado no Milvus, apenas para navegação)
         parent_chunk_id = f"{self.document_id}#{article_chunk.article_id}"
@@ -1259,8 +1319,23 @@ class ChunkMaterializer:
             span_id=article_chunk.article_id,
         )
 
-        # PR13: Obtém offsets canônicos para o artigo
-        art_start, art_end, art_hash = self._get_canonical_offsets(article_chunk.article_id)
+        # PR13: Obtém offsets ESTRUTURAIS para validação de hierarquia (filhos dentro do pai)
+        art_start, art_structural_end, art_hash = self._get_canonical_offsets(article_chunk.article_id)
+
+        # Para o chunk ART, usa caput_end_pos para evidence/snippets (não inclui filhos)
+        art_caput_end = art_structural_end  # Default: structural (se não tiver filhos)
+        if article_span and article_span.caput_end_pos > 0:
+            art_caput_end = article_span.caput_end_pos
+
+        # Log detalhado para ART (large) com os três valores críticos
+        caput_len = art_caput_end - art_start if art_start >= 0 else 0
+        structural_len = art_structural_end - art_start if art_start >= 0 else 0
+        logger.info(
+            f"ART chunk offsets (LARGE): node_id={parent_node_id}, "
+            f"start_pos={art_start}, "
+            f"caput_end_pos={art_caput_end} (caput_len={caput_len}), "
+            f"structural_end_pos={art_structural_end} (structural_len={structural_len})"
+        )
 
         parent = MaterializedChunk(
             node_id=parent_node_id,
@@ -1269,7 +1344,7 @@ class ChunkMaterializer:
             span_id=article_chunk.article_id,
             device_type=DeviceType.ARTICLE,
             chunk_level=ChunkLevel.ARTICLE,
-            text=article_chunk.text,
+            text=article_caput,  # Usa apenas o caput (sem filhos)
             retrieval_text=article_retrieval_text,
             document_id=self.document_id,
             tipo_documento=self.tipo_documento,
@@ -1279,9 +1354,9 @@ class ChunkMaterializer:
             citations=article_chunk.citations,
             metadata=self.metadata,
             canonical_start=art_start,
-            canonical_end=art_end,
+            canonical_end=art_caput_end,  # CAPUT end para evidence/snippets
             canonical_hash=art_hash,
-            aliases=extract_aliases(article_chunk.text),
+            aliases=extract_aliases(article_caput),  # Aliases do caput apenas
         )
         parent.validate()
         # Marca que este chunk não deve ser indexado no Milvus
@@ -1289,7 +1364,8 @@ class ChunkMaterializer:
         chunks.append(parent)
 
         # 2. Subchunks (PART) - estes SÃO indexados
-        parts = self._split_large_article(article_chunk.text, article_chunk.article_id)
+        # Usa article_caput para split (decisão baseada apenas no caput, não filhos)
+        parts = self._split_large_article(article_caput, article_chunk.article_id)
 
         for part in parts:
             part_chunk_id = f"{self.document_id}#{part['span_id']}"
@@ -1350,12 +1426,13 @@ class ChunkMaterializer:
                 )
 
                 # PR13 STRICT: Resolve offsets para o parágrafo
+                # Usa art_structural_end (não caput_end) para validação de hierarquia
                 par_start, par_end, par_hash = self._resolve_child_offset_strict(
                     span_id=par_id,
                     device_type="paragraph",
                     chunk_text=par_span.text,
                     parent_start=art_start,
-                    parent_end=art_end,
+                    parent_end=art_structural_end,  # Structural range (inclui filhos)
                 )
 
                 child = MaterializedChunk(
@@ -1415,12 +1492,13 @@ class ChunkMaterializer:
                 # IMPORTANTE: Sempre busca no range do ARTIGO, não do parágrafo!
                 # O texto do parágrafo contém apenas o caput, não os incisos.
                 # NOTA: Usa inc_span.text (original) para busca, não inc_text (reconstruído)
+                # Usa art_structural_end (não caput_end) para validação de hierarquia
                 inc_start, inc_end, inc_hash = self._resolve_child_offset_strict(
                     span_id=inc_id,
                     device_type="inciso",
                     chunk_text=inc_span.text,  # Texto original, não reconstruído
                     parent_start=art_start,    # Sempre busca no artigo
-                    parent_end=art_end,
+                    parent_end=art_structural_end,  # Structural range (inclui filhos)
                 )
 
                 child = MaterializedChunk(

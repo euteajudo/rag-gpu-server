@@ -341,10 +341,14 @@ class OrchestratorConfig:
 
     # LLM
     temperature: float = 0.0
-    max_tokens: int = 512  # Suficiente para JSON de IDs
+    max_tokens: int = 512  # Deprecated: usar output_token_budget
     model_context_limit: int = 8192  # Limite de contexto do modelo (Qwen3-8B)
     chars_per_token: float = 4.0  # Estimativa de caracteres por token
     context_safety_margin: int = 256  # Margem de segurança para evitar overflow
+
+    # Orçamento fixo de saída (evita JSON truncado)
+    output_token_budget: int = 1024  # FIXO: tokens reservados para output
+    max_ids_per_list: int = 200  # Máximo de IDs por lista (paginação)
 
     # Validação
     strict_validation: bool = True  # Falhar em IDs inválidos
@@ -381,11 +385,14 @@ REGRAS CRÍTICAS:
 3. Se o artigo não tem parágrafos, retorne paragrafo_ids: []
 4. Se o artigo não tem incisos, retorne inciso_ids: []
 5. Mantenha a ordem exata de aparição no texto
+6. MÁXIMO 200 IDs por lista - se houver mais, retorne has_more:true e next_cursor com último ID
+7. JSON MINIFICADO - sem espaços extras, sem quebras de linha, sem texto adicional
 
 CHECKLIST ANTES DE RESPONDER:
 - Verifique: cada ID que você listou aparece literalmente no texto?
 - Se não há [PAR-...] no texto, a lista de parágrafos deve estar VAZIA
 - Se não há [INC-...] no texto, a lista de incisos deve estar VAZIA
+- Se lista > 200: retorne apenas os primeiros 200 IDs + has_more:true + next_cursor
 """
 
 ARTICLE_USER_PROMPT = """Extraia os IDs de parágrafos e incisos do artigo abaixo.
@@ -400,11 +407,14 @@ INSTRUÇÕES:
 2. COPIE apenas os IDs que você encontrar - não invente nenhum
 3. Se não encontrar nenhum parágrafo, retorne paragrafo_ids: []
 4. Se não encontrar nenhum inciso, retorne inciso_ids: []
+5. MÁXIMO 200 IDs por lista. Se houver mais:
+   - Retorne apenas os primeiros 200
+   - Defina has_more: true
+   - Defina next_cursor: "ULTIMO_ID_RETORNADO"
+6. JSON MINIFICADO (uma linha, sem espaços extras)
 
-Retorne JSON com:
-- article_id: "{article_id}"
-- paragrafo_ids: [lista dos PAR-* encontrados, ou [] se nenhum]
-- inciso_ids: [lista dos INC-* encontrados, ou [] se nenhum]"""
+Retorne JSON minificado:
+{{"article_id":"{article_id}","paragrafo_ids":[...],"inciso_ids":[...],"has_more":false,"next_cursor":null}}"""
 
 # Prompt para retry focado
 ARTICLE_RETRY_PROMPT = """O artigo abaixo tem spans que podem ter sido omitidos na extração anterior.
@@ -682,64 +692,66 @@ class ArticleOrchestrator:
         """
         return int(len(text) / self.config.chars_per_token)
 
-    def _calculate_dynamic_max_tokens(self, input_text: str) -> int:
+    def _calculate_max_input_chars(self) -> int:
         """
-        Calcula max_tokens disponível para resposta baseado no input.
+        Calcula máximo de caracteres permitidos no input.
 
-        Usa estimativa CONSERVADORA de tokens para evitar erros 400.
-
-        Args:
-            input_text: Texto completo que será enviado ao modelo
+        Abordagem determinística:
+        - Output budget é FIXO (output_token_budget)
+        - Input é TRUNCADO para caber no restante do contexto
 
         Returns:
-            max_tokens que pode ser solicitado sem estourar contexto
+            Máximo de caracteres permitidos no input
         """
-        # Estima tokens do input com fator conservador
-        # Tokenizer Qwen pode gerar mais tokens que o esperado para português
-        chars_per_token = 2.5  # conservador (era 4.0)
-        input_tokens = int(len(input_text) / chars_per_token)
+        # Orçamento fixo para output (não reduz se input for grande)
+        output_budget = self.config.output_token_budget
+        safety_margin = self.config.context_safety_margin
 
-        # Calcula espaço disponível com margem extra
-        safety_margin = 512  # margem de segurança aumentada
-        available = (
+        # Tokens disponíveis para input
+        max_input_tokens = (
             self.config.model_context_limit
-            - input_tokens
+            - output_budget
             - safety_margin
         )
 
-        # Limita entre min e max permitido
-        min_tokens = 128  # Mínimo para resposta JSON válida
-        max_allowed = 256  # Limita max_tokens para safety (IDs são curtos)
-        max_tokens = min(max_allowed, max(min_tokens, available))
+        # Converte para caracteres (conservador: 2.5 chars/token)
+        chars_per_token = 2.5
+        max_input_chars = int(max_input_tokens * chars_per_token)
 
-        if available < min_tokens:
-            logger.warning(
-                f"Input muito grande: {input_tokens} tokens estimados, "
-                f"disponível: {available} tokens. Usando mínimo: {min_tokens}"
-            )
+        # Desconta overhead dos prompts (system + headers + instruções)
+        prompt_overhead = 3500
+        max_input_chars -= prompt_overhead
 
-        logger.info(
-            f"Tokens dinâmicos: input_chars={len(input_text)}, "
-            f"input_tokens_est={input_tokens}, disponível={available}, "
-            f"usando max_tokens={max_tokens}"
+        # Garante mínimo razoável
+        max_input_chars = max(max_input_chars, 10000)
+
+        logger.debug(
+            f"Orçamento determinístico: output_budget={output_budget}, "
+            f"max_input_tokens={max_input_tokens}, max_input_chars={max_input_chars}"
         )
 
-        return max_tokens
+        return max_input_chars
+
+    def _get_fixed_output_tokens(self) -> int:
+        """Retorna orçamento fixo de tokens para output."""
+        return self.config.output_token_budget
 
     def _input_exceeds_context(self, input_text: str) -> bool:
         """
         Verifica se o input excede o limite de contexto do modelo.
 
         Retorna True se o input for muito grande para caber no contexto
-        mesmo com max_tokens mínimo.
+        com o orçamento fixo de output.
         """
         input_tokens = self._estimate_tokens(input_text)
-        min_output_tokens = 256  # Mínimo necessário para resposta JSON
-        max_input_allowed = self.config.model_context_limit - min_output_tokens - self.config.context_safety_margin
+        # Usa orçamento fixo de output (determinístico)
+        output_budget = self.config.output_token_budget
+        max_input_allowed = self.config.model_context_limit - output_budget - self.config.context_safety_margin
 
         if input_tokens > max_input_allowed:
             logger.warning(
-                f"Input excede contexto: {input_tokens} tokens > {max_input_allowed} permitidos"
+                f"Input excede contexto: {input_tokens} tokens > {max_input_allowed} permitidos "
+                f"(output_budget={output_budget})"
             )
             return True
         return False
@@ -776,34 +788,32 @@ class ArticleOrchestrator:
         allowed_paragrafos: list[str],
         allowed_incisos: list[str]
     ) -> str:
-        """Chama LLM para extrair hierarquia do artigo com schema dinâmico."""
-        # Verifica e trunca se input for muito grande
-        # O prompt total inclui: system prompt + headers + allowed IDs + annotated_text
-        # Estimativa MUITO conservadora: 2.5 chars/token (tokenizer Qwen pode ser mais agressivo)
-        # contexto 8192, output 256 (mínimo para JSON), margem 512, overhead prompts 3000 chars
-        prompt_overhead_chars = 3500  # system + headers + instruções + allowed_ids
-        chars_per_token_conservative = 2.5  # muito conservador para safety
-        max_input_chars = int(
-            (self.config.model_context_limit - 256 - 512)  # reserva 256 output, 512 margem
-            * chars_per_token_conservative
-            - prompt_overhead_chars
-        )
-        # Garante mínimo de 15000 chars para artigos pequenos
-        max_input_chars = max(max_input_chars, 15000)
+        """Chama LLM para extrair hierarquia do artigo com schema dinâmico.
+
+        Abordagem determinística para evitar JSON truncado:
+        - Output budget é FIXO (output_token_budget = 1024)
+        - Input é TRUNCADO para caber no restante do contexto
+        - Paginação limita listas a max_ids_per_list (200) IDs
+        """
+        # Calcula máximo de caracteres permitidos no input (output é fixo)
+        max_input_chars = self._calculate_max_input_chars()
 
         if len(annotated_text) > max_input_chars:
             logger.warning(
                 f"Artigo {article_id}: texto muito grande ({len(annotated_text)} chars), "
-                f"truncando para {max_input_chars} chars"
+                f"truncando para {max_input_chars} chars (output fixo: {self.config.output_token_budget} tokens)"
             )
             annotated_text = self._truncate_annotated_text(annotated_text, max_input_chars)
 
-        # Prompt com contadores para evitar alucinação
+        # Limite de IDs para paginação
+        max_ids = self.config.max_ids_per_list
+
+        # Prompt com contadores e instruções de paginação
         user_prompt = f"""Extraia os IDs de parágrafos e incisos do artigo abaixo.
 
 ESTATÍSTICAS DO PARSER:
-- Parágrafos detectados: {len(allowed_paragrafos)} → IDs permitidos: {allowed_paragrafos}
-- Incisos detectados: {len(allowed_incisos)} → IDs permitidos: {allowed_incisos}
+- Parágrafos detectados: {len(allowed_paragrafos)} → IDs permitidos: {allowed_paragrafos[:20]}{"..." if len(allowed_paragrafos) > 20 else ""}
+- Incisos detectados: {len(allowed_incisos)} → IDs permitidos: {allowed_incisos[:20]}{"..." if len(allowed_incisos) > 20 else ""}
 
 ARTIGO:
 {annotated_text}
@@ -815,25 +825,32 @@ INSTRUÇÕES:
 2. COPIE apenas os IDs que aparecem na lista de IDs permitidos
 3. Se a lista permitida está vazia, retorne array vazio para aquela categoria
 4. NÃO invente IDs que não estão na lista permitida
+5. MÁXIMO {max_ids} IDs por lista. Se houver mais:
+   - Retorne apenas os primeiros {max_ids}
+   - Defina "has_more": true
+   - Defina "next_cursor": "ULTIMO_ID_RETORNADO"
+6. JSON MINIFICADO (uma linha, sem espaços extras)
 
-Retorne JSON com:
-- article_id: "{article_id}"
-- paragrafo_ids: [IDs dos parágrafos encontrados, ou [] se nenhum permitido]
-- inciso_ids: [IDs dos incisos encontrados, ou [] se nenhum permitido]"""
+Retorne JSON minificado:
+{{"article_id":"{article_id}","paragrafo_ids":[...],"inciso_ids":[...],"has_more":false,"next_cursor":null}}"""
 
         messages = [
             {"role": "system", "content": ARTICLE_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
 
-        # Gera schema dinâmico com enum
+        # Gera schema dinâmico com enum e paginação
         dynamic_schema = self._build_dynamic_schema(
             article_id, allowed_paragrafos, allowed_incisos
         )
 
-        # Calcula max_tokens dinâmico para evitar estouro de contexto
-        full_input = ARTICLE_SYSTEM_PROMPT + user_prompt
-        dynamic_max_tokens = self._calculate_dynamic_max_tokens(full_input)
+        # Usa orçamento FIXO de output tokens (não dinâmico!)
+        fixed_output_tokens = self._get_fixed_output_tokens()
+
+        logger.info(
+            f"Artigo {article_id}: input_chars={len(annotated_text)}, "
+            f"output_budget={fixed_output_tokens} tokens (fixo)"
+        )
 
         # Tenta guided JSON se disponível
         if hasattr(self.llm, 'chat_with_schema'):
@@ -841,13 +858,13 @@ Retorne JSON com:
                 messages=messages,
                 schema=dynamic_schema,
                 temperature=self.config.temperature,
-                max_tokens=dynamic_max_tokens,
+                max_tokens=fixed_output_tokens,
             )
         else:
             response = self.llm.chat(
                 messages=messages,
                 temperature=self.config.temperature,
-                max_tokens=dynamic_max_tokens,
+                max_tokens=fixed_output_tokens,
             )
 
         return response
@@ -858,7 +875,9 @@ Retorne JSON com:
         allowed_paragrafos: list[str],
         allowed_incisos: list[str]
     ) -> dict:
-        """Constrói JSON schema dinâmico com enum de IDs permitidos."""
+        """Constrói JSON schema dinâmico com enum de IDs permitidos e paginação."""
+        max_ids = self.config.max_ids_per_list
+
         schema = {
             "type": "object",
             "properties": {
@@ -868,15 +887,25 @@ Retorne JSON com:
                 },
                 "paragrafo_ids": {
                     "type": "array",
+                    "maxItems": max_ids,  # Limite para evitar JSON truncado
                     "items": {
                         "type": "string"
                     }
                 },
                 "inciso_ids": {
                     "type": "array",
+                    "maxItems": max_ids,  # Limite para evitar JSON truncado
                     "items": {
                         "type": "string"
                     }
+                },
+                "has_more": {
+                    "type": "boolean",
+                    "default": False
+                },
+                "next_cursor": {
+                    "type": ["string", "null"],
+                    "default": None
                 }
             },
             "required": ["article_id", "paragrafo_ids", "inciso_ids"],
@@ -1067,31 +1096,30 @@ Retorne JSON com:
         missing_ids: list[str],
         found_ids: list[str]
     ) -> str:
-        """Retry focado em um tipo específico (parágrafos OU incisos)."""
-        # Aplica mesma lógica de truncação do _call_llm
-        prompt_overhead_chars = 4000  # retry tem mais overhead (listas de IDs)
-        chars_per_token_conservative = 2.5
-        max_input_chars = int(
-            (self.config.model_context_limit - 256 - 512)
-            * chars_per_token_conservative
-            - prompt_overhead_chars
-        )
-        max_input_chars = max(max_input_chars, 12000)
+        """Retry focado em um tipo específico (parágrafos OU incisos).
+
+        Usa orçamento fixo de output tokens (determinístico).
+        """
+        # Calcula máximo de input (output é fixo)
+        # Retry tem overhead extra de listas de IDs
+        max_input_chars = self._calculate_max_input_chars() - 500  # overhead extra
 
         if len(annotated_text) > max_input_chars:
             logger.warning(
                 f"Retry {article_id}: texto muito grande ({len(annotated_text)} chars), "
-                f"truncando para {max_input_chars} chars"
+                f"truncando para {max_input_chars} chars (output fixo: {self.config.output_token_budget} tokens)"
             )
             annotated_text = self._truncate_annotated_text(annotated_text, max_input_chars)
+
+        max_ids = self.config.max_ids_per_list
 
         user_prompt = f"""BUSCA FOCADA: Procure especificamente por {target_type.upper()} no texto abaixo.
 
 IDs FALTANDO (preciso encontrar esses):
-{missing_ids}
+{missing_ids[:50]}{"..." if len(missing_ids) > 50 else ""}
 
 IDs JÁ ENCONTRADOS:
-{found_ids}
+{found_ids[:50]}{"..." if len(found_ids) > 50 else ""}
 
 ARTIGO:
 {annotated_text}
@@ -1100,8 +1128,10 @@ INSTRUÇÕES:
 1. Procure APENAS pelos IDs listados em "FALTANDO"
 2. Verifique se eles aparecem no texto entre colchetes [ID]
 3. Retorne a lista COMPLETA (encontrados + novos)
+4. MÁXIMO {max_ids} IDs por lista. Se houver mais: has_more=true, next_cursor="ULTIMO_ID"
+5. JSON MINIFICADO (uma linha)
 
-Retorne JSON com article_id="{article_id}" e as listas completas."""
+Retorne JSON minificado com article_id="{article_id}" e as listas completas."""
 
         messages = [
             {"role": "system", "content": ARTICLE_SYSTEM_PROMPT},
@@ -1120,22 +1150,21 @@ Retorne JSON com article_id="{article_id}" e as listas completas."""
             article_id, allowed_par, allowed_inc
         )
 
-        # Calcula max_tokens dinâmico para evitar estouro de contexto
-        full_input = ARTICLE_SYSTEM_PROMPT + user_prompt
-        dynamic_max_tokens = self._calculate_dynamic_max_tokens(full_input)
+        # Usa orçamento FIXO de output tokens
+        fixed_output_tokens = self._get_fixed_output_tokens()
 
         if hasattr(self.llm, 'chat_with_schema'):
             response = self.llm.chat_with_schema(
                 messages=messages,
                 schema=dynamic_schema,
                 temperature=self.config.temperature,
-                max_tokens=dynamic_max_tokens,
+                max_tokens=fixed_output_tokens,
             )
         else:
             response = self.llm.chat(
                 messages=messages,
                 temperature=self.config.temperature,
-                max_tokens=dynamic_max_tokens,
+                max_tokens=fixed_output_tokens,
             )
 
         return response
@@ -1149,44 +1178,43 @@ Retorne JSON com article_id="{article_id}" e as listas completas."""
         allowed_paragrafos: list[str],
         allowed_incisos: list[str]
     ) -> str:
-        """Chama LLM com prompt de retry focado e schema dinâmico."""
-        # Aplica mesma lógica de truncação
-        prompt_overhead_chars = 4500  # retry tem mais overhead (listas de IDs)
-        chars_per_token_conservative = 2.5
-        max_input_chars = int(
-            (self.config.model_context_limit - 256 - 512)
-            * chars_per_token_conservative
-            - prompt_overhead_chars
-        )
-        max_input_chars = max(max_input_chars, 12000)
+        """Chama LLM com prompt de retry focado e schema dinâmico.
+
+        Usa orçamento fixo de output tokens (determinístico).
+        """
+        # Calcula máximo de input (output é fixo)
+        # Retry genérico tem overhead extra maior
+        max_input_chars = self._calculate_max_input_chars() - 1000  # overhead extra
 
         if len(annotated_text) > max_input_chars:
             logger.warning(
                 f"Retry genérico {article_id}: texto muito grande ({len(annotated_text)} chars), "
-                f"truncando para {max_input_chars} chars"
+                f"truncando para {max_input_chars} chars (output fixo: {self.config.output_token_budget} tokens)"
             )
             annotated_text = self._truncate_annotated_text(annotated_text, max_input_chars)
+
+        max_ids = self.config.max_ids_per_list
 
         user_prompt = f"""O artigo abaixo tem spans que podem ter sido omitidos na extração anterior.
 
 IDs PERMITIDOS (do parser):
-- Parágrafos: {allowed_paragrafos}
-- Incisos: {allowed_incisos}
+- Parágrafos: {allowed_paragrafos[:30]}{"..." if len(allowed_paragrafos) > 30 else ""}
+- Incisos: {allowed_incisos[:30]}{"..." if len(allowed_incisos) > 30 else ""}
 
 IDs JÁ ENCONTRADOS:
-- Parágrafos: {found_paragrafos}
-- Incisos: {found_incisos}
+- Parágrafos: {found_paragrafos[:30]}{"..." if len(found_paragrafos) > 30 else ""}
+- Incisos: {found_incisos[:30]}{"..." if len(found_incisos) > 30 else ""}
 
 ARTIGO (revise com atenção):
 {annotated_text}
 
 Procure por IDs adicionais que podem ter sido omitidos.
 IMPORTANTE: Só retorne IDs que estão na lista de PERMITIDOS.
+MÁXIMO {max_ids} IDs por lista. Se houver mais: has_more=true, next_cursor="ULTIMO_ID"
+JSON MINIFICADO (uma linha, sem espaços extras)
 
-Retorne a lista COMPLETA:
-- article_id: "{article_id}"
-- paragrafo_ids: [lista completa dos parágrafos encontrados]
-- inciso_ids: [lista completa dos incisos encontrados]"""
+Retorne JSON minificado:
+{{"article_id":"{article_id}","paragrafo_ids":[...],"inciso_ids":[...],"has_more":false,"next_cursor":null}}"""
 
         messages = [
             {"role": "system", "content": ARTICLE_SYSTEM_PROMPT},
@@ -1198,22 +1226,21 @@ Retorne a lista COMPLETA:
             article_id, allowed_paragrafos, allowed_incisos
         )
 
-        # Calcula max_tokens dinâmico para evitar estouro de contexto
-        full_input = ARTICLE_SYSTEM_PROMPT + user_prompt
-        dynamic_max_tokens = self._calculate_dynamic_max_tokens(full_input)
+        # Usa orçamento FIXO de output tokens
+        fixed_output_tokens = self._get_fixed_output_tokens()
 
         if hasattr(self.llm, 'chat_with_schema'):
             response = self.llm.chat_with_schema(
                 messages=messages,
                 schema=dynamic_schema,
                 temperature=self.config.temperature,
-                max_tokens=dynamic_max_tokens,
+                max_tokens=fixed_output_tokens,
             )
         else:
             response = self.llm.chat(
                 messages=messages,
                 temperature=self.config.temperature,
-                max_tokens=dynamic_max_tokens,
+                max_tokens=fixed_output_tokens,
             )
 
         return response

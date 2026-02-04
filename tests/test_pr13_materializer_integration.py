@@ -21,6 +21,7 @@ class MockSpan:
     parent_id: Optional[str] = None
     start_pos: int = -1
     end_pos: int = -1
+    caput_end_pos: int = -1  # PR13: fim do caput para artigos
 
 
 @dataclass
