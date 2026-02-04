@@ -30,6 +30,7 @@ from .markdown_sanitizer import MarkdownSanitizer
 from .article_validator import ArticleValidator
 from ..chunking.citation_extractor import extract_citations_from_chunk
 from ..chunking.canonical_offsets import normalize_canonical_text, compute_canonical_hash
+from ..chunking.origin_classifier import OriginClassifier
 
 
 class ExtractionMethod(str, Enum):
@@ -197,6 +198,8 @@ class PipelineResult:
     ingest_run_id: str = ""
     # PR13: Canonical hash para validação de offsets
     canonical_hash: str = ""
+    # OriginClassifier: Estatísticas de classificação de origem
+    origin_stats: Optional[dict] = None
 
 
 class IngestionPipeline:
@@ -587,9 +590,13 @@ class IngestionPipeline:
                         return result
                     report_progress("materialization", 0.75)
 
+                    # Fase 4.5: OriginClassifier (classificacao de origem material)
+                    origin_stats = self._phase_origin_classification(materialized, result)
+                    result.origin_stats = origin_stats  # Salva stats no resultado
+
                 # Fase 5: Embeddings (se nao pular) - 75% a 90%
                 if not request.skip_embeddings:
-                    report_progress("embedding", 0.75)
+                    report_progress("embedding", 0.76)
                     self._phase_embeddings(materialized, result)
                     if result.status == IngestStatus.FAILED:
                         return result
@@ -1126,6 +1133,60 @@ class IngestionPipeline:
             result.status = IngestStatus.FAILED
             result.errors.append(IngestError(phase="materialization", message=str(e)))
             return None
+
+    def _phase_origin_classification(self, materialized, result: PipelineResult) -> dict:
+        """
+        Fase 4.5: Classificacao de origem material dos chunks.
+
+        Detecta chunks que contem material de outras leis citadas/modificadas,
+        permitindo tratamento diferenciado no retrieval.
+
+        Exemplo: Art. 337-E esta no PDF da Lei 14.133 mas E do Codigo Penal.
+
+        Args:
+            materialized: Lista de MaterializedChunk
+            result: PipelineResult para registrar a fase
+
+        Returns:
+            dict com estatisticas de classificacao
+        """
+        phase_start = time.perf_counter()
+        try:
+            logger.info("Fase 4.5: OriginClassifier iniciando...")
+
+            classifier = OriginClassifier()
+            stats = classifier.classify_materialized_batch(materialized)
+
+            duration = round(time.perf_counter() - phase_start, 3)
+
+            # Monta output descritivo
+            if stats["external"] > 0:
+                refs_str = ", ".join(f"{k}:{v}" for k, v in stats["external_refs"].items())
+                output = f"{stats['self']} self, {stats['external']} external ({refs_str})"
+            else:
+                output = f"{stats['total']} chunks (todos self)"
+
+            result.phases.append({
+                "name": "origin_classification",
+                "duration_seconds": duration,
+                "output": output,
+                "success": True,
+                "stats": stats,
+            })
+
+            logger.info(f"Fase 4.5: OriginClassifier concluido em {duration}s - {output}")
+            return stats
+
+        except Exception as e:
+            logger.error(f"Erro no OriginClassifier: {e}", exc_info=True)
+            # Nao falha o pipeline, apenas loga o erro
+            result.phases.append({
+                "name": "origin_classification",
+                "duration_seconds": 0,
+                "output": f"Erro: {str(e)}",
+                "success": False,
+            })
+            return {"total": len(materialized), "self": len(materialized), "external": 0, "external_refs": {}}
 
     def _phase_embeddings(self, materialized, result: PipelineResult):
         """Fase 5: Embeddings com BGE-M3"""

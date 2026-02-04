@@ -459,6 +459,16 @@ class MaterializedChunk:
     canonical_end: int = -1    # Offset fim no canonical_text (-1 se desconhecido)
     canonical_hash: str = ""   # SHA256 do canonical_text para anti-mismatch
 
+    # OriginClassifier: Classificação de origem material
+    # Distingue entre material da própria lei vs material de outras leis citadas
+    # Ex: Art. 337-E está no PDF da Lei 14.133 mas É do Código Penal
+    origin_type: str = "self"           # "self" | "external"
+    origin_reference: Optional[str] = None      # "DL-2848-1940" | None
+    origin_reference_name: Optional[str] = None # "Código Penal" | None
+    is_external_material: bool = False
+    origin_confidence: str = "high"     # "high" | "medium" | "low"
+    origin_reason: Optional[str] = None # "rule:codigo_penal_art337" | None
+
     def validate(self) -> None:
         """
         Valida consistência do node_id.
