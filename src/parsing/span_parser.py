@@ -322,9 +322,9 @@ class SpanParser:
         # 3. Extrai artigos (principal)
         self._extract_artigos(markdown, doc)
 
-        # 4. Para cada artigo, extrai subdivisões
+        # 4. Para cada artigo, extrai subdivisões (passa markdown para offsets PR13)
         for span in list(doc.articles):
-            self._extract_article_children(span, doc)
+            self._extract_article_children(span, markdown, doc)
 
         logger.info(
             f"Parsed document: {len(doc.spans)} spans, "
@@ -429,8 +429,15 @@ class SpanParser:
             doc.add_span(span)
 
     def _extract_artigos(self, markdown: str, doc: ParsedDocument):
-        """Extrai artigos do documento."""
-        for match in self.PATTERN_ARTIGO.finditer(markdown):
+        """Extrai artigos do documento.
+
+        PR13: O end_pos de cada artigo vai até o início do próximo artigo
+        (ou fim do documento), para incluir todos os filhos no range.
+        """
+        # Coleta todos os matches primeiro para calcular end_pos correto
+        matches = list(self.PATTERN_ARTIGO.finditer(markdown))
+
+        for i, match in enumerate(matches):
             numero = match.group(1)
             content = match.group(2).strip() if match.group(2) else ""
 
@@ -450,6 +457,12 @@ class SpanParser:
             # Encontra capítulo pai
             parent_id = self._find_parent_capitulo(match.start(), doc)
 
+            # PR13: end_pos = início do próximo artigo ou fim do documento
+            if i + 1 < len(matches):
+                end_pos = matches[i + 1].start()
+            else:
+                end_pos = len(markdown)
+
             span = Span(
                 span_id=f"ART-{numero.zfill(3)}",
                 span_type=SpanType.ARTIGO,
@@ -457,7 +470,7 @@ class SpanParser:
                 identifier=numero,
                 parent_id=parent_id,
                 start_pos=match.start(),
-                end_pos=match.end(),
+                end_pos=end_pos,
                 metadata={"full_match": match.group(0)},
             )
             doc.add_span(span)
@@ -470,9 +483,16 @@ class SpanParser:
                 parent = cap.span_id
         return parent
 
-    def _extract_article_children(self, article: Span, doc: ParsedDocument):
-        """Extrai parágrafos, incisos e alíneas de um artigo."""
-        full_text = article.metadata.get("full_match", "")
+    def _extract_article_children(self, article: Span, markdown: str, doc: ParsedDocument):
+        """Extrai parágrafos, incisos e alíneas de um artigo.
+
+        PR13: Usa markdown[start_pos:end_pos] para obter o texto do artigo
+        e calcula offsets absolutos para todos os filhos.
+        """
+        # PR13: Usa slice do markdown baseado nos offsets do artigo
+        full_text = markdown[article.start_pos:article.end_pos]
+        base_offset = article.start_pos
+
         if not full_text:
             return
 
@@ -483,25 +503,31 @@ class SpanParser:
         if first_par:
             caput_text = full_text[:first_par.start()]
             paragrafos_text = full_text[first_par.start():]
+            paragrafos_base = base_offset + first_par.start()
         else:
             caput_text = full_text
             paragrafos_text = ""
+            paragrafos_base = 0
 
-        # Extrai incisos do caput (antes dos parágrafos)
-        self._extract_incisos(caput_text, art_num, article.span_id, doc)
+        # Extrai incisos do caput (antes dos parágrafos) com offsets absolutos
+        self._extract_incisos(caput_text, base_offset, art_num, article.span_id, doc)
 
         # Extrai parágrafos (que por sua vez extraem seus próprios incisos)
         if paragrafos_text:
-            self._extract_paragrafos(paragrafos_text, art_num, article.span_id, doc)
+            self._extract_paragrafos(paragrafos_text, paragrafos_base, art_num, article.span_id, doc)
 
     def _extract_paragrafos(
         self,
         text: str,
+        base_offset: int,
         art_num: str,
         parent_id: str,
         doc: ParsedDocument
     ):
-        """Extrai parágrafos de um artigo."""
+        """Extrai parágrafos de um artigo.
+
+        PR13: Calcula offsets absolutos usando base_offset.
+        """
         for match in self.PATTERN_PARAGRAFO.finditer(text):
             numero = match.group(1)
             content = match.group(2).strip() if match.group(2) else ""
@@ -532,21 +558,29 @@ class SpanParser:
                 text=f"§ {identifier}º {clean_content}" if identifier != "único" else f"Parágrafo único. {clean_content}",
                 identifier=identifier,
                 parent_id=parent_id,
+                start_pos=base_offset + match.start(),
+                end_pos=base_offset + match.end(),
                 metadata={"full_match": match.group(0)},
             )
             doc.add_span(span)
 
             # Extrai incisos dentro do parágrafo (parent_id vincula ao parágrafo)
-            self._extract_incisos(match.group(0), art_num, span_id, doc)
+            # PR13: Passa offset absoluto do parágrafo para incisos
+            inciso_base = base_offset + match.start()
+            self._extract_incisos(match.group(0), inciso_base, art_num, span_id, doc)
 
     def _extract_incisos(
         self,
         text: str,
+        base_offset: int,
         art_num: str,
         parent_id: str,
         doc: ParsedDocument
     ):
-        """Extrai incisos de um artigo ou parágrafo."""
+        """Extrai incisos de um artigo ou parágrafo.
+
+        PR13: Calcula offsets absolutos usando base_offset.
+        """
         for match in self.PATTERN_INCISO.finditer(text):
             romano = match.group(1)
             content = match.group(2).strip() if match.group(2) else ""
@@ -579,22 +613,30 @@ class SpanParser:
                 text=f"{romano} - {clean_content}",
                 identifier=romano,
                 parent_id=parent_id,
+                start_pos=base_offset + match.start(),
+                end_pos=base_offset + match.end(),
                 metadata={"full_match": match.group(0)},
             )
             doc.add_span(span)
 
             # Extrai alíneas dentro do inciso
-            self._extract_alineas(match.group(0), art_num, romano, span_id, doc)
+            # PR13: Passa offset absoluto do inciso para alíneas
+            alinea_base = base_offset + match.start()
+            self._extract_alineas(match.group(0), alinea_base, art_num, romano, span_id, doc)
 
     def _extract_alineas(
         self,
         text: str,
+        base_offset: int,
         art_num: str,
         inciso: str,
         parent_id: str,
         doc: ParsedDocument
     ):
-        """Extrai alíneas de um inciso."""
+        """Extrai alíneas de um inciso.
+
+        PR13: Calcula offsets absolutos usando base_offset.
+        """
         for match in self.PATTERN_ALINEA.finditer(text):
             letra = match.group(1)
             content = match.group(2).strip() if match.group(2) else ""
@@ -610,6 +652,8 @@ class SpanParser:
                 text=f"{letra}) {content}",
                 identifier=letra,
                 parent_id=parent_id,
+                start_pos=base_offset + match.start(),
+                end_pos=base_offset + match.end(),
             )
             doc.add_span(span)
 
