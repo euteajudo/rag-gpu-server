@@ -342,6 +342,9 @@ class OrchestratorConfig:
     # LLM
     temperature: float = 0.0
     max_tokens: int = 512  # Suficiente para JSON de IDs
+    model_context_limit: int = 8192  # Limite de contexto do modelo (Qwen3-8B)
+    chars_per_token: float = 4.0  # Estimativa de caracteres por token
+    context_safety_margin: int = 256  # Margem de segurança para evitar overflow
 
     # Validação
     strict_validation: bool = True  # Falhar em IDs inválidos
@@ -670,6 +673,102 @@ class ArticleOrchestrator:
 
         return descendants
 
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        Estima número de tokens em um texto.
+
+        Usa proporção chars/token configurável (default: 4 chars = 1 token).
+        Esta é uma estimativa conservadora para português.
+        """
+        return int(len(text) / self.config.chars_per_token)
+
+    def _calculate_dynamic_max_tokens(self, input_text: str) -> int:
+        """
+        Calcula max_tokens disponível para resposta baseado no input.
+
+        Usa estimativa CONSERVADORA de tokens para evitar erros 400.
+
+        Args:
+            input_text: Texto completo que será enviado ao modelo
+
+        Returns:
+            max_tokens que pode ser solicitado sem estourar contexto
+        """
+        # Estima tokens do input com fator conservador
+        # Tokenizer Qwen pode gerar mais tokens que o esperado para português
+        chars_per_token = 2.5  # conservador (era 4.0)
+        input_tokens = int(len(input_text) / chars_per_token)
+
+        # Calcula espaço disponível com margem extra
+        safety_margin = 512  # margem de segurança aumentada
+        available = (
+            self.config.model_context_limit
+            - input_tokens
+            - safety_margin
+        )
+
+        # Limita entre min e max permitido
+        min_tokens = 128  # Mínimo para resposta JSON válida
+        max_allowed = 256  # Limita max_tokens para safety (IDs são curtos)
+        max_tokens = min(max_allowed, max(min_tokens, available))
+
+        if available < min_tokens:
+            logger.warning(
+                f"Input muito grande: {input_tokens} tokens estimados, "
+                f"disponível: {available} tokens. Usando mínimo: {min_tokens}"
+            )
+
+        logger.info(
+            f"Tokens dinâmicos: input_chars={len(input_text)}, "
+            f"input_tokens_est={input_tokens}, disponível={available}, "
+            f"usando max_tokens={max_tokens}"
+        )
+
+        return max_tokens
+
+    def _input_exceeds_context(self, input_text: str) -> bool:
+        """
+        Verifica se o input excede o limite de contexto do modelo.
+
+        Retorna True se o input for muito grande para caber no contexto
+        mesmo com max_tokens mínimo.
+        """
+        input_tokens = self._estimate_tokens(input_text)
+        min_output_tokens = 256  # Mínimo necessário para resposta JSON
+        max_input_allowed = self.config.model_context_limit - min_output_tokens - self.config.context_safety_margin
+
+        if input_tokens > max_input_allowed:
+            logger.warning(
+                f"Input excede contexto: {input_tokens} tokens > {max_input_allowed} permitidos"
+            )
+            return True
+        return False
+
+    def _truncate_annotated_text(self, annotated_text: str, max_chars: int = 28000) -> str:
+        """
+        Trunca texto anotado preservando estrutura.
+
+        Mantém os primeiros N caracteres, cortando em linha completa.
+        Adiciona nota de truncamento.
+        """
+        if len(annotated_text) <= max_chars:
+            return annotated_text
+
+        # Corta na última linha completa antes do limite
+        truncated = annotated_text[:max_chars]
+        last_newline = truncated.rfind('\n')
+        if last_newline > 0:
+            truncated = truncated[:last_newline]
+
+        # Adiciona nota
+        truncated += "\n\n[... texto truncado por limite de contexto ...]"
+
+        logger.info(
+            f"Texto anotado truncado: {len(annotated_text)} -> {len(truncated)} chars"
+        )
+
+        return truncated
+
     def _call_llm(
         self,
         article_id: str,
@@ -678,6 +777,27 @@ class ArticleOrchestrator:
         allowed_incisos: list[str]
     ) -> str:
         """Chama LLM para extrair hierarquia do artigo com schema dinâmico."""
+        # Verifica e trunca se input for muito grande
+        # O prompt total inclui: system prompt + headers + allowed IDs + annotated_text
+        # Estimativa MUITO conservadora: 2.5 chars/token (tokenizer Qwen pode ser mais agressivo)
+        # contexto 8192, output 256 (mínimo para JSON), margem 512, overhead prompts 3000 chars
+        prompt_overhead_chars = 3500  # system + headers + instruções + allowed_ids
+        chars_per_token_conservative = 2.5  # muito conservador para safety
+        max_input_chars = int(
+            (self.config.model_context_limit - 256 - 512)  # reserva 256 output, 512 margem
+            * chars_per_token_conservative
+            - prompt_overhead_chars
+        )
+        # Garante mínimo de 15000 chars para artigos pequenos
+        max_input_chars = max(max_input_chars, 15000)
+
+        if len(annotated_text) > max_input_chars:
+            logger.warning(
+                f"Artigo {article_id}: texto muito grande ({len(annotated_text)} chars), "
+                f"truncando para {max_input_chars} chars"
+            )
+            annotated_text = self._truncate_annotated_text(annotated_text, max_input_chars)
+
         # Prompt com contadores para evitar alucinação
         user_prompt = f"""Extraia os IDs de parágrafos e incisos do artigo abaixo.
 
@@ -711,19 +831,23 @@ Retorne JSON com:
             article_id, allowed_paragrafos, allowed_incisos
         )
 
+        # Calcula max_tokens dinâmico para evitar estouro de contexto
+        full_input = ARTICLE_SYSTEM_PROMPT + user_prompt
+        dynamic_max_tokens = self._calculate_dynamic_max_tokens(full_input)
+
         # Tenta guided JSON se disponível
         if hasattr(self.llm, 'chat_with_schema'):
             response = self.llm.chat_with_schema(
                 messages=messages,
                 schema=dynamic_schema,
                 temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+                max_tokens=dynamic_max_tokens,
             )
         else:
             response = self.llm.chat(
                 messages=messages,
                 temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+                max_tokens=dynamic_max_tokens,
             )
 
         return response
@@ -944,6 +1068,23 @@ Retorne JSON com:
         found_ids: list[str]
     ) -> str:
         """Retry focado em um tipo específico (parágrafos OU incisos)."""
+        # Aplica mesma lógica de truncação do _call_llm
+        prompt_overhead_chars = 4000  # retry tem mais overhead (listas de IDs)
+        chars_per_token_conservative = 2.5
+        max_input_chars = int(
+            (self.config.model_context_limit - 256 - 512)
+            * chars_per_token_conservative
+            - prompt_overhead_chars
+        )
+        max_input_chars = max(max_input_chars, 12000)
+
+        if len(annotated_text) > max_input_chars:
+            logger.warning(
+                f"Retry {article_id}: texto muito grande ({len(annotated_text)} chars), "
+                f"truncando para {max_input_chars} chars"
+            )
+            annotated_text = self._truncate_annotated_text(annotated_text, max_input_chars)
+
         user_prompt = f"""BUSCA FOCADA: Procure especificamente por {target_type.upper()} no texto abaixo.
 
 IDs FALTANDO (preciso encontrar esses):
@@ -979,18 +1120,22 @@ Retorne JSON com article_id="{article_id}" e as listas completas."""
             article_id, allowed_par, allowed_inc
         )
 
+        # Calcula max_tokens dinâmico para evitar estouro de contexto
+        full_input = ARTICLE_SYSTEM_PROMPT + user_prompt
+        dynamic_max_tokens = self._calculate_dynamic_max_tokens(full_input)
+
         if hasattr(self.llm, 'chat_with_schema'):
             response = self.llm.chat_with_schema(
                 messages=messages,
                 schema=dynamic_schema,
                 temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+                max_tokens=dynamic_max_tokens,
             )
         else:
             response = self.llm.chat(
                 messages=messages,
                 temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+                max_tokens=dynamic_max_tokens,
             )
 
         return response
@@ -1005,6 +1150,23 @@ Retorne JSON com article_id="{article_id}" e as listas completas."""
         allowed_incisos: list[str]
     ) -> str:
         """Chama LLM com prompt de retry focado e schema dinâmico."""
+        # Aplica mesma lógica de truncação
+        prompt_overhead_chars = 4500  # retry tem mais overhead (listas de IDs)
+        chars_per_token_conservative = 2.5
+        max_input_chars = int(
+            (self.config.model_context_limit - 256 - 512)
+            * chars_per_token_conservative
+            - prompt_overhead_chars
+        )
+        max_input_chars = max(max_input_chars, 12000)
+
+        if len(annotated_text) > max_input_chars:
+            logger.warning(
+                f"Retry genérico {article_id}: texto muito grande ({len(annotated_text)} chars), "
+                f"truncando para {max_input_chars} chars"
+            )
+            annotated_text = self._truncate_annotated_text(annotated_text, max_input_chars)
+
         user_prompt = f"""O artigo abaixo tem spans que podem ter sido omitidos na extração anterior.
 
 IDs PERMITIDOS (do parser):
@@ -1036,18 +1198,22 @@ Retorne a lista COMPLETA:
             article_id, allowed_paragrafos, allowed_incisos
         )
 
+        # Calcula max_tokens dinâmico para evitar estouro de contexto
+        full_input = ARTICLE_SYSTEM_PROMPT + user_prompt
+        dynamic_max_tokens = self._calculate_dynamic_max_tokens(full_input)
+
         if hasattr(self.llm, 'chat_with_schema'):
             response = self.llm.chat_with_schema(
                 messages=messages,
                 schema=dynamic_schema,
                 temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+                max_tokens=dynamic_max_tokens,
             )
         else:
             response = self.llm.chat(
                 messages=messages,
                 temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+                max_tokens=dynamic_max_tokens,
             )
 
         return response
