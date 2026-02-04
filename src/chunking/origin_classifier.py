@@ -117,7 +117,8 @@ class OriginClassifier:
         OriginRule(
             name="codigo_penal_art337",
             # Deve COMECAR com Art. 337-* (nao apenas conter)
-            pattern=re.compile(r'^[\s\-\*]*Art\.?\s*337-[A-Z]', re.IGNORECASE | re.MULTILINE),
+            # Aceita: "Art. 337-E", "Art. 337º E", "Art. 337° E", "Art. 337 E"
+            pattern=re.compile(r'^[\s\-\*]*Art\.?\s*337[-º°]?\s*[A-Z]', re.IGNORECASE | re.MULTILINE),
             origin_reference="DL-2848-1940",
             origin_reference_name="Codigo Penal",
             confidence="high",
