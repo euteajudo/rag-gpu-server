@@ -124,6 +124,20 @@ class MarkdownSanitizer:
         # Remove linhas que ficaram vazias após remoção de anomalias
         sanitized = re.sub(r'\n\s*\n\s*\n', '\n\n', sanitized)
 
+        # === FIX: Normaliza estrutura legal (força quebra de linha antes de Art.) ===
+        # Com force_backend_text=True, Docling pode não preservar quebras de linha
+        # antes de artigos, causando falha na detecção pelo SpanParser.
+        # Este fix garante que "Art. X" sempre comece em nova linha.
+        sanitized = self._normalize_legal_structure(sanitized)
+        if 'legal_structure_normalized' in [c for c in changes_made]:
+            pass
+        else:
+            # Conta quantas normalizações foram feitas
+            original_art_count = len(re.findall(r'Art\.?\s*\d+', markdown, re.IGNORECASE))
+            normalized_art_count = len(re.findall(r'^(?:\d+\.\s*)?[-*]?\s*Art\.?\s*\d+', sanitized, re.IGNORECASE | re.MULTILINE))
+            if normalized_art_count > original_art_count * 0.5:
+                changes_made.append(f"Normalizado estrutura legal ({normalized_art_count} artigos com quebra de linha)")
+
         return sanitized, SanitizationReport(
             original_length=original_length,
             sanitized_length=len(sanitized),
@@ -131,6 +145,57 @@ class MarkdownSanitizer:
             anomalies_found=anomalies_found,
             changes_made=changes_made,
         )
+
+    def _normalize_legal_structure(self, markdown: str) -> str:
+        """
+        Normaliza estrutura legal garantindo quebras de linha antes de dispositivos.
+
+        Com force_backend_text=True no Docling 2.67+, o texto pode ser extraído
+        sem quebras de linha adequadas, causando falha na detecção de artigos.
+
+        Este método adiciona quebra de linha ANTES de:
+        - Art. X (artigos)
+        - § X (parágrafos)
+        - CAPÍTULO, SEÇÃO, SUBSEÇÃO (estruturas)
+
+        NÃO adiciona antes de incisos (I -, II -) ou alíneas (a), b))
+        pois estes frequentemente aparecem em sequência no texto.
+        """
+        if not markdown:
+            return markdown
+
+        # Padrão: texto que NÃO está no início de linha seguido de Art.
+        # Captura: qualquer caractere que não seja \n, seguido de espaço e Art.
+        # Substitui por: \n antes de Art.
+        # Regex: (?<!\n)(\s+)(Art\.?\s*\d+)
+        # Isso encontra "texto Art. 1" e transforma em "texto\nArt. 1"
+
+        # 1. Normaliza artigos
+        # Padrão negativo: não fazer se já está no início da linha
+        normalized = re.sub(
+            r'(?<!\n)(\s)(Art\.?\s*\d+[°ºo]?)',
+            r'\n\2',
+            markdown,
+            flags=re.IGNORECASE
+        )
+
+        # 2. Normaliza parágrafos (§)
+        normalized = re.sub(
+            r'(?<!\n)(\s)(§\s*\d+[°ºo]?|[Pp]ar[áa]grafo\s+[úu]nico)',
+            r'\n\2',
+            normalized,
+            flags=re.IGNORECASE
+        )
+
+        # 3. Normaliza estruturas superiores (CAPÍTULO, SEÇÃO)
+        normalized = re.sub(
+            r'(?<!\n)(\s)(CAP[ÍI]TULO\s+[IVXLC]+|SE[ÇC][ÃA]O\s+[IVXLC]+|SUBSE[ÇC][ÃA]O\s+[IVXLC]+)',
+            r'\n\2',
+            normalized,
+            flags=re.IGNORECASE
+        )
+
+        return normalized
 
     def detect_anomalies(self, markdown: str) -> List[Tuple[str, int, List[str]]]:
         """
