@@ -275,8 +275,11 @@ class SpanParser:
         re.IGNORECASE | re.MULTILINE | re.DOTALL
     )
 
-    # Numerais romanos: I-XX
-    ROMAN_NUMERALS = r'(?:I{1,3}|IV|VI{0,3}|IX|X{1,3}|XI{1,3}|XIV|XV|XVI{0,3}|XIX|XX{0,3})'
+    # Numerais romanos: I-C (1-100)
+    # Estrutura: (dezenas opcionais)(unidades opcionais)
+    # Dezenas: XC(90), L?X{0,3}(50-89), XL(40), ou vazio(1-9)
+    # Unidades: IX(9), IV(4), V?I{0,3}(0-3,5-8)
+    ROMAN_NUMERALS = r'(?:(?:XC|L?X{0,3}|XL)(?:IX|IV|V?I{0,3})|(?:IX|IV|V?I{0,3}))'
 
     # Inciso: "- I  -", "- II –", "III -", "12. I -" (com prefixo numérico do Docling)
     # Formato Docling varia: "- I  -  texto" ou "III - texto" (com ou sem bullet)
