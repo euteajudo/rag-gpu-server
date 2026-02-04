@@ -215,7 +215,7 @@ class IngestionPipeline:
             min_word_ratio=0.3,
         )
 
-    def _create_docling_converter(self, enable_ocr: bool = False, fast_mode: bool = True):
+    def _create_docling_converter(self, enable_ocr: bool = False, fast_mode: bool = False):
         """
         Cria um DocumentConverter do Docling.
 
@@ -224,6 +224,40 @@ class IngestionPipeline:
             fast_mode: Se True, desabilita análise de tabelas (muito mais rápido)
 
         Referência: https://docling-project.github.io/docling/examples/full_page_ocr/
+
+        ⚠️  AVISO IMPORTANTE - NÃO HABILITAR fast_mode ⚠️
+        ═══════════════════════════════════════════════════════════════════════════
+        O fast_mode (force_backend_text=True) foi DESABILITADO intencionalmente
+        após investigação detalhada de erros de ingestão em fevereiro de 2026.
+
+        PROBLEMA IDENTIFICADO:
+        Com force_backend_text=True, o Docling extrai texto "raw" do PDF sem
+        análise de layout. Isso causa:
+
+        1. PERDA DE QUEBRAS DE LINHA: Artigos, parágrafos e incisos ficam
+           concatenados em uma única linha, ex:
+           "Art. 45. O licenciamento... I - disposição final... II - mitigação..."
+
+        2. FALHA NO SpanParser: Os regex do SpanParser dependem de quebras de
+           linha para detectar início de artigos (^Art\.) e estruturas legais.
+           Sem quebras, a detecção falha ou produz offsets incorretos.
+
+        3. OffsetResolutionError: Chunks ficam com offsets inválidos, causando
+           erro "Chunk 'INC-XXX-XX' não encontrado no range do pai" durante
+           a materialização no ChunkMaterializer.
+
+        TRADE-OFF DE PERFORMANCE:
+        - fast_mode=True:  ~30 segundos para PDF de 60 páginas
+        - fast_mode=False: ~5-10 minutos para PDF de 60 páginas
+
+        A perda de qualidade na extração é INACEITÁVEL para documentos legais
+        onde a estrutura hierárquica (artigos > parágrafos > incisos > alíneas)
+        é crítica para o funcionamento do RAG.
+
+        REFERÊNCIA: Documentação Docling v2.67+
+        - force_backend_text bypasses layout analysis entirely
+        - Recommended only for simple text extraction, not structured documents
+        ═══════════════════════════════════════════════════════════════════════════
         """
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.datamodel.base_models import InputFormat
@@ -237,14 +271,17 @@ class IngestionPipeline:
             # Fallback para versões que requerem ocr_options
             pipeline_options = PdfPipelineOptions(ocr_options=EasyOcrOptions())
 
-        # OTIMIZAÇÃO: Modo rápido para documentos legais (majoritariamente texto)
-        # force_backend_text=True: extrai texto do PDF sem layout analysis (GPU)
-        # do_table_structure=False: desabilita análise de tabelas
-        # Resultado: de 30+ min para ~30s em PDFs de 60 páginas
+        # ⚠️ MODO RÁPIDO - DESABILITADO POR PADRÃO (ver docstring acima)
+        # fast_mode=True causa perda de quebras de linha e falha no SpanParser
+        # Mantido apenas para casos excepcionais onde qualidade não é crítica
         if fast_mode:
             pipeline_options.force_backend_text = True
             pipeline_options.do_table_structure = False
-            logger.info("Modo rápido: force_backend_text + sem análise de tabelas")
+            logger.warning("⚠️ FAST_MODE ATIVADO - Qualidade de extração reduzida!")
+        else:
+            # Modo padrão: layout analysis completo para preservar estrutura
+            pipeline_options.do_table_structure = False  # Tabelas ainda desabilitadas (não usamos)
+            logger.info("Modo padrão: layout analysis habilitado para estrutura legal")
 
         # Tenta configurar aceleração GPU (pode não estar disponível em todas versões)
         try:
