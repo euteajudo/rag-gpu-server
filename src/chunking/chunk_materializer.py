@@ -310,6 +310,7 @@ import re
 
 from .chunk_models import LegalChunk, ChunkLevel
 from .canonical_offsets import resolve_child_offsets, OffsetResolutionError
+from .alias_extractor import extract_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -821,6 +822,7 @@ class ChunkMaterializer:
             canonical_start=art_start,
             canonical_end=art_end,
             canonical_hash=art_hash,
+            aliases=extract_aliases(article_chunk.text),
         )
         # Validação obrigatória - aborta se node_id inconsistente
         parent.validate()
@@ -877,6 +879,7 @@ class ChunkMaterializer:
                 canonical_start=par_start,
                 canonical_end=par_end,
                 canonical_hash=par_hash,
+                aliases=extract_aliases(par_span.text),
             )
             # Validação obrigatória - aborta se node_id inconsistente
             child.validate()
@@ -948,6 +951,7 @@ class ChunkMaterializer:
                 canonical_start=inc_start,
                 canonical_end=inc_end,
                 canonical_hash=inc_hash,
+                aliases=extract_aliases(inc_text),
             )
             # Validação obrigatória - aborta se node_id inconsistente
             child.validate()
@@ -1277,6 +1281,7 @@ class ChunkMaterializer:
             canonical_start=art_start,
             canonical_end=art_end,
             canonical_hash=art_hash,
+            aliases=extract_aliases(article_chunk.text),
         )
         parent.validate()
         # Marca que este chunk não deve ser indexado no Milvus
@@ -1318,6 +1323,7 @@ class ChunkMaterializer:
                 # Citations inclui o artigo pai + o span da parte
                 citations=[article_chunk.article_id, part["span_id"]],
                 metadata=self.metadata,
+                aliases=extract_aliases(part["text"]),
             )
             part_chunk.validate()
             chunks.append(part_chunk)
@@ -1372,6 +1378,7 @@ class ChunkMaterializer:
                     canonical_start=par_start,
                     canonical_end=par_end,
                     canonical_hash=par_hash,
+                    aliases=extract_aliases(par_span.text),
                 )
                 child.validate()
                 chunks.append(child)
@@ -1436,6 +1443,7 @@ class ChunkMaterializer:
                     canonical_start=inc_start,
                     canonical_end=inc_end,
                     canonical_hash=inc_hash,
+                    aliases=extract_aliases(inc_text),
                 )
                 child.validate()
                 chunks.append(child)
