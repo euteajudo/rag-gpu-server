@@ -258,8 +258,13 @@ class SpanParser:
     # NÃO para nos incisos/parágrafos - eles serão extraídos depois
     # NOTA: Prefixo numérico (ex: "11.") é ignorado na captura - aparece quando Docling
     #       interpreta artigos como itens de lista numerada
+    # NOTA 2: Captura opcional de sufixo letra (A-Z) para Art. 337-E, 337-F, etc.
+    #         Grupo 1: número do artigo (ex: "337")
+    #         Grupo 2: sufixo letra opcional (ex: "E", "F", ou None) - DEVE ser seguido de ponto
+    #         Grupo 3: conteúdo do artigo
+    #         O sufixo só é capturado se: "337º E." ou "337-E." (letra + ponto obrigatório)
     PATTERN_ARTIGO = re.compile(
-        rf'^(?:\d+\.\s*)?[-*]?\s*Art\.?\s*(\d+)[°ºo]?\s*[-.]?\s*(.+?)(?=\n(?:\d+\.\s*)?[-*]?\s*Art\.?\s*\d+[°ºo]?(?:\s|[-.])|^{ESTRUTURA_SUPERIOR}|\Z)',
+        rf'^(?:\d+\.\s*)?[-*]?\s*Art\.?\s*(\d+)[°ºo]?\s*[-]?\s*([A-Z](?=\.))?\s*[-.]?\s*(.+?)(?=\n(?:\d+\.\s*)?[-*]?\s*Art\.?\s*\d+[°ºo]?(?:\s|[-.])|^{ESTRUTURA_SUPERIOR}|\Z)',
         re.IGNORECASE | re.MULTILINE | re.DOTALL
     )
 
@@ -439,7 +444,8 @@ class SpanParser:
 
         for i, match in enumerate(matches):
             numero = match.group(1)
-            content = match.group(2).strip() if match.group(2) else ""
+            sufixo_letra = match.group(2)  # Captura letra opcional (E, F, G para Art. 337-E, etc.)
+            content = match.group(3).strip() if match.group(3) else ""
 
             # Limpa conteúdo (remove subdivisões que serão extraídas depois)
             content_lines = content.split('\n')
@@ -463,11 +469,21 @@ class SpanParser:
             else:
                 end_pos = len(markdown)
 
+            # Gera span_id e identifier com sufixo letra se presente (ex: ART-337-E)
+            if sufixo_letra:
+                span_id = f"ART-{numero.zfill(3)}-{sufixo_letra.upper()}"
+                identifier = f"{numero}-{sufixo_letra.upper()}"
+                text_prefix = f"Art. {numero}º {sufixo_letra.upper()}."
+            else:
+                span_id = f"ART-{numero.zfill(3)}"
+                identifier = numero
+                text_prefix = f"Art. {numero}º"
+
             span = Span(
-                span_id=f"ART-{numero.zfill(3)}",
+                span_id=span_id,
                 span_type=SpanType.ARTIGO,
-                text=f"Art. {numero}º {text}" if text else f"Art. {numero}º",
-                identifier=numero,
+                text=f"{text_prefix} {text}" if text else text_prefix,
+                identifier=identifier,
                 parent_id=parent_id,
                 start_pos=match.start(),
                 end_pos=end_pos,
