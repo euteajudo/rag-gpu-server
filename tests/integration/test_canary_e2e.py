@@ -5,6 +5,12 @@ Teste Canary E2E - Validação Completa do Pipeline
 Este teste é um "canary in the coal mine" - se falhar, algo fundamental quebrou.
 Deve ser executado em todo CI/CD e antes de deploys.
 
+IMPORTANTE: Este teste roda SEM MOCKS - usa implementações reais de:
+- SpanParser (parsing real)
+- ChunkMaterializer (materialização real)
+- OriginClassifier (classificação real)
+- extract_offsets_from_parsed_doc (extração real)
+
 Cobre:
 1. Parsing completo (SpanParser)
 2. PR13 offsets (canonical_start, canonical_end, canonical_hash)
@@ -12,6 +18,11 @@ Cobre:
 4. Origin classification (self vs external)
 5. Large article handling (sem erro 400)
 6. Hierarquia correta (parent_node_id)
+7. NEGATIVO: AMBIGUOUS - texto duplicado causa erro
+8. NEGATIVO: NOT_FOUND - texto inexistente causa erro
+
+TODO: Quando src.orchestrator existir, reativar TestIngestionPipelineHappyPath
+      em tests/test_ingestion_pipeline.py e reduzir skips/excludes.
 
 @author: Claude (RunPod)
 @date: 2026-02-05
@@ -29,6 +40,7 @@ from src.parsing.span_models import SpanType, ParsedDocument
 from src.chunking.canonical_offsets import (
     extract_offsets_from_parsed_doc,
     normalize_canonical_text,
+    OffsetResolutionError,
 )
 from src.chunking.chunk_materializer import ChunkMaterializer, DeviceType
 from src.chunking.origin_classifier import OriginClassifier
@@ -318,13 +330,140 @@ class TestCanaryE2E:
 
         print(f"✅ CANARY 6 PASSED: Hierarquia correta ({len(chunks)} chunks verificados)")
 
+    def test_canary_7_negative_ambiguous(self):
+        """
+        CANARY 7 NEGATIVO: Texto ambíguo (múltiplas ocorrências) deve causar erro.
+
+        Este teste garante que o sistema FALHA CORRETAMENTE quando não consegue
+        determinar univocamente a posição de um span no texto canônico.
+        """
+        from src.parsing.span_models import Span, SpanType, ParsedDocument
+        from src.parsing.article_orchestrator import ArticleChunk
+
+        # Texto canônico com "TEXTO REPETIDO" aparecendo 3 vezes
+        canonical_text_ambiguous = """Art. 1º TEXTO REPETIDO aqui.
+
+§ 1º TEXTO REPETIDO no parágrafo.
+
+§ 2º TEXTO REPETIDO de novo.
+"""
+
+        # Cria ParsedDocument
+        parsed_doc = ParsedDocument()
+        article_span = Span(
+            span_id="ART-001",
+            span_type=SpanType.ARTIGO,
+            text="Art. 1º TEXTO REPETIDO aqui.",
+            parent_id=None,
+            start_pos=0,
+            end_pos=len(canonical_text_ambiguous),
+            caput_end_pos=29,
+        )
+        parsed_doc.add_span(article_span)
+
+        # Parágrafo com texto que aparece múltiplas vezes no canonical
+        paragraph_span = Span(
+            span_id="PAR-001-1",
+            span_type=SpanType.PARAGRAFO,
+            text="TEXTO REPETIDO",  # Ambíguo! Aparece 3x
+            parent_id="ART-001",
+            # Sem start_pos/end_pos - forçará resolução
+        )
+        parsed_doc.add_span(paragraph_span)
+
+        article_chunk = ArticleChunk(
+            article_id="ART-001",
+            article_number="1",
+            text="Art. 1º TEXTO REPETIDO aqui.",
+            citations=["ART-001", "PAR-001-1"],
+            inciso_ids=[],
+            paragrafo_ids=["PAR-001-1"],
+        )
+
+        materializer = ChunkMaterializer(
+            document_id="TEST-AMBIGUOUS",
+            offsets_map={"ART-001": (0, len(canonical_text_ambiguous))},
+            canonical_hash="hash_ambiguous",
+            canonical_text=canonical_text_ambiguous,
+        )
+
+        # DEVE lançar OffsetResolutionError com reason AMBIGUOUS
+        with pytest.raises(OffsetResolutionError) as exc_info:
+            materializer.materialize_article(article_chunk, parsed_doc)
+
+        assert "AMBIGUOUS" in exc_info.value.reason, \
+            f"Erro deveria ter reason=AMBIGUOUS, tem: {exc_info.value.reason}"
+
+        print("✅ CANARY 7 PASSED: AMBIGUOUS corretamente detectado")
+
+    def test_canary_8_negative_not_found(self):
+        """
+        CANARY 8 NEGATIVO: Texto inexistente no canonical deve causar erro.
+
+        Este teste garante que o sistema FALHA CORRETAMENTE quando o texto
+        de um span não existe no texto canônico.
+        """
+        from src.parsing.span_models import Span, SpanType, ParsedDocument
+        from src.parsing.article_orchestrator import ArticleChunk
+
+        # Texto canônico simples
+        canonical_text_simple = "Art. 1º Este é o texto do artigo.\n"
+
+        # Cria ParsedDocument
+        parsed_doc = ParsedDocument()
+        article_span = Span(
+            span_id="ART-001",
+            span_type=SpanType.ARTIGO,
+            text="Art. 1º Este é o texto do artigo.",
+            parent_id=None,
+            start_pos=0,
+            end_pos=len(canonical_text_simple),
+        )
+        parsed_doc.add_span(article_span)
+
+        # Parágrafo com texto que NÃO existe no canonical
+        paragraph_span = Span(
+            span_id="PAR-001-1",
+            span_type=SpanType.PARAGRAFO,
+            text="TEXTO QUE NÃO EXISTE NO CANONICAL",  # Não encontrável!
+            parent_id="ART-001",
+            # Sem start_pos/end_pos - forçará resolução
+        )
+        parsed_doc.add_span(paragraph_span)
+
+        article_chunk = ArticleChunk(
+            article_id="ART-001",
+            article_number="1",
+            text="Art. 1º Este é o texto do artigo.",
+            citations=["ART-001", "PAR-001-1"],
+            inciso_ids=[],
+            paragrafo_ids=["PAR-001-1"],
+        )
+
+        materializer = ChunkMaterializer(
+            document_id="TEST-NOT-FOUND",
+            offsets_map={"ART-001": (0, len(canonical_text_simple))},
+            canonical_hash="hash_notfound",
+            canonical_text=canonical_text_simple,
+        )
+
+        # DEVE lançar OffsetResolutionError com reason NOT_FOUND
+        with pytest.raises(OffsetResolutionError) as exc_info:
+            materializer.materialize_article(article_chunk, parsed_doc)
+
+        assert "NOT_FOUND" in exc_info.value.reason, \
+            f"Erro deveria ter reason=NOT_FOUND, tem: {exc_info.value.reason}"
+
+        print("✅ CANARY 8 PASSED: NOT_FOUND corretamente detectado")
+
     def test_canary_full_pipeline(self, parsed_doc, canonical_text):
-        """CANARY COMPLETO: Executa todos os canaries em sequência."""
+        """CANARY COMPLETO: Executa todos os canaries em sequência (positivos + negativos)."""
         print("\n" + "=" * 60)
-        print("CANARY E2E: VALIDAÇÃO COMPLETA DO PIPELINE")
+        print("CANARY E2E: VALIDAÇÃO COMPLETA DO PIPELINE (SEM MOCKS)")
         print("=" * 60)
 
-        # Executa todos os testes individuais
+        # Testes positivos (devem passar)
+        print("\n--- TESTES POSITIVOS ---")
         self.test_canary_1_parsing_extracts_structure(parsed_doc)
         self.test_canary_2_pr13_offsets_valid(parsed_doc, canonical_text)
         self.test_canary_3_snippet_integrity(parsed_doc, canonical_text)
@@ -332,8 +471,14 @@ class TestCanaryE2E:
         self.test_canary_5_large_article_no_400(parsed_doc, canonical_text)
         self.test_canary_6_hierarchy_parent_node_id(parsed_doc, canonical_text)
 
+        # Testes negativos (devem falhar corretamente)
+        print("\n--- TESTES NEGATIVOS ---")
+        self.test_canary_7_negative_ambiguous()
+        self.test_canary_8_negative_not_found()
+
         print("\n" + "=" * 60)
         print("✅✅✅ CANARY E2E PASSOU: PIPELINE SAUDÁVEL ✅✅✅")
+        print("(6 positivos + 2 negativos verificados)")
         print("=" * 60)
 
 
