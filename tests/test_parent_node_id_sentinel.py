@@ -16,8 +16,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Adiciona src ao path para imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Adiciona projeto ao path para imports com prefixo src.
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class TestArticleParentNodeIdEmpty:
@@ -29,9 +29,12 @@ class TestArticleParentNodeIdEmpty:
 
     def test_article_has_empty_parent_node_id(self):
         """Verifica que artigos materializados têm parent_node_id vazio."""
-        from chunking.chunk_materializer import ChunkMaterializer, MaterializedChunk
-        from parsing.span_models import Span, SpanType, ParsedDocument
-        from parsing.article_orchestrator import ArticleChunk
+        from src.chunking.chunk_materializer import ChunkMaterializer, MaterializedChunk
+        from src.parsing.span_models import Span, SpanType, ParsedDocument
+        from src.parsing.article_orchestrator import ArticleChunk
+
+        # Texto canônico para PR13 STRICT
+        canonical_text = "Art. 5º O estudo técnico preliminar será elaborado.\n"
 
         # Cria ParsedDocument com span de artigo
         parsed_doc = ParsedDocument()
@@ -40,6 +43,8 @@ class TestArticleParentNodeIdEmpty:
             span_type=SpanType.ARTIGO,
             text="Art. 5º O estudo técnico preliminar será elaborado.",
             parent_id=None,
+            start_pos=0,
+            end_pos=51,
         )
         parsed_doc.add_span(article_span)
 
@@ -55,9 +60,9 @@ class TestArticleParentNodeIdEmpty:
 
         materializer = ChunkMaterializer(
             document_id="IN-65-2021",
-            tipo_documento="IN",
-            numero="65",
-            ano=2021,
+            offsets_map={"ART-005": (0, 51)},
+            canonical_hash="test_hash_001",
+            canonical_text=canonical_text,
         )
 
         # Materializa o artigo
@@ -73,7 +78,7 @@ class TestArticleParentNodeIdEmpty:
 
     def test_article_milvus_dict_has_empty_parent_node_id(self):
         """Verifica que to_milvus_dict() de artigo tem parent_node_id vazio."""
-        from chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
+        from src.chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
 
         chunk = MaterializedChunk(
             chunk_id="IN-65-2021#ART-005",
@@ -103,9 +108,12 @@ class TestParagraphParentNodeIdPointsToArticle:
 
     def test_paragraph_points_to_article(self):
         """Verifica que parágrafo tem parent_node_id apontando para artigo."""
-        from chunking.chunk_materializer import ChunkMaterializer
-        from parsing.span_models import Span, SpanType, ParsedDocument
-        from parsing.article_orchestrator import ArticleChunk
+        from src.chunking.chunk_materializer import ChunkMaterializer
+        from src.parsing.span_models import Span, SpanType, ParsedDocument
+        from src.parsing.article_orchestrator import ArticleChunk
+
+        # Texto canônico para PR13 STRICT
+        canonical_text = "Art. 5º O estudo técnico preliminar será elaborado.\n§ 1º O estudo técnico preliminar a que se refere...\n"
 
         # Cria ParsedDocument com artigo e parágrafo
         parsed_doc = ParsedDocument()
@@ -115,6 +123,9 @@ class TestParagraphParentNodeIdPointsToArticle:
             span_type=SpanType.ARTIGO,
             text="Art. 5º O estudo técnico preliminar será elaborado.",
             parent_id=None,
+            start_pos=0,
+            end_pos=103,  # Inclui parágrafo para structural range
+            caput_end_pos=51,  # Apenas o caput
         )
         parsed_doc.add_span(article_span)
 
@@ -123,6 +134,8 @@ class TestParagraphParentNodeIdPointsToArticle:
             span_type=SpanType.PARAGRAFO,
             text="§ 1º O estudo técnico preliminar a que se refere...",
             parent_id="ART-005",
+            start_pos=52,
+            end_pos=103,
         )
         parsed_doc.add_span(paragraph_span)
 
@@ -138,9 +151,9 @@ class TestParagraphParentNodeIdPointsToArticle:
 
         materializer = ChunkMaterializer(
             document_id="IN-65-2021",
-            tipo_documento="IN",
-            numero="65",
-            ano=2021,
+            offsets_map={"ART-005": (0, 103), "PAR-005-1": (52, 103)},
+            canonical_hash="test_hash_002",
+            canonical_text=canonical_text,
         )
 
         chunks = materializer.materialize_article(article_chunk, parsed_doc)
@@ -160,7 +173,7 @@ class TestParagraphParentNodeIdPointsToArticle:
 
     def test_paragraph_milvus_dict_has_article_parent(self):
         """Verifica que to_milvus_dict() de parágrafo aponta para artigo."""
-        from chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
+        from src.chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
 
         chunk = MaterializedChunk(
             chunk_id="IN-65-2021#PAR-005-1",
@@ -192,9 +205,12 @@ class TestIncisoParentNodeIdHierarchy:
 
     def test_inciso_under_paragraph_points_to_paragraph(self):
         """Inciso filho de parágrafo deve apontar para o parágrafo."""
-        from chunking.chunk_materializer import ChunkMaterializer
-        from parsing.span_models import Span, SpanType, ParsedDocument
-        from parsing.article_orchestrator import ArticleChunk
+        from src.chunking.chunk_materializer import ChunkMaterializer
+        from src.parsing.span_models import Span, SpanType, ParsedDocument
+        from src.parsing.article_orchestrator import ArticleChunk
+
+        # Texto canônico para PR13 STRICT
+        canonical_text = "Art. 5º O estudo técnico preliminar será elaborado.\n§ 1º Compete ao setor requisitante:\nI - elaboração do estudo técnico preliminar;\n"
 
         # Cria ParsedDocument com hierarquia completa
         parsed_doc = ParsedDocument()
@@ -204,6 +220,9 @@ class TestIncisoParentNodeIdHierarchy:
             span_type=SpanType.ARTIGO,
             text="Art. 5º O estudo técnico preliminar será elaborado.",
             parent_id=None,
+            start_pos=0,
+            end_pos=134,  # Structural range inclui tudo
+            caput_end_pos=51,
         )
         parsed_doc.add_span(article_span)
 
@@ -212,6 +231,8 @@ class TestIncisoParentNodeIdHierarchy:
             span_type=SpanType.PARAGRAFO,
             text="§ 1º Compete ao setor requisitante:",
             parent_id="ART-005",
+            start_pos=52,
+            end_pos=87,
         )
         parsed_doc.add_span(paragraph_span)
 
@@ -221,6 +242,8 @@ class TestIncisoParentNodeIdHierarchy:
             span_type=SpanType.INCISO,
             text="I - elaboração do estudo técnico preliminar;",
             parent_id="PAR-005-1",  # Filho do parágrafo
+            start_pos=88,
+            end_pos=133,
         )
         parsed_doc.add_span(inciso_span)
 
@@ -236,9 +259,13 @@ class TestIncisoParentNodeIdHierarchy:
 
         materializer = ChunkMaterializer(
             document_id="IN-65-2021",
-            tipo_documento="IN",
-            numero="65",
-            ano=2021,
+            offsets_map={
+                "ART-005": (0, 134),
+                "PAR-005-1": (52, 87),
+                "INC-005-I": (88, 133),
+            },
+            canonical_hash="test_hash_003",
+            canonical_text=canonical_text,
         )
 
         chunks = materializer.materialize_article(article_chunk, parsed_doc)
@@ -258,9 +285,12 @@ class TestIncisoParentNodeIdHierarchy:
 
     def test_inciso_under_article_points_to_article(self):
         """Inciso filho direto de artigo deve apontar para o artigo."""
-        from chunking.chunk_materializer import ChunkMaterializer
-        from parsing.span_models import Span, SpanType, ParsedDocument
-        from parsing.article_orchestrator import ArticleChunk
+        from src.chunking.chunk_materializer import ChunkMaterializer
+        from src.parsing.span_models import Span, SpanType, ParsedDocument
+        from src.parsing.article_orchestrator import ArticleChunk
+
+        # Texto canônico para PR13 STRICT
+        canonical_text = "Art. 5º O estudo técnico preliminar será elaborado.\nI - elaboração do estudo técnico preliminar;\n"
 
         # Cria ParsedDocument
         parsed_doc = ParsedDocument()
@@ -270,6 +300,9 @@ class TestIncisoParentNodeIdHierarchy:
             span_type=SpanType.ARTIGO,
             text="Art. 5º O estudo técnico preliminar será elaborado.",
             parent_id=None,
+            start_pos=0,
+            end_pos=97,  # Structural range inclui inciso
+            caput_end_pos=51,
         )
         parsed_doc.add_span(article_span)
 
@@ -279,6 +312,8 @@ class TestIncisoParentNodeIdHierarchy:
             span_type=SpanType.INCISO,
             text="I - elaboração do estudo técnico preliminar;",
             parent_id="ART-005",  # Diretamente filho do artigo
+            start_pos=52,
+            end_pos=96,
         )
         parsed_doc.add_span(inciso_span)
 
@@ -294,9 +329,12 @@ class TestIncisoParentNodeIdHierarchy:
 
         materializer = ChunkMaterializer(
             document_id="IN-65-2021",
-            tipo_documento="IN",
-            numero="65",
-            ano=2021,
+            offsets_map={
+                "ART-005": (0, 97),
+                "INC-005-I": (52, 96),
+            },
+            canonical_hash="test_hash_004",
+            canonical_text=canonical_text,
         )
 
         chunks = materializer.materialize_article(article_chunk, parsed_doc)
@@ -325,7 +363,7 @@ class TestParentChunkIdNeverInMilvusPayload:
 
     def test_milvus_dict_never_has_parent_chunk_id(self):
         """Verifica que to_milvus_dict() nunca contém 'parent_chunk_id'."""
-        from chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
+        from src.chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
 
         # Testa com artigo (parent_node_id vazio)
         article_chunk = MaterializedChunk(
@@ -369,9 +407,12 @@ class TestParentChunkIdNeverInMilvusPayload:
 
     def test_all_materialized_chunks_use_parent_node_id_only(self):
         """Verifica que todos os chunks materializados usam apenas parent_node_id."""
-        from chunking.chunk_materializer import ChunkMaterializer
-        from parsing.span_models import Span, SpanType, ParsedDocument
-        from parsing.article_orchestrator import ArticleChunk
+        from src.chunking.chunk_materializer import ChunkMaterializer
+        from src.parsing.span_models import Span, SpanType, ParsedDocument
+        from src.parsing.article_orchestrator import ArticleChunk
+
+        # Texto canônico para PR13 STRICT
+        canonical_text = "Art. 5º O estudo técnico preliminar será elaborado.\n§ 1º Compete ao setor requisitante:\nI - elaboração do estudo técnico preliminar;\n"
 
         # Cria hierarquia completa: artigo → parágrafo → inciso
         parsed_doc = ParsedDocument()
@@ -381,6 +422,9 @@ class TestParentChunkIdNeverInMilvusPayload:
             span_type=SpanType.ARTIGO,
             text="Art. 5º O estudo técnico preliminar será elaborado.",
             parent_id=None,
+            start_pos=0,
+            end_pos=134,
+            caput_end_pos=51,
         )
         parsed_doc.add_span(article_span)
 
@@ -389,6 +433,8 @@ class TestParentChunkIdNeverInMilvusPayload:
             span_type=SpanType.PARAGRAFO,
             text="§ 1º Compete ao setor requisitante:",
             parent_id="ART-005",
+            start_pos=52,
+            end_pos=87,
         )
         parsed_doc.add_span(paragraph_span)
 
@@ -397,6 +443,8 @@ class TestParentChunkIdNeverInMilvusPayload:
             span_type=SpanType.INCISO,
             text="I - elaboração do estudo técnico preliminar;",
             parent_id="PAR-005-1",
+            start_pos=88,
+            end_pos=133,
         )
         parsed_doc.add_span(inciso_span)
 
@@ -411,9 +459,13 @@ class TestParentChunkIdNeverInMilvusPayload:
 
         materializer = ChunkMaterializer(
             document_id="IN-65-2021",
-            tipo_documento="IN",
-            numero="65",
-            ano=2021,
+            offsets_map={
+                "ART-005": (0, 134),
+                "PAR-005-1": (52, 87),
+                "INC-005-I": (88, 133),
+            },
+            canonical_hash="test_hash_005",
+            canonical_text=canonical_text,
         )
 
         chunks = materializer.materialize_article(article_chunk, parsed_doc)
@@ -445,7 +497,7 @@ class TestParentNodeIdFormat:
 
     def test_parent_node_id_has_leis_prefix(self):
         """Verifica que parent_node_id de filhos tem prefixo 'leis:'."""
-        from chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
+        from src.chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
 
         chunk = MaterializedChunk(
             chunk_id="IN-65-2021#PAR-005-1",
@@ -464,7 +516,7 @@ class TestParentNodeIdFormat:
 
     def test_parent_node_id_never_has_part_suffix(self):
         """Verifica que parent_node_id NUNCA tem sufixo @Pxx."""
-        from chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
+        from src.chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
 
         chunk = MaterializedChunk(
             chunk_id="IN-65-2021#PAR-005-1",
@@ -484,7 +536,7 @@ class TestParentNodeIdFormat:
 
     def test_empty_parent_node_id_is_string_not_none(self):
         """Verifica que parent_node_id vazio é string vazia, não None."""
-        from chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
+        from src.chunking.chunk_materializer import MaterializedChunk, DeviceType, ChunkLevel
 
         chunk = MaterializedChunk(
             chunk_id="IN-65-2021#ART-005",

@@ -185,15 +185,16 @@ class TestArtifactsUploader:
         assert mock_session.post.call_count == 1
 
     def test_build_headers_with_api_key(self):
-        """Headers incluem Authorization quando API key está definida."""
+        """Headers incluem X-Ingest-Key quando API key está definida."""
         uploader = ArtifactsUploader(
             base_url="https://vectorgov.io",
             api_key="test-api-key",
         )
 
         headers = uploader._build_headers()
-        assert "Authorization" in headers
-        assert headers["Authorization"] == "Bearer test-api-key"
+        # Usa header dedicado X-Ingest-Key (não Authorization Bearer)
+        assert "X-Ingest-Key" in headers
+        assert headers["X-Ingest-Key"] == "test-api-key"
 
     def test_build_headers_with_cloudflare_access(self):
         """Headers incluem CF-Access quando credenciais estão definidas."""

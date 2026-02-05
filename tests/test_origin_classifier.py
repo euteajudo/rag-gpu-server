@@ -91,22 +91,26 @@ class TestCodigoPenalDetection:
             assert result["origin_reference"] == "DL-2848-1940"
 
     def test_decreto_lei_2848_mention(self, classifier):
-        """Mencao ao Decreto-Lei 2.848 deve ser detectada."""
+        """Mencao ao Decreto-Lei 2.848 deve ser detectada como MENCAO (self, low)."""
         chunk = {"text": "O Decreto-Lei nº 2.848, de 1940 (Código Penal), passa a vigorar..."}
         result = classifier.classify(chunk)
 
-        assert result["origin_type"] == "external"
+        # Low confidence = apenas mencao, mantido como "self" (auditavel, nao decisivo)
+        assert result["origin_type"] == "self"
         assert result["origin_reference"] == "DL-2848-1940"
-        assert result["origin_confidence"] == "high"
+        assert result["origin_confidence"] == "low"
+        assert result["is_external_material"] == False
 
-    def test_codigo_penal_mention_medium_confidence(self, classifier):
-        """Mencao generica ao 'Codigo Penal' deve ter confianca media."""
+    def test_codigo_penal_mention_low_confidence(self, classifier):
+        """Mencao generica ao 'Codigo Penal' deve ter confianca baixa (auditavel)."""
         chunk = {"text": "conforme o Código Penal estabelece..."}
         result = classifier.classify(chunk)
 
-        assert result["origin_type"] == "external"
+        # Low confidence = mantido como "self" com mencao registrada
+        assert result["origin_type"] == "self"
         assert result["origin_reference"] == "DL-2848-1940"
-        assert result["origin_confidence"] == "medium"
+        assert result["origin_confidence"] == "low"
+        assert result["is_external_material"] == False
 
 
 class TestOtherLawsDetection:
@@ -117,45 +121,55 @@ class TestOtherLawsDetection:
         return OriginClassifier()
 
     def test_cpc_lei_13105(self, classifier):
-        """Lei 13.105 (CPC) deve ser detectada."""
+        """Lei 13.105 (CPC) deve ser detectada como MENCAO (self, low)."""
         chunk = {"text": "conforme a Lei nº 13.105, de 2015..."}
         result = classifier.classify(chunk)
 
-        assert result["origin_type"] == "external"
+        # Low confidence = mencao auditavel, mantido como "self"
+        assert result["origin_type"] == "self"
         assert result["origin_reference"] == "LEI-13105-2015"
+        assert result["origin_confidence"] == "low"
 
     def test_cpc_mention(self, classifier):
-        """Mencao ao 'Codigo de Processo Civil' deve ser detectada."""
+        """Mencao ao 'Codigo de Processo Civil' deve ser detectada como MENCAO."""
         chunk = {"text": "nos termos do Código de Processo Civil..."}
         result = classifier.classify(chunk)
 
-        assert result["origin_type"] == "external"
+        # Low confidence = mencao auditavel, mantido como "self"
+        assert result["origin_type"] == "self"
         assert result["origin_reference"] == "LEI-13105-2015"
+        assert result["origin_confidence"] == "low"
 
     def test_lei_8666_low_confidence(self, classifier):
-        """Lei 8.666 deve ser detectada com baixa confianca (apenas mencao)."""
+        """Lei 8.666 deve ser detectada com baixa confianca (auditavel, nao decisivo)."""
         chunk = {"text": "A Lei nº 8.666, de 1993, fica revogada."}
         result = classifier.classify(chunk)
 
-        assert result["origin_type"] == "external"
+        # Low confidence = mencao, mantido como "self" para evitar falsos positivos
+        assert result["origin_type"] == "self"
         assert result["origin_reference"] == "LEI-8666-1993"
         assert result["origin_confidence"] == "low"
+        assert result["is_external_material"] == False
 
     def test_lei_10520(self, classifier):
-        """Lei 10.520 (Pregao) deve ser detectada."""
+        """Lei 10.520 (Pregao) deve ser detectada como MENCAO."""
         chunk = {"text": "revoga-se a Lei nº 10.520, de 2002..."}
         result = classifier.classify(chunk)
 
-        assert result["origin_type"] == "external"
+        # Low confidence = mencao auditavel, mantido como "self"
+        assert result["origin_type"] == "self"
         assert result["origin_reference"] == "LEI-10520-2002"
+        assert result["origin_confidence"] == "low"
 
     def test_lindb(self, classifier):
-        """LINDB (Decreto-Lei 4.657) deve ser detectada."""
+        """LINDB (Decreto-Lei 4.657) deve ser detectada como MENCAO."""
         chunk = {"text": "conforme o Decreto-Lei nº 4.657, de 1942..."}
         result = classifier.classify(chunk)
 
-        assert result["origin_type"] == "external"
+        # Low confidence = mencao auditavel, mantido como "self"
+        assert result["origin_type"] == "self"
         assert result["origin_reference"] == "DL-4657-1942"
+        assert result["origin_confidence"] == "low"
 
 
 class TestBatchClassification:
@@ -169,19 +183,24 @@ class TestBatchClassification:
         """Batch com chunks mistos deve retornar estatisticas corretas."""
         chunks = [
             {"text": "Art. 1º Esta Lei estabelece normas gerais."},
-            {"text": "Art. 337-E. Admitir, possibilitar..."},
+            {"text": "Art. 337-E. Admitir, possibilitar..."},  # EXTERNAL (high confidence)
             {"text": "Art. 2º Aplicam-se as disposições."},
-            {"text": "Art. 337-F. Frustrar ou fraudar..."},
-            {"text": "A Lei 8.666 fica revogada."},
+            {"text": "Art. 337-F. Frustrar ou fraudar..."},    # EXTERNAL (high confidence)
+            {"text": "A Lei 8.666 fica revogada."},            # SELF com mencao (low confidence)
         ]
 
         results, stats = classifier.classify_batch(chunks)
 
         assert stats["total"] == 5
-        assert stats["self"] == 2
-        assert stats["external"] == 3
+        # Art. 337-E e Art. 337-F sao external (high confidence)
+        # Os outros 3 sao self (incluindo mencao a Lei 8.666 que e low confidence)
+        assert stats["self"] == 3
+        assert stats["external"] == 2
         assert "DL-2848-1940" in stats["external_refs"]
         assert stats["external_refs"]["DL-2848-1940"] == 2
+        # Mencao a Lei 8.666 e registrada separadamente
+        assert stats["mentions"] == 1
+        assert "LEI-8666-1993" in stats["mention_refs"]
 
     def test_batch_all_self(self, classifier):
         """Batch com todos chunks 'self'."""
@@ -354,16 +373,22 @@ class TestEdgeCases:
             assert result["origin_type"] == "external", f"Falhou para: {text}"
 
     def test_codigo_with_accent(self, classifier):
-        """Deve detectar 'Código' com acento."""
+        """Deve detectar 'Código' com acento (como MENCAO, nao external)."""
         chunk = {"text": "conforme o Código Penal estabelece..."}
         result = classifier.classify(chunk)
-        assert result["origin_type"] == "external"
+        # Low confidence = mencao, mantido como "self" (auditavel)
+        assert result["origin_type"] == "self"
+        assert result["origin_reference"] == "DL-2848-1940"
+        assert result["origin_confidence"] == "low"
 
     def test_codigo_without_accent(self, classifier):
-        """Deve detectar 'Codigo' sem acento."""
+        """Deve detectar 'Codigo' sem acento (como MENCAO, nao external)."""
         chunk = {"text": "conforme o Codigo Penal estabelece..."}
         result = classifier.classify(chunk)
-        assert result["origin_type"] == "external"
+        # Low confidence = mencao, mantido como "self" (auditavel)
+        assert result["origin_type"] == "self"
+        assert result["origin_reference"] == "DL-2848-1940"
+        assert result["origin_confidence"] == "low"
 
     def test_partial_match_not_triggered(self, classifier):
         """Texto parcial nao deve disparar regra incorretamente."""

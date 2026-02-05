@@ -256,12 +256,16 @@ class TestParsedDocumentChunkPartsBuilder:
         assert chunks[0].logical_node_id == "leis:LEI-14133-2021#ART-001"
 
     def test_builder_uses_default_prefix(self):
-        """Builder deve usar prefix padrão baseado no document_type."""
+        """Builder deve usar prefix padrão baseado no document_type.
+
+        Nota: IN (Instrução Normativa) usa namespace 'leis' (unificado para docs legais).
+        """
         builder = ParsedDocumentChunkPartsBuilder(
             document_id="IN-58-2022",
             document_type="IN",
         )
-        assert builder.prefix == "ins"
+        # IN -> 'leis' (namespace unificado para documentos legais)
+        assert builder.prefix == "leis"
 
     def test_builder_uses_custom_prefix(self):
         """Builder deve usar prefix customizado quando fornecido."""

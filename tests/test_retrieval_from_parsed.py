@@ -356,14 +356,14 @@ class TestArticleNumberExtraction:
     """Testes de extração do article_number do span."""
 
     def test_article_number_in_context_header(self):
-        """article_number deve aparecer no context_header."""
+        """article_number deve aparecer no context_header (extraído do span_id)."""
         spans = [
             Span(
                 span_id="ART-014",
                 span_type=SpanType.ARTIGO,
                 text="Art. 14. Texto.",
                 parent_id=None,
-                article_number="14",
+                # article_number é extraído automaticamente do span_id
             ),
         ]
         doc = ParsedDocument(spans=spans)
