@@ -278,8 +278,10 @@ class SpanParser:
     # Numerais romanos: I-C (1-100)
     # Estrutura: (dezenas opcionais)(unidades opcionais)
     # Dezenas: XC(90), L?X{0,3}(50-89), XL(40), ou vazio(1-9)
-    # Unidades: IX(9), IV(4), V?I{0,3}(0-3,5-8)
-    ROMAN_NUMERALS = r'(?:(?:XC|L?X{0,3}|XL)(?:IX|IV|V?I{0,3})|(?:IX|IV|V?I{0,3}))'
+    # Unidades: IX(9), IV(4), V?I{1,3}(1-3,6-8), V(5)
+    # IMPORTANTE: Regex DEVE requerer pelo menos 1 caractere para evitar matches vazios
+    # que causam span_ids malformados como "INC-001-" (sem numeral romano)
+    ROMAN_NUMERALS = r'(?:(?:XC|L?X{0,3}|XL)(?:IX|IV|V?I{1,3}|V)?|(?:IX|IV|V?I{1,3}|V))'
 
     # Inciso: "- I  -", "- II –", "III -", "12. I -" (com prefixo numérico do Docling)
     # Formato Docling varia: "- I  -  texto" ou "III - texto" (com ou sem bullet)
@@ -296,8 +298,9 @@ class SpanParser:
     )
 
     # Item numérico: "1)", "2)", "3)" (dentro de alíneas, raro)
+    # NOTA: VI{0,3} foi corrigido para VI{1,3}|V para evitar match vazio
     PATTERN_ITEM = re.compile(
-        r'^[-*]?\s*(\d+)\)\s*(.+?)(?=\n[-*]?\s*\d+\)|^[-*]?\s*[a-z]\)|^[-*]?\s*(?:I{1,3}|IV|VI{0,3})\s*[-–]|\Z)',
+        r'^[-*]?\s*(\d+)\)\s*(.+?)(?=\n[-*]?\s*\d+\)|^[-*]?\s*[a-z]\)|^[-*]?\s*(?:I{1,3}|IV|V(?:I{1,3})?)\s*[-–]|\Z)',
         re.MULTILINE | re.DOTALL
     )
 
@@ -621,6 +624,11 @@ class SpanParser:
         for match in self.PATTERN_INCISO.finditer(text):
             romano = match.group(1)
             content = match.group(2).strip() if match.group(2) else ""
+
+            # DEFESA: Pula matches com romano vazio (bug da regex)
+            # Isso previne span_ids malformados como "INC-001-" ou "INC-001-_2"
+            if not romano or not romano.strip():
+                continue
 
             # Limpa conteúdo (para na primeira alínea)
             content_lines = content.split('\n')
