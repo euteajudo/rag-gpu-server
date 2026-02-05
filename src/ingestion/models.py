@@ -81,12 +81,12 @@ class ProcessedChunk(BaseModel):
     ano: int
     article_number: str = Field("", description="Número do artigo")
 
-    # Campos específicos para Acórdãos TCU (opcionais)
-    colegiado: Optional[str] = Field(None, description="Colegiado: P (Plenário), 1C, 2C")
-    processo: Optional[str] = Field(None, description="Número do processo (TC xxx.xxx/xxxx-x)")
-    relator: Optional[str] = Field(None, description="Nome do Ministro Relator")
-    data_sessao: Optional[str] = Field(None, description="Data da sessão (DD/MM/YYYY)")
-    unidade_tecnica: Optional[str] = Field(None, description="Unidade técnica responsável")
+    # Campos específicos para Acórdãos TCU (string vazia para LEIs)
+    colegiado: str = Field("", description="Colegiado: P (Plenário), 1C, 2C")
+    processo: str = Field("", description="Número do processo (TC xxx.xxx/xxxx-x)")
+    relator: str = Field("", description="Nome do Ministro Relator")
+    data_sessao: str = Field("", description="Data da sessão (DD/MM/YYYY)")
+    unidade_tecnica: str = Field("", description="Unidade técnica responsável")
 
     # Vetores (opcionais, preenchidos se skip_embeddings=False)
     dense_vector: Optional[list[float]] = Field(None, description="Embedding dense 1024d")
@@ -112,6 +112,15 @@ class ProcessedChunk(BaseModel):
     canonical_start: int = Field(-1, description="Offset início no canonical_text (-1 se desconhecido)")
     canonical_end: int = Field(-1, description="Offset fim no canonical_text (-1 se desconhecido)")
     canonical_hash: str = Field("", description="SHA256 do canonical_text para anti-mismatch")
+
+    # OriginClassifier: Classificação de origem do material
+    # "self" = material da própria lei, "external" = material citado de outra lei
+    origin_type: str = Field("self", description="Origem: self (própria lei) ou external (outra lei)")
+    origin_confidence: str = Field("high", description="Confiança: high, medium, low")
+    origin_reference: str = Field("", description="Referência externa (ex: DL-2848-1940) se origin_type=external")
+    origin_reference_name: str = Field("", description="Nome da referência externa (ex: Código Penal)")
+    is_external_material: bool = Field(False, description="True se material é de outra lei")
+    origin_reason: str = Field("", description="Regra que determinou a classificação (ex: rule:codigo_penal_art337)")
 
     class Config:
         json_schema_extra = {

@@ -1416,6 +1416,13 @@ class IngestionPipeline:
                     canonical_start=getattr(chunk, 'canonical_start', -1),
                     canonical_end=getattr(chunk, 'canonical_end', -1),
                     canonical_hash=getattr(chunk, 'canonical_hash', ''),
+                    # OriginClassifier: Classificação de origem
+                    origin_type=getattr(chunk, 'origin_type', 'self'),
+                    origin_confidence=getattr(chunk, 'origin_confidence', 'high'),
+                    origin_reference=getattr(chunk, 'origin_reference', '') or '',
+                    origin_reference_name=getattr(chunk, 'origin_reference_name', '') or '',
+                    is_external_material=getattr(chunk, 'is_external_material', False) or False,
+                    origin_reason=getattr(chunk, 'origin_reason', '') or '',
                 )
             else:
                 # MaterializedChunk (leis/decretos)
@@ -1469,6 +1476,19 @@ class IngestionPipeline:
                     canonical_start=getattr(chunk, 'canonical_start', -1),
                     canonical_end=getattr(chunk, 'canonical_end', -1),
                     canonical_hash=getattr(chunk, 'canonical_hash', ''),
+                    # OriginClassifier: Classificação de origem
+                    origin_type=getattr(chunk, 'origin_type', 'self'),
+                    origin_confidence=getattr(chunk, 'origin_confidence', 'high'),
+                    origin_reference=getattr(chunk, 'origin_reference', '') or '',
+                    origin_reference_name=getattr(chunk, 'origin_reference_name', '') or '',
+                    is_external_material=getattr(chunk, 'is_external_material', False) or False,
+                    origin_reason=getattr(chunk, 'origin_reason', '') or '',
+                    # Campos Acórdão (vazios para LEI/DECRETO)
+                    colegiado="",
+                    processo="",
+                    relator="",
+                    data_sessao="",
+                    unidade_tecnica="",
                 )
 
             # Adiciona vetores se foram gerados

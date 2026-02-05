@@ -154,9 +154,13 @@ class MarkdownSanitizer:
         sem quebras de linha adequadas, causando falha na detecção de artigos.
 
         Este método adiciona quebra de linha ANTES de:
-        - Art. X (artigos)
         - § X (parágrafos)
         - CAPÍTULO, SEÇÃO, SUBSEÇÃO (estruturas)
+
+        NÃO normaliza artigos (Art. X) porque:
+        1. O SpanParser já detecta artigos corretamente com MULTILINE
+        2. Normalizar "Art. X" também captura REFERÊNCIAS a artigos de outras leis
+           (ex: "Art. 5º da Lei 8.666") criando falsos positivos
 
         NÃO adiciona antes de incisos (I -, II -) ou alíneas (a), b))
         pois estes frequentemente aparecem em sequência no texto.
@@ -164,22 +168,13 @@ class MarkdownSanitizer:
         if not markdown:
             return markdown
 
-        # Padrão: texto que NÃO está no início de linha seguido de Art.
-        # Captura: qualquer caractere que não seja \n, seguido de espaço e Art.
-        # Substitui por: \n antes de Art.
-        # Regex: (?<!\n)(\s+)(Art\.?\s*\d+)
-        # Isso encontra "texto Art. 1" e transforma em "texto\nArt. 1"
+        # NOTA: Normalização de artigos DESABILITADA
+        # A normalização de "Art. X" causava falsos positivos ao transformar
+        # referências como "Art. 5º da Lei 8.666" em definições de artigos.
+        # O SpanParser já detecta artigos corretamente sem esta normalização.
+        normalized = markdown
 
-        # 1. Normaliza artigos
-        # Padrão negativo: não fazer se já está no início da linha
-        normalized = re.sub(
-            r'(?<!\n)(\s)(Art\.?\s*\d+[°ºo]?)',
-            r'\n\2',
-            markdown,
-            flags=re.IGNORECASE
-        )
-
-        # 2. Normaliza parágrafos (§)
+        # 1. Normaliza parágrafos (§)
         normalized = re.sub(
             r'(?<!\n)(\s)(§\s*\d+[°ºo]?|[Pp]ar[áa]grafo\s+[úu]nico)',
             r'\n\2',
@@ -187,7 +182,7 @@ class MarkdownSanitizer:
             flags=re.IGNORECASE
         )
 
-        # 3. Normaliza estruturas superiores (CAPÍTULO, SEÇÃO)
+        # 2. Normaliza estruturas superiores (CAPÍTULO, SEÇÃO)
         normalized = re.sub(
             r'(?<!\n)(\s)(CAP[ÍI]TULO\s+[IVXLC]+|SE[ÇC][ÃA]O\s+[IVXLC]+|SUBSE[ÇC][ÃA]O\s+[IVXLC]+)',
             r'\n\2',
