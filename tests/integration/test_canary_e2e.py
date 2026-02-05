@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Teste Canary E2E - Validação Completa do Pipeline
+=================================================
 
 Este teste é um "canary in the coal mine" - se falhar, algo fundamental quebrou.
 Deve ser executado em todo CI/CD e antes de deploys.
@@ -11,21 +12,73 @@ IMPORTANTE: Este teste roda SEM MOCKS - usa implementações reais de:
 - OriginClassifier (classificação real)
 - extract_offsets_from_parsed_doc (extração real)
 
-Cobre:
-1. Parsing completo (SpanParser)
-2. PR13 offsets (canonical_start, canonical_end, canonical_hash)
-3. Snippet integrity (slice retorna texto correto)
-4. Origin classification (self vs external)
-5. Large article handling (sem erro 400)
-6. Hierarquia correta (parent_node_id)
-7. NEGATIVO: AMBIGUOUS - texto duplicado causa erro
-8. NEGATIVO: NOT_FOUND - texto inexistente causa erro
+INVARIANTES GARANTIDAS
+======================
 
-TODO: Quando src.orchestrator existir, reativar TestIngestionPipelineHappyPath
-      em tests/test_ingestion_pipeline.py e reduzir skips/excludes.
+1. PARSING (Canary 1)
+   - SpanParser extrai artigos, parágrafos e incisos corretamente
+   - Hierarquia parent_id está correta
+   - span_id segue convenção (ART-xxx, PAR-xxx-y, INC-xxx-Y)
+
+2. PR13 OFFSETS (Canary 2)
+   - Todos os spans têm offsets no offsets_map
+   - start >= 0, end > start para todos os spans
+   - Filhos estão DENTRO do range estrutural do pai
+   - canonical_hash não é vazio
+
+3. SNIPPET INTEGRITY (Canary 3)
+   - canonical_text[start:end] contém o texto esperado
+   - Artigos contêm "Art."
+   - Incisos contêm numerais romanos
+
+4. ORIGIN CLASSIFICATION (Canary 4)
+   - Artigos normais são classificados como "self"
+   - Art. 337-* são classificados como "external" (Código Penal)
+   - Menções a outras leis são "self" com confidence="low" (auditável)
+
+5. LARGE ARTICLE (Canary 5)
+   - Artigos com muitos incisos (20+) processam sem erro 400
+   - Materialização completa sem exceção
+
+6. HIERARQUIA (Canary 6)
+   - Artigos têm parent_node_id = "" (string vazia)
+   - Parágrafos apontam para artigo pai
+   - Incisos apontam para parágrafo ou artigo
+   - Payload Milvus usa parent_node_id, NUNCA parent_chunk_id
+
+7. NEGATIVO: AMBIGUOUS (Canary 7)
+   - Texto duplicado no canonical DEVE causar OffsetResolutionError
+   - reason deve conter "AMBIGUOUS"
+
+8. NEGATIVO: NOT_FOUND (Canary 8)
+   - Texto inexistente no canonical DEVE causar OffsetResolutionError
+   - reason deve conter "NOT_FOUND"
+
+ARQUIVOS SKIPPED/EXCLUÍDOS E MOTIVOS
+====================================
+
+EXCLUÍDOS (--ignore no pytest):
+- test_article_validator.py: Requer FastAPI (ModuleNotFoundError)
+- test_chunk_materializer_split.py: Import relativo inválido (exec() com código)
+- test_rel_type_classification.py: Duplicated timeseries Prometheus (conflito de registry)
+
+SKIPPED (pytest.mark.skip):
+- test_ingestion_pipeline.py::TestIngestionPipelineHappyPath (2 testes)
+  Motivo: src.orchestrator não existe ainda
+  TODO: Reativar quando orchestrator for implementado
+
+PRÓXIMOS PASSOS
+===============
+
+Quando src.orchestrator existir:
+1. Remover skip de TestIngestionPipelineHappyPath
+2. Ajustar patch paths para módulo real
+3. Adicionar canary de ingestão completa (PDF → Milvus)
+4. Reduzir excludes resolvendo imports problemáticos
 
 @author: Claude (RunPod)
 @date: 2026-02-05
+@version: 2.0 (com negativos AMBIGUOUS/NOT_FOUND)
 """
 
 import pytest
