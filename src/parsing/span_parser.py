@@ -231,6 +231,32 @@ class SpanParser:
     # REGEX PATTERNS - Estrutura Legal Brasileira
     # =========================================================================
 
+    # =========================================================================
+    # PADRÕES DE CITAÇÃO - Detecta referências a §, não novos dispositivos
+    # =========================================================================
+    # Bug ADDRESS_MISMATCH: O regex de § capturava citações internas como
+    # "conforme § 1º deste artigo" criando spans com ID incorreto.
+    # Estes padrões identificam contextos de CITAÇÃO (não é novo dispositivo).
+    #
+    # Exemplo problemático:
+    #   "§ 2º Para os fins do disposto no § 1º deste artigo, considera-se..."
+    #   O "§ 1º deste artigo" é CITAÇÃO, não deve criar novo span PAR-xxx-1.
+    # =========================================================================
+    CITATION_CONTEXT_PATTERNS = [
+        # Preposições/locuções que introduzem citações
+        r'(?:conforme|nos termos d[oa]|segundo [oa]|previsto n[oa]|de que trata [oa]|referido n[oa]|mencionado n[oa]|disposto n[oa]|estabelecido n[oa])\s*§',
+        # § seguido de indicadores de referência
+        r'§\s*\d+[ºo°]?\s*(?:deste|desta|do|da|acima|anterior|seguinte|do caput|deste artigo|desta lei)',
+        # Artigo definido + § (indica referência, não definição)
+        r'(?:o|a|os|as|ao|à|aos|às|no|na|nos|nas|do|da|dos|das|pelo|pela)\s+§\s*\d+[ºo°]?',
+        # Citação composta: "art. 40, § 1º" ou "art. 40 § 1º"
+        r'art(?:igo)?\.?\s*\d+[ºo°]?\s*[,\s]\s*§',
+        # § do art. XX (citação cruzada)
+        r'§\s*\d+[ºo°]?\s+do\s+art',
+        # Inciso que referencia parágrafo: "inciso I do § 2º"
+        r'inciso\s+[IVXLC]+\s+d[oa]\s+§',
+    ]
+
     # Capítulo: "CAPÍTULO I", "CAPITULO II", "CAP. III"
     PATTERN_CAPITULO = re.compile(
         r'^(?:CAP[ÍI]TULO|CAP\.?)\s+([IVXLC]+)\b[^\n]*',
@@ -307,6 +333,71 @@ class SpanParser:
     def __init__(self, config: Optional[ParserConfig] = None):
         """Inicializa o parser."""
         self.config = config or ParserConfig()
+        # Compila padrões de citação para performance
+        self._citation_patterns_compiled = [
+            re.compile(p, re.IGNORECASE) for p in self.CITATION_CONTEXT_PATTERNS
+        ]
+
+    def _is_citation_context(self, text: str, match_start: int, match_end: int) -> bool:
+        """
+        Verifica se um match de § está em contexto de citação (não é novo dispositivo).
+
+        Analisa o texto ANTES do match para detectar padrões que indicam
+        que o § é uma referência a outro dispositivo, não uma definição.
+
+        IMPORTANTE: A análise foca no contexto ANTERIOR ao §, pois um parágrafo
+        real começa com "§ Xº" no início da linha, sem preposições antes.
+
+        Args:
+            text: Texto completo sendo parseado
+            match_start: Posição inicial do match no texto
+            match_end: Posição final do match no texto
+
+        Returns:
+            True se o § está em contexto de citação (deve ser ignorado)
+            False se é um novo dispositivo (deve criar span)
+
+        Exemplos:
+            "§ 1º O estudo técnico..." → False (novo parágrafo)
+            "conforme § 1º deste artigo" → True (citação)
+            "nos termos do § 2º" → True (citação)
+            "Art. 40, § 1º" → True (citação composta)
+        """
+        # Pega contexto: 60 chars ANTES do match apenas
+        # (o texto após § não importa para detectar se é citação)
+        context_start = max(0, match_start - 60)
+        context_before = text[context_start:match_start]
+
+        # Se não há contexto antes (início do texto), não é citação
+        if not context_before.strip():
+            return False
+
+        # Verifica se o § está no início de uma linha (após \n)
+        # Se sim, é um novo dispositivo, não citação
+        last_newline = context_before.rfind('\n')
+        if last_newline != -1:
+            text_after_newline = context_before[last_newline + 1:].strip()
+            # Se só tem espaços/bullets/números entre \n e o match, é novo dispositivo
+            if not text_after_newline or re.match(r'^(?:\d+\.\s*)?[-*]?\s*$', text_after_newline):
+                return False
+
+        # Padrões específicos de citação (verificam texto ANTES do §)
+        # Estes indicam que o § seguinte é uma referência
+        citation_before_patterns = [
+            r'(?:conforme|nos termos d[oa]|segundo [oa]|previsto n[oa]|de que trata [oa]|referido n[oa]|mencionado n[oa]|disposto n[oa]|estabelecido n[oa])\s*$',
+            r'(?:o|a|os|as|ao|à|aos|às|no|na|nos|nas|do|da|dos|das|pelo|pela)\s*$',
+            r'art(?:igo)?\.?\s*\d+[ºo°]?\s*[,\s]\s*$',
+            r'inciso\s+[IVXLC]+\s+d[oa]\s*$',
+        ]
+
+        for pattern in citation_before_patterns:
+            if re.search(pattern, context_before, re.IGNORECASE):
+                logger.debug(
+                    f"Citação detectada (contexto antes): '...{context_before[-40:]}§'"
+                )
+                return True
+
+        return False
 
     def parse(self, markdown: str) -> ParsedDocument:
         """
@@ -553,8 +644,12 @@ class SpanParser:
         self._extract_incisos(caput_text, base_offset, art_num, article.span_id, doc)
 
         # Extrai parágrafos (que por sua vez extraem seus próprios incisos)
+        # ADDRESS_MISMATCH FIX: Passa markdown completo para detecção de citações
         if paragrafos_text:
-            self._extract_paragrafos(paragrafos_text, paragrafos_base, art_num, article.span_id, doc)
+            self._extract_paragrafos(
+                paragrafos_text, paragrafos_base, art_num, article.span_id, doc,
+                full_markdown=markdown  # Para análise de contexto de citação
+            )
 
     def _extract_paragrafos(
         self,
@@ -562,15 +657,41 @@ class SpanParser:
         base_offset: int,
         art_num: str,
         parent_id: str,
-        doc: ParsedDocument
+        doc: ParsedDocument,
+        full_markdown: str = ""
     ):
         """Extrai parágrafos de um artigo.
 
         PR13: Calcula offsets absolutos usando base_offset.
+
+        ADDRESS_MISMATCH FIX: Verifica se cada match é uma citação interna
+        (ex: "conforme § 1º deste artigo") antes de criar o span.
+        Citações são ignoradas para evitar spans com ID incorreto.
+
+        Args:
+            text: Texto do artigo (slice do markdown)
+            base_offset: Offset absoluto do início do texto no markdown
+            art_num: Número do artigo (ex: "040")
+            parent_id: span_id do artigo pai
+            doc: ParsedDocument para adicionar spans
+            full_markdown: Markdown completo (para análise de contexto de citação)
         """
         for match in self.PATTERN_PARAGRAFO.finditer(text):
             numero = match.group(1)
             content = match.group(2).strip() if match.group(2) else ""
+
+            # ADDRESS_MISMATCH FIX: Verifica se é citação antes de criar span
+            # Usa posição absoluta no markdown para análise de contexto
+            abs_start = base_offset + match.start()
+            abs_end = base_offset + match.end()
+
+            # Se temos o markdown completo, verifica contexto de citação
+            if full_markdown and self._is_citation_context(full_markdown, abs_start, abs_end):
+                logger.debug(
+                    f"Ignorando citação de § no Art. {art_num}: "
+                    f"'{match.group(0)[:50]}...' (posição {abs_start})"
+                )
+                continue  # Pula este match - é citação, não novo dispositivo
 
             # Determina identificador
             if numero:

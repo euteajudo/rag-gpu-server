@@ -213,6 +213,9 @@ from .acordao_models import (
 )
 from .acordao_span_parser import AcordaoSpanParser
 
+# Address Validator (ADDRESS_MISMATCH detection)
+from .address_validator import AddressValidator, ValidationResult
+
 __all__ = [
     # Core models
     "SpanType",
@@ -253,4 +256,7 @@ __all__ = [
     "normalize_acordao_id",
     "parse_colegiado",
     "AcordaoSpanParser",
+    # Address Validator
+    "AddressValidator",
+    "ValidationResult",
 ]
