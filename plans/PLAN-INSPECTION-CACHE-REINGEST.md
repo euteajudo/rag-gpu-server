@@ -311,18 +311,240 @@ RunPod (GPU Server)                        VPS (Hostinger)
 
 ## 6. O que cada lado precisa implementar
 
-### 6.1 VPS — 2 endpoints novos
+### 6.1 VPS — 2 endpoints novos + infraestrutura existente
+
+#### Infraestrutura VPS já existente (reutilizar)
+
+O lado VPS **já possui** grande parte da infraestrutura necessária. Os seguintes componentes estão implementados e funcionando:
+
+**Router**: `extracao/src/api/routers/inspect.py` (registrado no main.py como `/api/v1/inspect`)
+
+| Endpoint existente | Método | O que faz | Reutilizável para cache? |
+|----------|--------|-----------|-------------------------|
+| `/inspect/artifacts/upload` | POST | Recebe artefatos aprovados do RunPod (multipart) → MinIO | ✅ Pré-requisito (persiste os dados que o cache serve) |
+| `/inspect/artifacts/{doc_id}/exists` | GET | Verifica se `metadata.json` existe no MinIO | ✅ Base para Endpoint A |
+| `/inspect/artifacts/{doc_id}/metadata` | GET | Retorna `metadata.json` completo | ✅ Base para Endpoint A |
+| `/inspect/artifacts/{doc_id}/canonical` | GET | Retorna `canonical.md` como PlainText | ✅ Base para Endpoint B |
+| `/inspect/artifacts/{doc_id}/check-hash` | GET | Verifica SHA-256 do PDF vs metadata | ✅ Lógica de validação já existe |
+
+**Helpers já implementados em `inspect.py`**:
+- `_get_minio_client()` → retorna `(minio_client, bucket)` — lazy init do MinIO
+- `_check_ingest_key()` → valida `X-Ingest-Key` header — autenticação
+
+**MinIO Config**:
+- Container: `blog-minio` (porta 9100)
+- Bucket: `vectorgov-evidence`
+- Access key: `admin_minio_blog`
+- Path base: `inspections/{document_id}/`
+
+**Arquivos no MinIO após aprovação** (persistidos pelo `POST /inspect/artifacts/upload`):
+```
+inspections/{document_id}/
+├── metadata.json                 ← InspectionMetadata (status, pdf_hash, approved_at, etc.)
+├── canonical.md                  ← Texto canônico reconciliado
+├── offsets.json                  ← Mapa span_id → offsets no canonical
+├── chunks_preview.json           ← Lista de chunks com textos e posições
+├── pymupdf_result.json           ← Artefato fase PyMuPDF
+├── vlm_result.json               ← Artefato fase VLM
+├── reconciliation_result.json    ← Artefato fase reconciliação
+├── integrity_result.json         ← Artefato fase integridade
+└── pages/                        ← PNGs anotados das páginas
+    ├── page_001.png
+    └── ...
+```
+
+**StorageService** (`extracao/src/evidence/storage_service.py`):
+- Métodos genéricos reutilizáveis: `get_file(object_key)`, `file_exists(object_key)`, `compute_sha256(data)`
+- **Nota**: StorageService usa path `documents/{doc_id}/`, mas os artefatos de inspeção estão em `inspections/{doc_id}/`. Os endpoints de cache devem usar `_get_minio_client()` diretamente (como os endpoints existentes já fazem) ou estender StorageService com path `inspections/`.
+
+#### Endpoints novos a implementar
 
 | Endpoint | Método | O que faz |
 |----------|--------|-----------|
 | `/api/v1/inspect/cache/{document_id}` | GET | Checa se existe inspeção aprovada. Lê `metadata.json` do MinIO, verifica `status == APPROVED`, retorna `has_cache` + `sha256_source` |
 | `/api/v1/inspect/cache/{document_id}/artifacts` | GET | Retorna `chunks_preview.json` + `canonical.md` + `offsets.json` combinados num JSON único |
 
-**Auth**: Mesma `X-Ingest-Key` dos endpoints existentes.
+#### Implementação detalhada — Endpoint A: Cache Check
 
-**Dependência**: O endpoint `POST /api/v1/inspect/artifacts` (descrito em `VPS_INSTRUCTIONS_INSPECT_ARTIFACTS.md`) precisa estar funcionando primeiro, pois é ele que persiste os artefatos que o cache vai servir.
+**Arquivo**: `extracao/src/api/routers/inspect.py` (adicionar ao router existente)
 
-**Nota sobre o `sha256_source`**: O `InspectionMetadata` já tem este campo? Se não, o RunPod precisa incluí-lo nos metadados da inspeção. Verificar o modelo `InspectionMetadata` em `src/inspection/models.py` do RunPod.
+```python
+@router.get("/cache/{document_id}")
+async def check_inspection_cache(
+    document_id: str,
+    x_ingest_key: Optional[str] = Header(None, alias="X-Ingest-Key"),
+):
+    """
+    Verifica se existe inspeção aprovada para uso como cache na re-ingestão.
+
+    Chamado pelo RunPod antes de iniciar o pipeline VLM.
+    """
+    _check_ingest_key(x_ingest_key)
+
+    try:
+        minio_client, bucket = _get_minio_client()
+        key = f"inspections/{document_id}/metadata.json"
+
+        try:
+            response = minio_client.get_object(bucket, key)
+            data = response.read()
+            response.close()
+            response.release_conn()
+        except Exception:
+            return {"has_cache": False, "document_id": document_id}
+
+        metadata = json.loads(data.decode("utf-8"))
+
+        # Verificar se foi aprovada
+        status = metadata.get("status", "")
+        if status != "APPROVED":
+            return {
+                "has_cache": False,
+                "document_id": document_id,
+                "reason": f"status={status} (precisa APPROVED)",
+            }
+
+        return {
+            "has_cache": True,
+            "document_id": document_id,
+            "approved_at": metadata.get("approved_at"),
+            "approved_by": metadata.get("approved_by"),
+            "sha256_source": metadata.get("pdf_hash", ""),
+            "canonical_hash": metadata.get("canonical_hash", ""),
+            "total_chunks": metadata.get("total_chunks", 0),
+            "pipeline_version": metadata.get("pipeline_version", ""),
+        }
+
+    except Exception as e:
+        logger.error(f"Erro ao verificar cache {document_id}: {e}")
+        # Fallback gracioso — RunPod trata como "sem cache"
+        return {"has_cache": False, "document_id": document_id}
+```
+
+**Notas de implementação**:
+- Campo `pdf_hash` no metadata.json: verificar se `InspectionMetadata` do RunPod persiste como `pdf_hash` ou `sha256_source`. Ajustar o `.get()` conforme.
+- Campo `total_chunks`: pode vir de `metadata.total_chunks` ou de leitura do `chunks_preview.json` (contar itens). Preferir metadata se disponível.
+- Endpoint **nunca retorna erro 500** — sempre retorna `has_cache: false` em caso de exceção (fallback gracioso).
+
+#### Implementação detalhada — Endpoint B: Artifacts Bundle
+
+**Arquivo**: `extracao/src/api/routers/inspect.py` (adicionar ao router existente)
+
+```python
+@router.get("/cache/{document_id}/artifacts")
+async def get_inspection_cache_artifacts(
+    document_id: str,
+    x_ingest_key: Optional[str] = Header(None, alias="X-Ingest-Key"),
+):
+    """
+    Retorna artefatos de inspeção aprovada para uso como cache na re-ingestão.
+
+    Combina chunks_preview.json + canonical.md + offsets.json em uma resposta única.
+    Chamado pelo RunPod após confirmar que cache existe e SHA-256 confere.
+    """
+    _check_ingest_key(x_ingest_key)
+
+    try:
+        minio_client, bucket = _get_minio_client()
+        base = f"inspections/{document_id}"
+
+        # 1. chunks_preview.json (obrigatório)
+        chunks_data = _read_minio_json(minio_client, bucket, f"{base}/chunks_preview.json")
+        if chunks_data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"chunks_preview.json não encontrado para {document_id}",
+            )
+
+        # 2. canonical.md (obrigatório)
+        canonical_bytes = _read_minio_bytes(minio_client, bucket, f"{base}/canonical.md")
+        if canonical_bytes is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"canonical.md não encontrado para {document_id}",
+            )
+        canonical_md = canonical_bytes.decode("utf-8")
+
+        # 3. offsets.json (obrigatório)
+        offsets_data = _read_minio_json(minio_client, bucket, f"{base}/offsets.json")
+        if offsets_data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"offsets.json não encontrado para {document_id}",
+            )
+
+        # 4. metadata.json (para canonical_hash)
+        metadata = _read_minio_json(minio_client, bucket, f"{base}/metadata.json")
+        canonical_hash = metadata.get("canonical_hash", "") if metadata else ""
+
+        # Extrair chunks do artefato ChunksPreviewArtifact
+        # O formato é: {"chunks": [...], "total_chunks": N, ...}
+        chunks_list = chunks_data.get("chunks", [])
+
+        # Extrair offsets do artefato
+        # O formato é: {"offsets": {...}, "document_id": "...", ...}
+        offsets_map = offsets_data.get("offsets", offsets_data)
+
+        return {
+            "document_id": document_id,
+            "canonical_md": canonical_md,
+            "canonical_hash": canonical_hash,
+            "offsets": offsets_map,
+            "chunks": chunks_list,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao buscar cache artifacts {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _read_minio_json(minio_client, bucket: str, key: str) -> Optional[dict]:
+    """Helper: lê e parseia JSON do MinIO. Retorna None se não existir."""
+    try:
+        response = minio_client.get_object(bucket, key)
+        data = response.read()
+        response.close()
+        response.release_conn()
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _read_minio_bytes(minio_client, bucket: str, key: str) -> Optional[bytes]:
+    """Helper: lê bytes do MinIO. Retorna None se não existir."""
+    try:
+        response = minio_client.get_object(bucket, key)
+        data = response.read()
+        response.close()
+        response.release_conn()
+        return data
+    except Exception:
+        return None
+```
+
+**Notas de implementação**:
+- Helpers `_read_minio_json()` e `_read_minio_bytes()` devem ser adicionados no mesmo arquivo (ou extraídos para um utils se preferir).
+- O `chunks_preview.json` segue o formato `ChunksPreviewArtifact` do RunPod: `{"chunks": [...], "total_chunks": N}`. Verificar estrutura exata antes de implementar.
+- O `offsets.json` pode ter formato `{"offsets": {...}, "document_id": "...", "canonical_text_length": N}`. Extrair apenas a parte `offsets`.
+- Considerar compressão gzip via `Accept-Encoding` se o canonical.md for grande (100KB+ para leis longas).
+
+#### Resumo da implementação VPS
+
+| Item | Ação | Estimativa |
+|------|------|-----------|
+| Endpoint A: `/cache/{document_id}` | Adicionar ao `inspect.py` existente | ~30 linhas |
+| Endpoint B: `/cache/{document_id}/artifacts` | Adicionar ao `inspect.py` existente | ~60 linhas |
+| Helpers MinIO (`_read_minio_json`, `_read_minio_bytes`) | Adicionar ao `inspect.py` | ~20 linhas |
+| Testes | Testar com um document_id que já tenha inspeção aprovada | Manual |
+| **Total** | ~110 linhas de código novo | ~1-2 horas |
+
+**Auth**: Mesma `X-Ingest-Key` dos endpoints existentes (helper `_check_ingest_key()` já existe).
+
+**Dependência**: O endpoint `POST /api/v1/inspect/artifacts/upload` já está funcionando e persiste os artefatos que o cache vai servir.
+
+**Nota sobre o `sha256_source`**: O `InspectionMetadata` do RunPod persiste o hash do PDF no campo `pdf_hash` dentro do `metadata.json`. Verificar o modelo `InspectionMetadata` em `src/inspection/models.py` do RunPod para confirmar o nome exato do campo.
 
 ### 6.2 RunPod — 3 métodos novos + 1 modificação
 
