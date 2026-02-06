@@ -38,6 +38,7 @@ from .batch_collector import (
 )
 from .auth import APIKeyAuthMiddleware, DISABLE_DOCS
 from .ingestion.router import router as ingestion_router
+from .inspection.router import router as inspection_router
 from .middleware.rate_limit import RateLimitMiddleware, InMemoryRateLimiter
 
 # GPU Metrics via pynvml
@@ -481,6 +482,7 @@ logger.info(
 
 # Router de ingestao
 app.include_router(ingestion_router)
+app.include_router(inspection_router)
 
 # NOTA: Endpoints /enrich/* ficam na VPS, não no RunPod
 # Ver docs/VPS_ENRICH_INTEGRATION.md para detalhes
