@@ -353,6 +353,9 @@ async def lifespan(app: FastAPI):
     global EMBED_COLLECTOR, RERANK_COLLECTOR
 
     logger.info("=== RAG GPU Server iniciando ===")
+    logger.info(
+        f"Pipeline: {'VLM (Qwen3-VL + PyMuPDF)' if config.use_vlm_pipeline else 'Legado (Docling + SpanParser)'}"
+    )
     logger.info(f"Embedding model: {config.embedding_model}")
     logger.info(f"Reranker model: {config.reranker_model}")
     logger.info(f"Device: {config.device}")

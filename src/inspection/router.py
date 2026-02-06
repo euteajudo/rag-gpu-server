@@ -178,10 +178,10 @@ def _background_inspect(
 
             # Detecta fase completada pelo progresso
             stage_thresholds = {
-                "pymupdf": 0.30,
-                "vlm": 0.40,
-                "reconciliation": 0.60,
-                "integrity": 0.75,
+                "pymupdf": 0.25,
+                "vlm": 0.55,
+                "reconciliation": 0.70,
+                "integrity": 0.80,
                 "chunks": 0.95,
             }
             for stage_name, threshold in stage_thresholds.items():
@@ -192,6 +192,7 @@ def _background_inspect(
 
         # Executa dry-run
         pipeline.run(
+            task_id=task_id,
             pdf_bytes=pdf_content,
             document_id=document_id,
             tipo_documento=tipo_documento,

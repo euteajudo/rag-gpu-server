@@ -13,6 +13,7 @@ Pipeline completo:
 Retorna chunks prontos para indexacao (VPS faz o insert no Milvus).
 """
 
+import asyncio
 import os
 import time
 import hashlib
@@ -376,6 +377,31 @@ class IngestionPipeline:
             self._artifacts_uploader = get_artifacts_uploader()
         return self._artifacts_uploader
 
+    # === VLM Pipeline (PyMuPDF + Qwen3-VL) ===
+    _vlm_service = None
+
+    @property
+    def vlm_service(self):
+        """VLM Extraction Service - lazy loaded."""
+        if self._vlm_service is None:
+            from ..config import config
+            from ..extraction.pymupdf_extractor import PyMuPDFExtractor
+            from ..extraction.vlm_client import VLMClient
+            from ..extraction.vlm_service import VLMExtractionService
+
+            vlm_client = VLMClient(
+                base_url=config.vllm_base_url,
+                model=config.vllm_model,
+                max_retries=config.vlm_max_retries,
+            )
+            pymupdf_extractor = PyMuPDFExtractor(dpi=config.vlm_page_dpi)
+            self._vlm_service = VLMExtractionService(
+                vlm_client=vlm_client,
+                pymupdf_extractor=pymupdf_extractor,
+            )
+            logger.info("VLMExtractionService inicializado")
+        return self._vlm_service
+
     # === Acórdãos TCU ===
     _acordao_parser = None
     _acordao_chunker = None
@@ -515,6 +541,24 @@ class IngestionPipeline:
                 temp_path = f.name
 
             try:
+                # === Feature flag: VLM Pipeline vs Legacy Pipeline ===
+                from ..config import config as app_config
+                if app_config.use_vlm_pipeline:
+                    # === PIPELINE VLM: PyMuPDF + Qwen3-VL ===
+                    logger.info(f"Pipeline VLM ativo para {request.document_id}")
+                    report_progress("vlm_extraction", 0.10)
+
+                    vlm_result = self._phase_vlm_extraction(
+                        pdf_content, request, result, report_progress
+                    )
+                    if result.status == IngestStatus.FAILED:
+                        return result
+
+                    result.total_time_seconds = round(time.perf_counter() - start_time, 2)
+                    return result
+
+                # === PIPELINE LEGADO: Docling + SpanParser ===
+
                 # Fase 1: Docling (PDF -> Markdown) - 10% a 40%
                 report_progress("docling", 0.1)
                 result = self._phase_docling(temp_path, result)
@@ -640,6 +684,315 @@ class IngestionPipeline:
 
         result.total_time_seconds = round(time.perf_counter() - start_time, 2)
         return result
+
+    def _phase_vlm_extraction(
+        self,
+        pdf_content: bytes,
+        request: IngestRequest,
+        result: PipelineResult,
+        report_progress,
+    ) -> None:
+        """
+        Pipeline VLM completo: PyMuPDF + Qwen3-VL -> ProcessedChunks.
+
+        Substitui Docling + SpanParser + ArticleOrchestrator + ChunkMaterializer
+        com extração via visão computacional.
+
+        Args:
+            pdf_content: Bytes do PDF original
+            request: Metadados do documento
+            result: PipelineResult em construção
+            report_progress: Callback de progresso
+        """
+        phase_start = time.perf_counter()
+
+        try:
+            # Roda o pipeline VLM assíncrono no event loop
+            # O process() é chamado de um thread background, então
+            # precisamos criar/obter um event loop
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Estamos em um thread com event loop rodando
+                    # Cria um novo loop para este thread
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        extraction = pool.submit(
+                            asyncio.run,
+                            self.vlm_service.extract_document(
+                                pdf_bytes=pdf_content,
+                                document_id=request.document_id,
+                                progress_callback=report_progress,
+                            ),
+                        ).result()
+                else:
+                    extraction = loop.run_until_complete(
+                        self.vlm_service.extract_document(
+                            pdf_bytes=pdf_content,
+                            document_id=request.document_id,
+                            progress_callback=report_progress,
+                        )
+                    )
+            except RuntimeError:
+                # Nenhum event loop — cria um novo
+                extraction = asyncio.run(
+                    self.vlm_service.extract_document(
+                        pdf_bytes=pdf_content,
+                        document_id=request.document_id,
+                        progress_callback=report_progress,
+                    )
+                )
+
+            report_progress("vlm_extraction", 0.80)
+
+            # Registra fase VLM
+            vlm_duration = round(time.perf_counter() - phase_start, 2)
+            result.phases.append({
+                "name": "vlm_extraction",
+                "duration_seconds": vlm_duration,
+                "output": (
+                    f"Extraídos {extraction.total_devices} dispositivos de "
+                    f"{len(extraction.pages)} páginas via PyMuPDF+Qwen3-VL"
+                ),
+                "success": True,
+                "method": "pymupdf+qwen3vl",
+            })
+
+            # Armazena canonical para uso posterior
+            result.markdown_content = extraction.canonical_text
+            result.canonical_hash = extraction.canonical_hash
+
+            # === Converte DocumentExtraction -> list[ProcessedChunk] ===
+            report_progress("vlm_materialization", 0.85)
+
+            chunks = self._vlm_to_processed_chunks(extraction, request, result)
+
+            report_progress("vlm_materialization", 0.90)
+
+            # === Embeddings (se não pular) ===
+            if not request.skip_embeddings:
+                report_progress("embedding", 0.90)
+                # Cria objetos compatíveis para embedding
+                for chunk in chunks:
+                    text_for_embedding = chunk.retrieval_text or chunk.text
+                    embed_result = self.embedder.encode([text_for_embedding])
+                    chunk.dense_vector = embed_result.dense_embeddings[0]
+                    chunk.sparse_vector = (
+                        embed_result.sparse_embeddings[0]
+                        if embed_result.sparse_embeddings
+                        else {}
+                    )
+                report_progress("embedding", 0.95)
+
+                result.phases.append({
+                    "name": "embedding",
+                    "duration_seconds": round(time.perf_counter() - phase_start - vlm_duration, 2),
+                    "output": f"Embeddings para {len(chunks)} chunks VLM",
+                    "success": True,
+                })
+
+            result.chunks = chunks
+            result.status = IngestStatus.COMPLETED
+            report_progress("completed", 1.0)
+
+            logger.info(
+                f"Pipeline VLM concluído: {len(chunks)} chunks, "
+                f"{extraction.total_devices} dispositivos"
+            )
+
+        except Exception as e:
+            logger.error(f"Erro no pipeline VLM: {e}", exc_info=True)
+            result.status = IngestStatus.FAILED
+            result.errors.append(IngestError(
+                phase="vlm_extraction",
+                message=str(e),
+            ))
+
+    def _vlm_to_processed_chunks(
+        self,
+        extraction,
+        request: IngestRequest,
+        result: PipelineResult,
+    ) -> List[ProcessedChunk]:
+        """
+        Converte DocumentExtraction (VLM) para list[ProcessedChunk].
+
+        Mapeia os dispositivos extraídos pelo VLM para o formato ProcessedChunk
+        esperado pelo pipeline downstream (VPS, Milvus, etc.).
+        """
+        from ..chunking.citation_extractor import extract_citations_from_chunk
+
+        chunks = []
+
+        for page in extraction.pages:
+            for device in page.devices:
+                # Gera span_id baseado no tipo e identificador
+                span_id = self._device_to_span_id(device)
+
+                # node_id e chunk_id
+                chunk_id = f"{request.document_id}#{span_id}"
+                node_id = f"leis:{chunk_id}"
+
+                # parent_node_id
+                parent_node_id = ""
+                if device.parent_identifier and device.device_type != "artigo":
+                    parent_span_id = self._identifier_to_span_id(
+                        device.parent_identifier, device.device_type
+                    )
+                    parent_node_id = f"leis:{request.document_id}#{parent_span_id}"
+
+                # device_type normalizado
+                device_type_map = {
+                    "artigo": "article",
+                    "paragrafo": "paragraph",
+                    "inciso": "inciso",
+                    "alinea": "alinea",
+                }
+                dt = device_type_map.get(device.device_type, device.device_type)
+
+                # chunk_level
+                chunk_level = "article" if dt == "article" else "device"
+
+                # Citações
+                citations = extract_citations_from_chunk(
+                    text=device.text or "",
+                    document_id=request.document_id,
+                    chunk_node_id=node_id,
+                    parent_chunk_id=parent_node_id or None,
+                    document_type=request.tipo_documento,
+                )
+
+                pc = ProcessedChunk(
+                    node_id=node_id,
+                    chunk_id=chunk_id,
+                    parent_node_id=parent_node_id,
+                    span_id=span_id,
+                    device_type=dt,
+                    chunk_level=chunk_level,
+                    text=device.text or "",
+                    parent_text="",
+                    retrieval_text=device.text or "",
+                    document_id=request.document_id,
+                    tipo_documento=request.tipo_documento,
+                    numero=request.numero,
+                    ano=request.ano,
+                    article_number=self._extract_article_number(device),
+                    citations=citations,
+                    # PR13: canonical offsets (sentinela por enquanto — reconciliator futuro)
+                    canonical_start=-1,
+                    canonical_end=-1,
+                    canonical_hash=extraction.canonical_hash,
+                    # VLM: campos novos
+                    page_number=page.page_number,
+                    bbox=device.bbox,
+                    confidence=device.confidence,
+                    # Campos Acórdão (vazios para LEI/DECRETO)
+                    colegiado="",
+                    processo="",
+                    relator="",
+                    data_sessao="",
+                    unidade_tecnica="",
+                )
+                chunks.append(pc)
+
+        logger.info(f"VLM -> ProcessedChunk: {len(chunks)} chunks gerados")
+        return chunks
+
+    @staticmethod
+    def _device_to_span_id(device) -> str:
+        """Converte DeviceExtraction para span_id (ex: ART-005, PAR-005-1)."""
+        import re
+
+        identifier = device.identifier.strip()
+        dtype = device.device_type.lower()
+
+        if dtype == "artigo":
+            # "Art. 5º" -> "ART-005"
+            match = re.search(r"(\d+)", identifier)
+            num = match.group(1) if match else "000"
+            return f"ART-{num.zfill(3)}"
+
+        elif dtype == "paragrafo":
+            # "§ 1º" -> precisa do pai para montar PAR-005-1
+            match = re.search(r"(\d+)", identifier)
+            num = match.group(1) if match else "0"
+            # Tenta extrair número do artigo pai
+            parent_id = device.parent_identifier or ""
+            parent_match = re.search(r"(\d+)", parent_id)
+            parent_num = parent_match.group(1) if parent_match else "000"
+            return f"PAR-{parent_num.zfill(3)}-{num}"
+
+        elif dtype == "inciso":
+            # "I" / "II" -> INC-005-1
+            parent_id = device.parent_identifier or ""
+            parent_match = re.search(r"(\d+)", parent_id)
+            parent_num = parent_match.group(1) if parent_match else "000"
+            # Converte romano ou numérico
+            inc_num = IngestionPipeline._roman_to_int(identifier.strip().rstrip(").-"))
+            return f"INC-{parent_num.zfill(3)}-{inc_num}"
+
+        elif dtype == "alinea":
+            # "a)" -> ALI-005-3-a (parent pode ser inciso romano)
+            parent_id = device.parent_identifier or ""
+            parent_match = re.search(r"(\d+)", parent_id)
+            if parent_match:
+                parent_num = parent_match.group(1).zfill(3)
+            else:
+                # Parent é inciso romano (ex: "III")
+                parent_num = str(IngestionPipeline._roman_to_int(parent_id.strip()))
+            letter = re.search(r"([a-z])", identifier.lower())
+            letter_str = letter.group(1) if letter else "a"
+            return f"ALI-{parent_num}-{letter_str}"
+
+        return f"DEV-{identifier[:20]}"
+
+    @staticmethod
+    def _identifier_to_span_id(identifier: str, child_type: str) -> str:
+        """Converte parent_identifier para span_id do pai."""
+        import re
+        match = re.search(r"(\d+)", identifier)
+        num = match.group(1) if match else "000"
+
+        # Detecta tipo do pai pelo identificador
+        ident_lower = identifier.lower().strip()
+        if ident_lower.startswith("art"):
+            return f"ART-{num.zfill(3)}"
+        elif "§" in identifier or ident_lower.startswith("par"):
+            parent_match = re.search(r"(\d+)", identifier)
+            return f"PAR-{num.zfill(3)}-{parent_match.group(1) if parent_match else '0'}"
+        else:
+            return f"ART-{num.zfill(3)}"
+
+    @staticmethod
+    def _roman_to_int(s: str) -> int:
+        """Converte numeral romano para inteiro."""
+        roman = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+        s = s.upper().strip()
+        result = 0
+        for i, c in enumerate(s):
+            if c not in roman:
+                # Tenta como número decimal
+                try:
+                    return int(s)
+                except ValueError:
+                    return 0
+            if i + 1 < len(s) and roman.get(c, 0) < roman.get(s[i + 1], 0):
+                result -= roman[c]
+            else:
+                result += roman[c]
+        return result
+
+    @staticmethod
+    def _extract_article_number(device) -> str:
+        """Extrai número do artigo de um DeviceExtraction."""
+        import re
+        if device.device_type == "artigo":
+            match = re.search(r"(\d+)", device.identifier)
+            return match.group(1) if match else ""
+        elif device.parent_identifier:
+            match = re.search(r"(\d+)", device.parent_identifier)
+            return match.group(1) if match else ""
+        return ""
 
     def _phase_docling(self, pdf_path: str, result: PipelineResult) -> PipelineResult:
         """
@@ -1311,6 +1664,10 @@ class IngestionPipeline:
                     "sparse_vector": getattr(chunk, '_sparse_vector', {}),
                     "has_citations": has_citations,
                     "citations_count": citations_count,
+                    # VLM: Campos do pipeline Qwen3-VL + PyMuPDF
+                    "page_number": getattr(chunk, 'page_number', -1),
+                    "bbox": json.dumps(getattr(chunk, 'bbox', []), ensure_ascii=False),
+                    "confidence": float(getattr(chunk, 'confidence', 0.0)),
                 }
                 data_list.append(data)
 

@@ -122,6 +122,11 @@ class ProcessedChunk(BaseModel):
     is_external_material: bool = Field(False, description="True se material é de outra lei")
     origin_reason: str = Field("", description="Regra que determinou a classificação (ex: rule:codigo_penal_art337)")
 
+    # VLM: Campos do pipeline Qwen3-VL + PyMuPDF
+    page_number: int = Field(-1, description="Página do dispositivo no PDF (-1 se desconhecido)")
+    bbox: list[float] = Field(default_factory=list, description="Bounding box no PDF [x0, y0, x1, y1]")
+    confidence: float = Field(0.0, description="Confiança do VLM na classificação (0.0-1.0)")
+
     class Config:
         json_schema_extra = {
             "example": {

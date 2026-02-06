@@ -25,8 +25,13 @@ class Config:
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 
     # vLLM (container separado)
-    vllm_base_url: str = "http://localhost:8080/v1"
-    vllm_model: str = "Qwen/Qwen3-8B-AWQ"
+    vllm_base_url: str = "http://localhost:8002/v1"
+    vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+
+    # VLM Pipeline
+    use_vlm_pipeline: bool = False     # Feature flag: True = PyMuPDF+Qwen3-VL, False = Docling+SpanParser
+    vlm_page_dpi: int = 300            # DPI para renderização de páginas
+    vlm_max_retries: int = 3           # Retries por página no VLM
 
     # Hardware
     use_fp16: bool = True
@@ -45,8 +50,11 @@ class Config:
             max_text_length=int(os.getenv("MAX_TEXT_LENGTH", "10000")),
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
             reranker_model=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
-            vllm_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8080/v1"),
-            vllm_model=os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ"),
+            vllm_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8002/v1"),
+            vllm_model=os.getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct"),
+            use_vlm_pipeline=os.getenv("USE_VLM_PIPELINE", "false").lower() == "true",
+            vlm_page_dpi=int(os.getenv("VLM_PAGE_DPI", "300")),
+            vlm_max_retries=int(os.getenv("VLM_MAX_RETRIES", "3")),
             use_fp16=os.getenv("USE_FP16", "true").lower() == "true",
             device=os.getenv("DEVICE", "cuda"),
             cache_dir=os.getenv("HF_HOME", "/root/.cache/huggingface"),

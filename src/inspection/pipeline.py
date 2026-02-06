@@ -1,18 +1,25 @@
 """
 Pipeline dry-run de inspeção.
 
-Executa as mesmas fases do pipeline de ingestão, mas:
+Executa as mesmas fases do pipeline de extração VLM, mas:
 - NÃO indexa no Milvus
 - NÃO gera embeddings
 - Salva artefatos intermediários no Redis via InspectionStorage
 - Reporta progresso via callback
-- Gera artefatos visuais (PyMuPDFArtifact com imagens anotadas)
+- Gera artefatos visuais (imagens anotadas com bboxes coloridos)
+
+Fases:
+1. PyMuPDF  — blocos de texto com bboxes (determinístico)
+2. VLM      — Qwen3-VL classifica dispositivos legais nas imagens
+3. Reconciliação — matching PyMuPDF ↔ VLM, texto SEMPRE do PyMuPDF
+4. Integridade   — validações no canonical_text
+5. Chunks        — preview dos chunks que seriam criados na ingestão
 """
 
+import asyncio
 import hashlib
 import logging
-import os
-import tempfile
+import re
 import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -30,7 +37,12 @@ from .models import (
     PyMuPDFBlock,
     PyMuPDFPageResult,
     ReconciliationArtifact,
+    ReconciliationMatch,
+    ReconciliationPageResult,
+    ReconciliationStats,
     VLMArtifact,
+    VLMElement,
+    VLMPageResult,
 )
 from .page_renderer import PageRenderer
 from .storage import InspectionStorage
@@ -38,56 +50,67 @@ from .storage import InspectionStorage
 logger = logging.getLogger(__name__)
 
 
+# Mapeamento tipo VLM → device_type do chunk
+_DEVICE_TYPE_MAP = {
+    "artigo": "article",
+    "paragrafo": "paragraph",
+    "inciso": "inciso",
+    "alinea": "alinea",
+    "caput": "caput",
+}
+
+# Profundidade hierárquica por tipo
+_DEVICE_DEPTH = {
+    "artigo": 1,
+    "paragrafo": 2,
+    "inciso": 3,
+    "alinea": 4,
+    "caput": 2,
+}
+
+
 class InspectionPipeline:
     """
     Pipeline dry-run para inspeção de documentos.
 
-    Executa fases de processamento, salva artefatos intermediários,
-    mas NÃO indexa no Milvus. Usado para revisão humana antes da
-    ingestão definitiva.
+    Executa fases de processamento VLM (PyMuPDF + Qwen3-VL),
+    salva artefatos intermediários, mas NÃO indexa no Milvus.
+    Usado para revisão humana antes da ingestão definitiva.
     """
 
     def __init__(self, storage: Optional[InspectionStorage] = None):
         self._storage = storage or InspectionStorage()
 
-        # Lazy-loaded components (same as IngestionPipeline)
-        self._docling_converter = None
-        self._span_parser = None
-        self._llm_client = None
-        self._orchestrator = None
+        # Lazy-loaded components
+        self._vlm_client = None
+        self._pymupdf_extractor = None
+
+        # Dados compartilhados entre fases (dentro de um run)
+        self._page_texts: list[str] = []
 
     # =========================================================================
-    # Lazy properties (reutiliza componentes do pipeline de ingestão)
+    # Lazy properties
     # =========================================================================
 
     @property
-    def docling_converter(self):
-        if self._docling_converter is None:
-            from ..ingestion.pipeline import IngestionPipeline
-            temp = IngestionPipeline()
-            self._docling_converter = temp.docling_converter
-        return self._docling_converter
+    def vlm_client(self):
+        if self._vlm_client is None:
+            from ..config import config
+            from ..extraction.vlm_client import VLMClient
+            self._vlm_client = VLMClient(
+                base_url=config.vllm_base_url,
+                model=config.vllm_model,
+                max_retries=config.vlm_max_retries,
+            )
+        return self._vlm_client
 
     @property
-    def span_parser(self):
-        if self._span_parser is None:
-            from ..parsing import SpanParser
-            self._span_parser = SpanParser()
-        return self._span_parser
-
-    @property
-    def llm_client(self):
-        if self._llm_client is None:
-            from ..llm.vllm_client import VLLMClient, LLMConfig
-            self._llm_client = VLLMClient(LLMConfig.for_extraction())
-        return self._llm_client
-
-    @property
-    def orchestrator(self):
-        if self._orchestrator is None:
-            from ..parsing import ArticleOrchestrator
-            self._orchestrator = ArticleOrchestrator(llm_client=self.llm_client)
-        return self._orchestrator
+    def pymupdf_extractor(self):
+        if self._pymupdf_extractor is None:
+            from ..config import config
+            from ..extraction.pymupdf_extractor import PyMuPDFExtractor
+            self._pymupdf_extractor = PyMuPDFExtractor(dpi=config.vlm_page_dpi)
+        return self._pymupdf_extractor
 
     # =========================================================================
     # Processo principal
@@ -156,31 +179,32 @@ class InspectionPipeline:
             # Fase 1: PyMuPDF — extração de blocos e renderização
             report("pymupdf", 0.10)
             pymupdf_artifact = self._phase_pymupdf(task_id, pdf_bytes)
-            report("pymupdf", 0.30)
+            report("pymupdf", 0.25)
 
-            # Fase 2: VLM — placeholder (será implementado na migração VLM)
-            report("vlm", 0.32)
-            vlm_artifact = self._phase_vlm_placeholder(task_id, total_pages)
-            report("vlm", 0.40)
+            # Fase 2: VLM — Qwen3-VL extrai estrutura de cada página
+            report("vlm", 0.27)
+            vlm_artifact = self._phase_vlm(task_id, pdf_bytes, pymupdf_artifact)
+            report("vlm", 0.55)
 
-            # Fase 3: Reconciliação — placeholder (depende do VLM)
-            report("reconciliation", 0.42)
-            recon_artifact = self._phase_reconciliation_placeholder(
-                task_id, pdf_bytes, document_id, tipo_documento, numero, ano,
+            # Fase 3: Reconciliação — matching PyMuPDF + VLM
+            report("reconciliation", 0.57)
+            recon_artifact = self._phase_reconciliation(
+                task_id, pdf_bytes, pymupdf_artifact, vlm_artifact,
             )
-            report("reconciliation", 0.60)
+            report("reconciliation", 0.70)
 
             # Fase 4: Integridade — valida a extração
-            report("integrity", 0.62)
+            report("integrity", 0.72)
             integrity_artifact = self._phase_integrity(
                 task_id, recon_artifact,
             )
-            report("integrity", 0.75)
+            report("integrity", 0.80)
 
             # Fase 5: Chunks — preview dos chunks que seriam criados
-            report("chunks", 0.77)
+            report("chunks", 0.82)
             chunks_artifact = self._phase_chunks_preview(
-                task_id, pdf_bytes, document_id, tipo_documento, numero, ano,
+                task_id, recon_artifact, vlm_artifact,
+                document_id, tipo_documento, numero, ano,
             )
             report("chunks", 0.95)
 
@@ -270,70 +294,341 @@ class InspectionPipeline:
         return artifact
 
     # =========================================================================
-    # Fase 2: VLM — Placeholder (Fase 0, será populado na migração)
+    # Fase 2: VLM — Extração de estrutura via Qwen3-VL
     # =========================================================================
 
-    def _phase_vlm_placeholder(
-        self, task_id: str, total_pages: int,
+    def _phase_vlm(
+        self,
+        task_id: str,
+        pdf_bytes: bytes,
+        pymupdf_artifact: PyMuPDFArtifact,
     ) -> VLMArtifact:
-        """Placeholder para a fase VLM. Será implementado na migração."""
-        logger.info("Inspeção Fase 2: VLM — placeholder (será implementado na migração)")
+        """
+        Envia imagem de cada página ao Qwen3-VL para extração de estrutura.
 
+        O VLM recebe APENAS imagens e retorna classificação:
+        tipo, identificador, bbox, hierarquia, confidence.
+        O texto final vem SEMPRE do PyMuPDF (Fase 1/3).
+        """
+        phase_start = time.perf_counter()
+        logger.info("Inspeção Fase 2: VLM — extraindo estrutura com Qwen3-VL...")
+
+        # Extrai páginas com PyMuPDFExtractor (300 DPI para VLM)
+        pages_data = self.pymupdf_extractor.extract_pages(pdf_bytes)
+
+        # Armazena textos das páginas para Fase 3 (canonical_text)
+        self._page_texts = [pd.text for pd in pages_data]
+
+        # Envia cada página ao VLM (async de contexto sync)
+        vlm_raw_results: list[tuple[int, dict]] = []  # (page_0idx, result)
+
+        loop = asyncio.new_event_loop()
+        try:
+            for pd in pages_data:
+                page_0idx = pd.page_number - 1  # PyMuPDFExtractor é 1-indexed
+                logger.info(f"  VLM: processando página {pd.page_number}/{len(pages_data)}")
+                try:
+                    result = loop.run_until_complete(
+                        self.vlm_client.extract_page(image_base64=pd.image_base64)
+                    )
+                    vlm_raw_results.append((page_0idx, result))
+                    logger.info(
+                        f"  VLM página {pd.page_number}: "
+                        f"{len(result.get('devices', []))} dispositivos"
+                    )
+                except Exception as e:
+                    logger.warning(f"  VLM falhou na página {pd.page_number}: {e}")
+                    vlm_raw_results.append((page_0idx, {"devices": []}))
+        finally:
+            loop.close()
+
+        # Converte para VLMElement + renderiza imagens anotadas
+        vlm_pages: list[VLMPageResult] = []
+        total_elements = 0
+        max_depth = 0
+
+        # Mapa global identifier → element_id (para resolver parent cross-page)
+        identifier_to_element_id: dict[str, str] = {}
+        all_elements: list[VLMElement] = []
+
+        with PageRenderer(pdf_bytes) as renderer:
+            for page_0idx, raw_result in vlm_raw_results:
+                # Dimensões da página em PDF points
+                if page_0idx < len(pymupdf_artifact.pages):
+                    page_w = pymupdf_artifact.pages[page_0idx].width
+                    page_h = pymupdf_artifact.pages[page_0idx].height
+                else:
+                    page_w, page_h = 595.0, 842.0  # A4 default
+
+                elements: list[VLMElement] = []
+                bboxes_for_render: list[tuple[BBox, str]] = []
+
+                for i, device in enumerate(raw_result.get("devices", [])):
+                    element_type = device.get("device_type", "unknown")
+                    identifier = device.get("identifier", "")
+                    element_id = f"{element_type}_{page_0idx}_{i}"
+
+                    # Bbox: VLM retorna normalizado [0-1], converte para PDF points
+                    bbox_raw = device.get("bbox", [])
+                    bbox = None
+                    if len(bbox_raw) == 4:
+                        try:
+                            bbox = BBox(
+                                x0=float(bbox_raw[0]) * page_w,
+                                y0=float(bbox_raw[1]) * page_h,
+                                x1=float(bbox_raw[2]) * page_w,
+                                y1=float(bbox_raw[3]) * page_h,
+                            )
+                            bboxes_for_render.append((bbox, "vlm"))
+                        except (ValueError, TypeError):
+                            pass
+
+                    depth = _DEVICE_DEPTH.get(element_type, 0)
+                    max_depth = max(max_depth, depth)
+
+                    elem = VLMElement(
+                        element_id=element_id,
+                        element_type=element_type,
+                        text=device.get("text", ""),
+                        bbox=bbox,
+                        confidence=float(device.get("confidence", 0.0)),
+                        page=page_0idx,
+                        parent_id=device.get("parent_identifier", "") or None,
+                        children_ids=[],
+                    )
+                    elements.append(elem)
+                    all_elements.append(elem)
+
+                    if identifier:
+                        identifier_to_element_id[identifier] = element_id
+
+                # Renderiza página com bboxes VLM (verde)
+                image_b64 = renderer.render_page_base64(page_0idx, bboxes_for_render)
+
+                vlm_pages.append(VLMPageResult(
+                    page_number=page_0idx,
+                    elements=elements,
+                    image_base64=image_b64,
+                ))
+                total_elements += len(elements)
+
+        # Segunda passada: resolve parent_id (identifier → element_id)
+        for elem in all_elements:
+            if elem.parent_id and elem.parent_id in identifier_to_element_id:
+                parent_eid = identifier_to_element_id[elem.parent_id]
+                elem.parent_id = parent_eid
+                # Atualiza children_ids do pai
+                for parent_elem in all_elements:
+                    if parent_elem.element_id == parent_eid:
+                        if elem.element_id not in parent_elem.children_ids:
+                            parent_elem.children_ids.append(elem.element_id)
+                        break
+
+        duration_ms = (time.perf_counter() - phase_start) * 1000
         artifact = VLMArtifact(
-            pages=[],
-            total_elements=0,
-            total_pages=total_pages,
-            hierarchy_depth=0,
-            duration_ms=0.0,
+            pages=vlm_pages,
+            total_elements=total_elements,
+            total_pages=len(vlm_pages),
+            hierarchy_depth=max_depth,
+            duration_ms=duration_ms,
         )
 
         self._storage.save_artifact(
             task_id, InspectionStage.VLM, artifact.model_dump_json(),
         )
+        logger.info(
+            f"Inspeção Fase 2: VLM — {total_elements} elementos, "
+            f"{len(vlm_pages)} páginas, depth={max_depth} em {duration_ms:.0f}ms"
+        )
         return artifact
 
     # =========================================================================
-    # Fase 3: Reconciliação — Usa Docling+SpanParser como proxy na Fase 0
+    # Fase 3: Reconciliação — Matching PyMuPDF ↔ VLM
     # =========================================================================
 
-    def _phase_reconciliation_placeholder(
+    def _phase_reconciliation(
         self,
         task_id: str,
         pdf_bytes: bytes,
-        document_id: str,
-        tipo_documento: str,
-        numero: str,
-        ano: int,
+        pymupdf_artifact: PyMuPDFArtifact,
+        vlm_artifact: VLMArtifact,
     ) -> ReconciliationArtifact:
         """
-        Na Fase 0 (scaffold), a reconciliação usa o pipeline atual
-        (Docling + SpanParser) para gerar o canonical text.
+        Reconcilia blocos PyMuPDF com elementos VLM.
 
-        Quando o VLM estiver implementado, esta fase fará matching
-        real entre blocos PyMuPDF e elementos VLM.
+        - Texto final = SEMPRE do PyMuPDF (determinístico)
+        - Classificação (tipo, hierarquia) = do VLM
+        - Matching por IoU de bounding boxes
+        - Constrói canonical_text a partir do PyMuPDF
         """
         phase_start = time.perf_counter()
-        logger.info("Inspeção Fase 3: Reconciliação — usando Docling como proxy...")
+        logger.info("Inspeção Fase 3: Reconciliação — matching PyMuPDF + VLM...")
 
-        canonical_text = ""
-        try:
-            # Usa Docling para gerar markdown (proxy para canonical text)
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                f.write(pdf_bytes)
-                temp_path = f.name
+        # 1. Constrói canonical_text a partir dos textos PyMuPDF (get_text("text"))
+        from ..utils.canonical_utils import normalize_canonical_text, compute_canonical_hash
 
-            try:
-                doc_result = self.docling_converter.convert(temp_path)
-                canonical_text = doc_result.document.export_to_markdown()
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-        except Exception as e:
-            logger.error(f"Erro na fase de reconciliação: {e}", exc_info=True)
+        raw_canonical = "\n".join(self._page_texts) if self._page_texts else ""
+        canonical_text = normalize_canonical_text(raw_canonical)
+        canonical_hash = compute_canonical_hash(canonical_text)
+
+        logger.info(
+            f"  canonical_text: {len(canonical_text)} chars, hash={canonical_hash[:16]}..."
+        )
+
+        # 2. Matching por página: PyMuPDF blocks ↔ VLM elements via bbox IoU
+        recon_pages: list[ReconciliationPageResult] = []
+        total_matches = 0
+        exact_matches = 0
+        partial_matches = 0
+        conflicts = 0
+        unmatched_pymupdf_count = 0
+        unmatched_vlm_count = 0
+
+        with PageRenderer(pdf_bytes) as renderer:
+            for page_0idx in range(max(len(pymupdf_artifact.pages), len(vlm_artifact.pages))):
+                # Blocos PyMuPDF desta página
+                pymupdf_page = None
+                if page_0idx < len(pymupdf_artifact.pages):
+                    pymupdf_page = pymupdf_artifact.pages[page_0idx]
+                blocks = pymupdf_page.blocks if pymupdf_page else []
+                page_w = pymupdf_page.width if pymupdf_page else 595.0
+                page_h = pymupdf_page.height if pymupdf_page else 842.0
+
+                # Elementos VLM desta página
+                vlm_page = None
+                if page_0idx < len(vlm_artifact.pages):
+                    vlm_page = vlm_artifact.pages[page_0idx]
+                elements = vlm_page.elements if vlm_page else []
+
+                matches: list[ReconciliationMatch] = []
+                matched_block_indices: set[int] = set()
+                matched_vlm_ids: set[str] = set()
+                bboxes_for_render: list[tuple[BBox, str]] = []
+
+                # Para cada elemento VLM, encontra melhor bloco PyMuPDF por IoU
+                for elem in elements:
+                    if elem.bbox is None:
+                        # VLM não retornou bbox — sem match possível
+                        matches.append(ReconciliationMatch(
+                            pymupdf_block_index=-1,
+                            vlm_element_id=elem.element_id,
+                            match_quality="unmatched_vlm",
+                            text_pymupdf="",
+                            text_vlm=elem.text,
+                            text_reconciled="",
+                            bbox_overlap=0.0,
+                            page=page_0idx,
+                        ))
+                        unmatched_vlm_count += 1
+                        continue
+
+                    best_iou = 0.0
+                    best_block_idx = -1
+                    best_block = None
+
+                    for block in blocks:
+                        if block.block_index in matched_block_indices:
+                            continue
+                        iou = _compute_bbox_iou(block.bbox, elem.bbox)
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_block_idx = block.block_index
+                            best_block = block
+
+                    if best_iou >= 0.1 and best_block is not None:
+                        # Match encontrado
+                        matched_block_indices.add(best_block_idx)
+                        matched_vlm_ids.add(elem.element_id)
+
+                        if best_iou >= 0.5:
+                            quality = "exact"
+                            exact_matches += 1
+                            bbox_color = "match"
+                        else:
+                            quality = "partial"
+                            partial_matches += 1
+                            bbox_color = "match"
+
+                        total_matches += 1
+
+                        # Texto reconciliado = SEMPRE do PyMuPDF
+                        matches.append(ReconciliationMatch(
+                            pymupdf_block_index=best_block_idx,
+                            vlm_element_id=elem.element_id,
+                            match_quality=quality,
+                            text_pymupdf=best_block.text,
+                            text_vlm=elem.text,
+                            text_reconciled=best_block.text,
+                            bbox_overlap=round(best_iou, 4),
+                            page=page_0idx,
+                        ))
+
+                        # Usa bbox do match para renderização
+                        if elem.bbox:
+                            bboxes_for_render.append((elem.bbox, bbox_color))
+
+                    else:
+                        # VLM sem match no PyMuPDF
+                        matches.append(ReconciliationMatch(
+                            pymupdf_block_index=-1,
+                            vlm_element_id=elem.element_id,
+                            match_quality="unmatched_vlm",
+                            text_pymupdf="",
+                            text_vlm=elem.text,
+                            text_reconciled="",
+                            bbox_overlap=0.0,
+                            page=page_0idx,
+                        ))
+                        unmatched_vlm_count += 1
+
+                        if elem.bbox:
+                            bboxes_for_render.append((elem.bbox, "conflict"))
+
+                # Blocos PyMuPDF sem match no VLM
+                for block in blocks:
+                    if block.block_index not in matched_block_indices:
+                        matches.append(ReconciliationMatch(
+                            pymupdf_block_index=block.block_index,
+                            vlm_element_id="",
+                            match_quality="unmatched_pymupdf",
+                            text_pymupdf=block.text,
+                            text_vlm="",
+                            text_reconciled=block.text,
+                            bbox_overlap=0.0,
+                            page=page_0idx,
+                        ))
+                        unmatched_pymupdf_count += 1
+                        bboxes_for_render.append((block.bbox, "pymupdf"))
+
+                # Renderiza página com bboxes de reconciliação
+                image_b64 = ""
+                if page_0idx < renderer.page_count:
+                    image_b64 = renderer.render_page_base64(page_0idx, bboxes_for_render)
+
+                recon_pages.append(ReconciliationPageResult(
+                    page_number=page_0idx,
+                    matches=matches,
+                    image_base64=image_b64,
+                ))
+
+        # Estatísticas
+        total_pymupdf = sum(len(p.blocks) for p in pymupdf_artifact.pages)
+        total_vlm = vlm_artifact.total_elements
+        stats = ReconciliationStats(
+            total_matches=total_matches,
+            exact_matches=exact_matches,
+            partial_matches=partial_matches,
+            conflicts=conflicts,
+            unmatched_pymupdf=unmatched_pymupdf_count,
+            unmatched_vlm=unmatched_vlm_count,
+            coverage_pymupdf=round(total_matches / max(total_pymupdf, 1), 4),
+            coverage_vlm=round(total_matches / max(total_vlm, 1), 4),
+        )
 
         duration_ms = (time.perf_counter() - phase_start) * 1000
         artifact = ReconciliationArtifact(
-            pages=[],
+            pages=recon_pages,
+            stats=stats,
             canonical_text=canonical_text,
             duration_ms=duration_ms,
         )
@@ -342,8 +637,11 @@ class InspectionPipeline:
             task_id, InspectionStage.RECONCILIATION, artifact.model_dump_json(),
         )
         logger.info(
-            f"Inspeção Fase 3: Reconciliação — "
-            f"{len(canonical_text)} chars em {duration_ms:.0f}ms"
+            f"Inspeção Fase 3: Reconciliação — {total_matches} matches "
+            f"({exact_matches} exact, {partial_matches} partial), "
+            f"{unmatched_pymupdf_count} blocos sem VLM, "
+            f"{unmatched_vlm_count} VLM sem bloco, "
+            f"{len(canonical_text)} chars canonical em {duration_ms:.0f}ms"
         )
         return artifact
 
@@ -374,7 +672,6 @@ class InspectionPipeline:
         ))
 
         # Check 2: Contém artigos
-        import re
         article_pattern = re.compile(r'(?:^|\n)\s*Art\.?\s+\d+', re.IGNORECASE)
         article_matches = article_pattern.findall(canonical)
         has_articles = len(article_matches) > 0
@@ -406,8 +703,26 @@ class InspectionPipeline:
             details={"non_ascii_ratio": round(non_ascii_ratio, 4)},
         ))
 
+        # Check 5: Reconciliação tem matches (VLM funcionou)
+        stats = recon_artifact.stats
+        has_vlm_matches = stats.total_matches > 0
+        checks.append(IntegrityCheck(
+            check_name="vlm_matches",
+            passed=has_vlm_matches,
+            message=f"VLM: {stats.total_matches} matches ({stats.exact_matches} exact)" if has_vlm_matches
+                    else "VLM não produziu matches — verifique se o vLLM está rodando",
+            details={
+                "total_matches": stats.total_matches,
+                "exact_matches": stats.exact_matches,
+                "partial_matches": stats.partial_matches,
+                "coverage_vlm": stats.coverage_vlm,
+            },
+        ))
+
         if not has_articles:
             warnings.append("Nenhum artigo detectado — documento pode não ser legislação")
+        if not has_vlm_matches:
+            warnings.append("VLM sem matches — chunks serão gerados apenas com texto PyMuPDF")
 
         passed_count = sum(1 for c in checks if c.passed)
         failed_count = len(checks) - passed_count
@@ -441,18 +756,21 @@ class InspectionPipeline:
     def _phase_chunks_preview(
         self,
         task_id: str,
-        pdf_bytes: bytes,
+        recon_artifact: ReconciliationArtifact,
+        vlm_artifact: VLMArtifact,
         document_id: str,
         tipo_documento: str,
         numero: str,
         ano: int,
     ) -> ChunksPreviewArtifact:
         """
-        Executa o pipeline real (SpanParser + ArticleOrchestrator + ChunkMaterializer)
-        para gerar preview dos chunks que SERIAM criados na ingestão.
+        Gera preview dos chunks que SERIAM criados na ingestão.
+
+        Cada dispositivo VLM com match no PyMuPDF vira um chunk.
+        Texto = do PyMuPDF (reconciliado). Classificação = do VLM.
         """
         phase_start = time.perf_counter()
-        logger.info("Inspeção Fase 5: Chunks — gerando preview...")
+        logger.info("Inspeção Fase 5: Chunks — gerando preview a partir do VLM...")
 
         chunks_preview: list[ChunkPreview] = []
         articles_count = 0
@@ -461,134 +779,121 @@ class InspectionPipeline:
         alineas_count = 0
         max_depth = 0
 
-        try:
-            # Converte PDF para markdown via Docling
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                f.write(pdf_bytes)
-                temp_path = f.name
+        collection_prefix = "leis"
 
-            try:
-                doc_result = self.docling_converter.convert(temp_path)
-                markdown_content = doc_result.document.export_to_markdown()
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+        # Coleta todos os matches com texto reconciliado + classificação VLM
+        # Mapeia vlm_element_id → VLMElement para obter classificação
+        vlm_element_map: dict[str, VLMElement] = {}
+        for vlm_page in vlm_artifact.pages:
+            for elem in vlm_page.elements:
+                vlm_element_map[elem.element_id] = elem
 
-            # SpanParser
-            parsed_doc = self.span_parser.parse(markdown_content)
-            logger.info(f"  SpanParser: {len(parsed_doc.spans)} spans")
+        # Computa offsets de página no canonical_text para offsets aproximados
+        page_start_offsets: list[int] = []
+        offset = 0
+        for page_text in self._page_texts:
+            page_start_offsets.append(offset)
+            offset += len(page_text) + 1  # +1 para "\n" entre páginas
 
-            # ArticleOrchestrator (usa LLM)
-            extraction_result = self.orchestrator.extract_all_articles(parsed_doc)
-            logger.info(
-                f"  ArticleOrchestrator: {len(extraction_result.chunks)} artigos "
-                f"({extraction_result.valid_articles} válidos)"
-            )
+        canonical_text = recon_artifact.canonical_text
 
-            # ChunkMaterializer
-            from ..chunking import ChunkMaterializer, ChunkMetadata
-            metadata = ChunkMetadata(
-                schema_version="1.0.0",
-                extractor_version="1.0.0",
-                ingestion_timestamp=datetime.now(timezone.utc).isoformat(),
-                document_hash=hashlib.sha256(pdf_bytes).hexdigest(),
-            )
+        # Para cada match com VLM, gera um ChunkPreview
+        # Agrupa por vlm_element_id (evita duplicatas)
+        seen_element_ids: set[str] = set()
+        all_chunk_data: list[dict] = []
 
-            # Tenta extrair offsets canônicos
-            offsets_map = {}
-            canonical_hash = ""
-            try:
-                from ..chunking.canonical_offsets import (
-                    extract_offsets_from_parsed_doc,
-                    normalize_canonical_text,
+        for recon_page in recon_artifact.pages:
+            for match in recon_page.matches:
+                # Só gera chunk para matches com VLM (tem classificação)
+                if not match.vlm_element_id or match.vlm_element_id in seen_element_ids:
+                    continue
+                if match.match_quality in ("unmatched_vlm",):
+                    continue
+                if not match.text_reconciled.strip():
+                    continue
+
+                seen_element_ids.add(match.vlm_element_id)
+                elem = vlm_element_map.get(match.vlm_element_id)
+                if elem is None:
+                    continue
+
+                # Tipo e span_id
+                device_type_vlm = elem.element_type.lower()
+                device_type_chunk = _DEVICE_TYPE_MAP.get(device_type_vlm, device_type_vlm)
+                identifier = _extract_identifier_from_element(elem)
+                parent_identifier = _extract_parent_identifier(elem, vlm_element_map)
+
+                span_id = _device_to_span_id(
+                    device_type_vlm, identifier, parent_identifier,
                 )
-                offsets_map, canonical_hash = extract_offsets_from_parsed_doc(parsed_doc)
-                canonical_text = normalize_canonical_text(
-                    getattr(parsed_doc, 'source_text', '') or ''
-                )
-            except Exception as e:
-                logger.warning(f"Offsets canônicos não disponíveis: {e}")
-                canonical_text = ""
-
-            materializer = ChunkMaterializer(
-                document_id=document_id,
-                tipo_documento=tipo_documento,
-                numero=numero,
-                ano=ano,
-                metadata=metadata,
-                offsets_map=offsets_map,
-                canonical_hash=canonical_hash,
-                canonical_text=canonical_text,
-            )
-            materialized = materializer.materialize_all(
-                extraction_result.chunks, parsed_doc,
-            )
-            logger.info(f"  ChunkMaterializer: {len(materialized)} chunks")
-
-            # Monta o collection_prefix para o node_id
-            collection_prefix = "leis"
-
-            # Converte para ChunkPreview
-            for chunk in materialized:
-                device_type = getattr(chunk, 'device_type', 'article')
-                if hasattr(device_type, 'value'):
-                    device_type = device_type.value
-                dt_str = str(device_type).lower()
-
-                chunk_level = getattr(chunk, 'chunk_level', 'article')
-                if hasattr(chunk_level, 'value'):
-                    chunk_level = chunk_level.value
-                cl_str = str(chunk_level).lower()
-
-                span_id = getattr(chunk, 'span_id', '')
                 node_id = f"{collection_prefix}:{document_id}#{span_id}"
                 chunk_id = f"{document_id}#{span_id}"
 
-                parent_span_id = getattr(chunk, 'parent_chunk_id', '') or ''
+                # Parent node_id
                 parent_node_id = ""
-                if parent_span_id:
-                    parent_node_id = f"{collection_prefix}:{parent_span_id}"
+                if parent_identifier:
+                    parent_span_id = _parent_to_span_id(parent_identifier)
+                    if parent_span_id:
+                        parent_node_id = f"{collection_prefix}:{document_id}#{parent_span_id}"
 
-                # Offsets canônicos
-                canonical_start = getattr(chunk, 'canonical_start', -1)
-                canonical_end = getattr(chunk, 'canonical_end', -1)
+                # Offsets canônicos (aproximado: busca texto no canonical)
+                canonical_start = -1
+                canonical_end = -1
+                text_snippet = match.text_reconciled[:80]  # Primeiros 80 chars
+                if text_snippet and canonical_text:
+                    pos = canonical_text.find(text_snippet)
+                    if pos >= 0:
+                        canonical_start = pos
+                        canonical_end = pos + len(match.text_reconciled)
 
-                # Conta filhos
-                children_count = sum(
-                    1 for c in materialized
-                    if (getattr(c, 'parent_chunk_id', '') or '') == chunk_id
-                    or (getattr(c, 'parent_chunk_id', '') or '') == f"{document_id}#{span_id}"
-                )
+                # Chunk level
+                chunk_level = "article" if device_type_vlm == "artigo" else "device"
 
-                chunks_preview.append(ChunkPreview(
-                    node_id=node_id,
-                    chunk_id=chunk_id,
-                    parent_node_id=parent_node_id,
-                    span_id=span_id,
-                    device_type=dt_str,
-                    chunk_level=cl_str,
-                    text=chunk.text or "",
-                    canonical_start=canonical_start if canonical_start is not None else -1,
-                    canonical_end=canonical_end if canonical_end is not None else -1,
-                    children_count=children_count,
-                ))
+                # Depth
+                depth = _DEVICE_DEPTH.get(device_type_vlm, 0)
+                max_depth = max(max_depth, depth)
+
+                all_chunk_data.append({
+                    "span_id": span_id,
+                    "node_id": node_id,
+                    "chunk_id": chunk_id,
+                    "parent_node_id": parent_node_id,
+                    "device_type": device_type_chunk,
+                    "chunk_level": chunk_level,
+                    "text": match.text_reconciled,
+                    "canonical_start": canonical_start,
+                    "canonical_end": canonical_end,
+                })
 
                 # Conta por tipo
-                if dt_str == "article":
+                if device_type_vlm == "artigo":
                     articles_count += 1
-                    max_depth = max(max_depth, 1)
-                elif dt_str == "paragraph":
+                elif device_type_vlm == "paragrafo":
                     paragraphs_count += 1
-                    max_depth = max(max_depth, 2)
-                elif dt_str == "inciso":
+                elif device_type_vlm == "inciso":
                     incisos_count += 1
-                    max_depth = max(max_depth, 3)
-                elif dt_str == "alinea":
+                elif device_type_vlm == "alinea":
                     alineas_count += 1
-                    max_depth = max(max_depth, 4)
 
-        except Exception as e:
-            logger.error(f"Erro na fase de chunks preview: {e}", exc_info=True)
+        # Calcula children_count para cada chunk
+        chunk_id_set = {cd["chunk_id"] for cd in all_chunk_data}
+        for cd in all_chunk_data:
+            children_count = sum(
+                1 for other in all_chunk_data
+                if other["parent_node_id"] == cd["node_id"]
+            )
+            chunks_preview.append(ChunkPreview(
+                node_id=cd["node_id"],
+                chunk_id=cd["chunk_id"],
+                parent_node_id=cd["parent_node_id"],
+                span_id=cd["span_id"],
+                device_type=cd["device_type"],
+                chunk_level=cd["chunk_level"],
+                text=cd["text"],
+                canonical_start=cd["canonical_start"],
+                canonical_end=cd["canonical_end"],
+                children_count=children_count,
+            ))
 
         duration_ms = (time.perf_counter() - phase_start) * 1000
         artifact = ChunksPreviewArtifact(
@@ -611,3 +916,158 @@ class InspectionPipeline:
             f"INC={incisos_count}, ALI={alineas_count}) em {duration_ms:.0f}ms"
         )
         return artifact
+
+
+# =============================================================================
+# Funções utilitárias (fora da classe)
+# =============================================================================
+
+
+def _compute_bbox_iou(bbox_a: BBox, bbox_b: BBox) -> float:
+    """
+    Calcula Intersection over Union entre dois bounding boxes.
+
+    Ambos devem estar no mesmo espaço de coordenadas (PDF points).
+    """
+    x_left = max(bbox_a.x0, bbox_b.x0)
+    y_top = max(bbox_a.y0, bbox_b.y0)
+    x_right = min(bbox_a.x1, bbox_b.x1)
+    y_bottom = min(bbox_a.y1, bbox_b.y1)
+
+    if x_right <= x_left or y_bottom <= y_top:
+        return 0.0
+
+    intersection = (x_right - x_left) * (y_bottom - y_top)
+    area_a = max((bbox_a.x1 - bbox_a.x0) * (bbox_a.y1 - bbox_a.y0), 1e-6)
+    area_b = max((bbox_b.x1 - bbox_b.x0) * (bbox_b.y1 - bbox_b.y0), 1e-6)
+    union = area_a + area_b - intersection
+
+    return intersection / union if union > 0 else 0.0
+
+
+def _roman_to_int(s: str) -> int:
+    """Converte numeral romano para inteiro."""
+    roman = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+    s = s.upper().strip()
+    result = 0
+    for i, c in enumerate(s):
+        if c not in roman:
+            try:
+                return int(s)
+            except ValueError:
+                return 0
+        if i + 1 < len(s) and roman.get(c, 0) < roman.get(s[i + 1], 0):
+            result -= roman[c]
+        else:
+            result += roman[c]
+    return result
+
+
+def _extract_identifier_from_element(elem: VLMElement) -> str:
+    """Extrai o identificador textual de um VLMElement."""
+    # O texto do VLM geralmente começa com o identificador
+    # Mas o element_id tem format "tipo_page_idx", não serve
+    # Precisamos extrair do texto
+    text = elem.text.strip()
+    element_type = elem.element_type.lower()
+
+    if element_type == "artigo":
+        match = re.match(r'(Art\.?\s*\d+[º°]?)', text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    elif element_type == "paragrafo":
+        match = re.match(r'(§\s*\d+[º°]?)', text)
+        if match:
+            return match.group(1)
+        if text.lower().startswith("parágrafo único"):
+            return "Parágrafo único"
+    elif element_type == "inciso":
+        match = re.match(r'([IVXLC]+)\s*[-–—.]', text)
+        if match:
+            return match.group(1)
+    elif element_type == "alinea":
+        match = re.match(r'([a-z])\)', text)
+        if match:
+            return match.group(1) + ")"
+
+    # Fallback: primeiros caracteres
+    return text[:20] if text else ""
+
+
+def _extract_parent_identifier(
+    elem: VLMElement,
+    vlm_element_map: dict[str, VLMElement],
+) -> str:
+    """Extrai o identificador textual do pai de um VLMElement."""
+    if not elem.parent_id:
+        return ""
+    # parent_id pode ser um element_id (se resolvido) ou um identifier original
+    parent = vlm_element_map.get(elem.parent_id)
+    if parent:
+        return _extract_identifier_from_element(parent)
+    # Se não encontrou no mapa, parent_id pode ser o identifier original
+    return elem.parent_id
+
+
+def _device_to_span_id(
+    device_type: str,
+    identifier: str,
+    parent_identifier: str,
+) -> str:
+    """
+    Converte tipo + identificador VLM para span_id.
+
+    Formato: ART-005, PAR-005-1, INC-005-III, ALI-005-III-a
+    """
+    dtype = device_type.lower()
+
+    if dtype == "artigo":
+        match = re.search(r"(\d+)", identifier)
+        num = match.group(1) if match else "000"
+        return f"ART-{num.zfill(3)}"
+
+    elif dtype == "paragrafo":
+        match = re.search(r"(\d+)", identifier)
+        num = match.group(1) if match else "0"
+        parent_match = re.search(r"(\d+)", parent_identifier)
+        parent_num = parent_match.group(1) if parent_match else "000"
+        return f"PAR-{parent_num.zfill(3)}-{num}"
+
+    elif dtype == "inciso":
+        parent_match = re.search(r"(\d+)", parent_identifier)
+        parent_num = parent_match.group(1) if parent_match else "000"
+        inc_num = _roman_to_int(identifier.strip().rstrip(").-"))
+        return f"INC-{parent_num.zfill(3)}-{inc_num}"
+
+    elif dtype == "alinea":
+        parent_match = re.search(r"(\d+)", parent_identifier)
+        if parent_match:
+            parent_num = parent_match.group(1).zfill(3)
+        else:
+            parent_num = str(_roman_to_int(parent_identifier.strip()))
+        letter = re.search(r"([a-z])", identifier.lower())
+        letter_str = letter.group(1) if letter else "a"
+        return f"ALI-{parent_num}-{letter_str}"
+
+    return f"DEV-{identifier[:20]}"
+
+
+def _parent_to_span_id(parent_identifier: str) -> str:
+    """Converte parent_identifier para span_id do pai."""
+    ident = parent_identifier.strip()
+    if not ident:
+        return ""
+
+    ident_lower = ident.lower()
+    match = re.search(r"(\d+)", ident)
+    num = match.group(1) if match else "000"
+
+    if ident_lower.startswith("art"):
+        return f"ART-{num.zfill(3)}"
+    elif "§" in ident or ident_lower.startswith("par"):
+        return f"PAR-{num.zfill(3)}-{match.group(1) if match else '0'}"
+    elif re.match(r'^[IVXLC]+$', ident):
+        # Inciso romano — precisa do artigo pai, não disponível aqui
+        return ""
+    else:
+        return f"ART-{num.zfill(3)}"
