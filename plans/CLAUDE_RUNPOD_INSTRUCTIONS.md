@@ -343,10 +343,10 @@ USE_VLM_PIPELINE=true                   # ativa pipeline VLM na ingestao
 |---------|--------|--------|
 | `__init__.py` | ~10 | Pronto |
 | `models.py` | 254 | Pronto — todos os modelos Pydantic |
-| `storage.py` | 284 | Pronto — Redis (temp) + MinIO (permanente) |
+| `storage.py` | ~160 | **LIMPO** — Redis-only, MinIO removido |
 | `page_renderer.py` | ~150 | Pronto — PNG com bboxes coloridos |
 | `pipeline.py` | ~1074 | **REESCRITO** — todas 5 fases implementadas, sem Docling |
-| `approval.py` | ~120 | Pronto — aprovacao Redis -> MinIO |
+| `approval.py` | ~336 | **REESCRITO** — usa InspectionUploader (HTTP POST), sem MinIO direto |
 | `router.py` | 431 | **CORRIGIDO** — task_id + thresholds |
 
 ### Extraction (src/extraction/)
@@ -359,6 +359,13 @@ USE_VLM_PIPELINE=true                   # ativa pipeline VLM na ingestao
 | `pymupdf_extractor.py` | 103 | Pronto — PNG 300 DPI + texto |
 | `vlm_service.py` | 184 | Pronto — orquestrador PyMuPDF -> VLM |
 
+### Sinks (src/sinks/)
+
+| Arquivo | Linhas | Status |
+|---------|--------|--------|
+| `inspection_uploader.py` | ~284 | **NOVO** — POST multipart para VPS /api/v1/inspect/artifacts |
+| `artifacts_uploader.py` | ~314 | Pronto — POST para /api/v1/ingest/artifacts (ingestao) |
+
 ### Planejamento (plans/)
 
 | Arquivo | Descricao |
@@ -366,3 +373,4 @@ USE_VLM_PIPELINE=true                   # ativa pipeline VLM na ingestao
 | `CLAUDE_RUNPOD_INSTRUCTIONS.md` | **ESTE DOCUMENTO** — briefing principal |
 | `TASK-EXTRACTION-PIPELINE-FLOW.md` | Diagrama completo ANTES/DEPOIS do pipeline |
 | `PLAN-VLM-MIGRATION-PHASE2.md` | Plano original da fase 2 (extraction backend) |
+| `VPS_INSTRUCTIONS_INSPECT_ARTIFACTS.md` | Spec do endpoint que a VPS deve implementar |

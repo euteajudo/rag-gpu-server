@@ -124,7 +124,10 @@ class ProcessedChunk(BaseModel):
 
     # VLM: Campos do pipeline Qwen3-VL + PyMuPDF
     page_number: int = Field(-1, description="Página do dispositivo no PDF (-1 se desconhecido)")
-    bbox: list[float] = Field(default_factory=list, description="Bounding box no PDF [x0, y0, x1, y1]")
+    bbox: list[float] = Field(default_factory=list, description="Bounding box em PDF points [x0, y0, x1, y1] (72 DPI)")
+    bbox_img: list[float] = Field(default_factory=list, description="Bounding box normalizada 0-1 (image space, debug)")
+    img_width: int = Field(0, description="Largura do pixmap em pixels")
+    img_height: int = Field(0, description="Altura do pixmap em pixels")
     confidence: float = Field(0.0, description="Confiança do VLM na classificação (0.0-1.0)")
 
     class Config:

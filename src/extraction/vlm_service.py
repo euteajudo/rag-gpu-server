@@ -2,11 +2,11 @@
 VLM Extraction Service - Orquestra a extração VLM de documentos legais.
 
 Pipeline completo:
-1. PyMuPDF: extrai páginas (imagens + texto determinístico)
-2. Qwen3-VL: extrai estrutura de cada página (sequencial, uma por vez)
-3. Concatena canonical_text de todas as páginas
+1. PyMuPDF: extrai páginas (blocos com offsets + imagens)
+2. canonical_text construído pelos blocos durante extração (offsets nativos)
+3. Qwen3-VL: extrai estrutura de cada página (sequencial, uma por vez)
 4. Computa canonical_hash
-5. Retorna DocumentExtraction
+5. Retorna DocumentExtraction com pages_data embutido
 
 O processamento é SEQUENCIAL (uma página por vez) porque:
 - O --max-model-len 8192 do vLLM limita o contexto
@@ -54,9 +54,9 @@ class VLMExtractionService:
         """
         Pipeline completo de extração VLM.
 
-        1. PyMuPDF: extrai páginas (imagens + texto)
-        2. Qwen3-VL: extrai estrutura de cada página (sequencial)
-        3. Concatena canonical_text de todas as páginas
+        1. PyMuPDF: extrai páginas (blocos com offsets + imagens)
+        2. canonical_text construído pelos blocos (offsets nativos)
+        3. Qwen3-VL: extrai estrutura de cada página (sequencial)
         4. Computa canonical_hash
         5. Retorna DocumentExtraction
 
@@ -75,11 +75,11 @@ class VLMExtractionService:
                 except Exception as e:
                     logger.warning(f"Erro no progress_callback: {e}")
 
-        # === Etapa 1: PyMuPDF ===
+        # === Etapa 1: PyMuPDF (blocos + canonical_text) ===
         report("pymupdf_extraction", 0.10)
         logger.info(f"VLM Pipeline: Etapa 1 - Extraindo páginas com PyMuPDF ({document_id})")
 
-        pages_data = self.pymupdf_extractor.extract_pages(pdf_bytes)
+        pages_data, raw_canonical = self.pymupdf_extractor.extract_pages(pdf_bytes)
         total_pages = len(pages_data)
 
         if total_pages == 0:
@@ -90,9 +90,10 @@ class VLMExtractionService:
                 canonical_text="",
                 canonical_hash="",
                 total_devices=0,
+                pages_data=[],
             )
 
-        logger.info(f"PyMuPDF: {total_pages} páginas extraídas")
+        logger.info(f"PyMuPDF: {total_pages} páginas, {len(raw_canonical)} chars")
         report("pymupdf_extraction", 0.20)
 
         # === Etapa 2: Qwen3-VL (sequencial, uma página por vez) ===
@@ -155,15 +156,9 @@ class VLMExtractionService:
 
         report("vlm_extraction", 0.80)
 
-        # === Etapa 3: Construir canonical_text ===
-        logger.info("VLM Pipeline: Etapa 3 - Construindo canonical_text")
+        # === Etapa 3: Normaliza canonical_text e computa hash ===
+        logger.info("VLM Pipeline: Etapa 3 - Normalizando canonical_text")
 
-        # Concatena texto de todas as páginas (texto do PyMuPDF, determinístico)
-        raw_canonical = "\n".join(
-            page_data.text for page_data in pages_data
-        )
-
-        # Normaliza e computa hash
         canonical_text = normalize_canonical_text(raw_canonical)
         canonical_hash = compute_canonical_hash(canonical_text)
 
@@ -181,4 +176,5 @@ class VLMExtractionService:
             canonical_text=canonical_text,
             canonical_hash=canonical_hash,
             total_devices=total_devices,
+            pages_data=pages_data,
         )
