@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from .models import IngestRequest, ProcessedChunk, IngestStatus, IngestError
 from .pipeline import get_pipeline, PipelineResult
-from utils.normalization import normalize_document_id
+from ..utils.normalization import normalize_document_id
 
 logger = logging.getLogger(__name__)
 
