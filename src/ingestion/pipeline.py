@@ -425,6 +425,13 @@ class IngestionPipeline:
 
             chunks = self._vlm_to_processed_chunks(extraction, request, result)
 
+            # Origin Classification — detecta material externo (ex: artigos do CP inseridos)
+            from ..classification.origin_classifier import classify_document
+            chunks = classify_document(chunks, extraction.canonical_text, request.document_id)
+            external_count = sum(1 for c in chunks if c.origin_type == "external")
+            if external_count > 0:
+                logger.info(f"[{request.document_id}] OriginClassifier: {external_count}/{len(chunks)} external")
+
             report_progress("vlm_materialization", 0.88)
 
             # === Embeddings (se não pular) ===
