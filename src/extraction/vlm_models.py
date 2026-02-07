@@ -42,6 +42,14 @@ class PageData:
     char_end: int = 0          # Offset do fim desta página no canonical_text
 
 
+@dataclass
+class BboxSpan:
+    """Segmento geométrico de um dispositivo em uma página."""
+    page_number: int           # 1-indexed
+    bbox_pdf: list[float]      # [x0, y0, x1, y1] PDF points
+    bbox_img: list[float]      # [x0, y0, x1, y1] normalizado 0-1
+
+
 class DeviceExtraction(BaseModel):
     """Um dispositivo legal extraído pelo VLM."""
 
@@ -69,3 +77,4 @@ class DocumentExtraction(BaseModel):
     canonical_hash: str = Field("", description="SHA256 do canonical_text normalizado")
     total_devices: int = Field(0, description="Total de dispositivos extraídos")
     pages_data: list = Field(default_factory=list, description="list[PageData] com blocos e offsets (não serializado)")
+    debug_artifacts: list[dict] = Field(default_factory=list, description="Raw VLM JSON por página (quando debug_artifacts=True)")

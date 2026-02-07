@@ -29,9 +29,13 @@ class Config:
     vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
 
     # VLM Pipeline
-    use_vlm_pipeline: bool = False     # Feature flag: True = PyMuPDF+Qwen3-VL, False = Docling+SpanParser
+    use_vlm_pipeline: bool = True      # Legacy removido, sempre VLM
     vlm_page_dpi: int = 300            # DPI para renderização de páginas
     vlm_max_retries: int = 3           # Retries por página no VLM
+
+    # Pipeline versioning & debug
+    pipeline_version: str = "1.1.0"    # Incrementar em mudanças de normalização/extração
+    debug_artifacts: bool = False      # Salvar raw VLM JSON + resolution_map
 
     # Hardware
     use_fp16: bool = True
@@ -52,9 +56,11 @@ class Config:
             reranker_model=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
             vllm_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8002/v1"),
             vllm_model=os.getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct"),
-            use_vlm_pipeline=os.getenv("USE_VLM_PIPELINE", "false").lower() == "true",
+            use_vlm_pipeline=True,  # Legacy removido, sempre VLM
             vlm_page_dpi=int(os.getenv("VLM_PAGE_DPI", "300")),
             vlm_max_retries=int(os.getenv("VLM_MAX_RETRIES", "3")),
+            pipeline_version=os.getenv("PIPELINE_VERSION", "1.1.0"),
+            debug_artifacts=os.getenv("DEBUG_ARTIFACTS", "false").lower() == "true",
             use_fp16=os.getenv("USE_FP16", "true").lower() == "true",
             device=os.getenv("DEVICE", "cuda"),
             cache_dir=os.getenv("HF_HOME", "/root/.cache/huggingface"),

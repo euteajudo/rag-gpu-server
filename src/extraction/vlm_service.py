@@ -99,7 +99,12 @@ class VLMExtractionService:
         # === Etapa 2: Qwen3-VL (sequencial, uma página por vez) ===
         logger.info(f"VLM Pipeline: Etapa 2 - Extraindo estrutura com Qwen3-VL ({total_pages} páginas)")
 
+        # Check if debug artifacts should be collected
+        from ..config import config as app_config
+        collect_debug = app_config.debug_artifacts
+
         page_extractions: list[PageExtraction] = []
+        debug_artifacts_list: list[dict] = []
         total_devices = 0
 
         for i, page_data in enumerate(pages_data):
@@ -113,6 +118,13 @@ class VLMExtractionService:
                 vlm_result = await self.vlm_client.extract_page(
                     image_base64=page_data.image_base64,
                 )
+
+                # Collect raw VLM response for debug
+                if collect_debug:
+                    debug_artifacts_list.append({
+                        "page_number": page_num,
+                        "raw_response": vlm_result,
+                    })
 
                 # Converte resultado VLM para modelo Pydantic
                 devices = []
@@ -177,4 +189,5 @@ class VLMExtractionService:
             canonical_hash=canonical_hash,
             total_devices=total_devices,
             pages_data=pages_data,
+            debug_artifacts=debug_artifacts_list if collect_debug else [],
         )

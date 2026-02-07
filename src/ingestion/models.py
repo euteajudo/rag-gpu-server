@@ -130,6 +130,13 @@ class ProcessedChunk(BaseModel):
     img_height: int = Field(0, description="Altura do pixmap em pixels")
     confidence: float = Field(0.0, description="Confiança do VLM na classificação (0.0-1.0)")
 
+    # Cross-page
+    is_cross_page: bool = Field(False, description="True se dispositivo cruza páginas")
+    bbox_spans: list[dict] = Field(
+        default_factory=list,
+        description="Segmentos geométricos por página [{page_number, bbox_pdf, bbox_img}, ...]"
+    )
+
     class Config:
         json_schema_extra = {
             "example": {

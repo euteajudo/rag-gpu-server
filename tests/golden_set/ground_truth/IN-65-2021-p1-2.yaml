@@ -1,0 +1,22 @@
+document_id: "IN-65-2021"
+tipo_documento: "IN"
+numero: "65"
+ano: 2021
+description: "Instrução Normativa TCU - páginas 1 a 2"
+expected_devices:
+  - span_id: "ART-001"
+    device_type: "article"
+    text_prefix: "Art. 1"
+    page: 1
+  - span_id: "ART-002"
+    device_type: "article"
+    text_prefix: "Art. 2"
+    page: 1
+  - span_id: "PAR-001-1"
+    device_type: "paragraph"
+    parent_span_id: "ART-001"
+    text_prefix: "§ 1"
+    page: 1
+invariants:
+  min_articles: 2
+  all_evidence_must_have_offsets: true

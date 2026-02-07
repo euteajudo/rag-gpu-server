@@ -335,7 +335,6 @@ class HealthResponse(BaseModel):
     status: str
     embedder: dict
     reranker: dict
-    docling: dict
     uptime_seconds: float
 
 
@@ -353,9 +352,7 @@ async def lifespan(app: FastAPI):
     global EMBED_COLLECTOR, RERANK_COLLECTOR
 
     logger.info("=== RAG GPU Server iniciando ===")
-    logger.info(
-        f"Pipeline: {'VLM (Qwen3-VL + PyMuPDF)' if config.use_vlm_pipeline else 'Legado (Docling + SpanParser)'}"
-    )
+    logger.info(f"Pipeline: VLM (Qwen3-VL + PyMuPDF)")
     logger.info(f"Embedding model: {config.embedding_model}")
     logger.info(f"Reranker model: {config.reranker_model}")
     logger.info(f"Device: {config.device}")
@@ -370,15 +367,6 @@ async def lifespan(app: FastAPI):
     logger.info("Pre-carregando reranker...")
     reranker = get_reranker()
     reranker._ensure_loaded()
-
-    # Pre-carrega Docling (modelos de layout e table structure na GPU)
-    logger.info("Pre-carregando Docling...")
-    try:
-        pipeline = get_pipeline()
-        docling_warmup = pipeline.warmup()
-        logger.info(f"Docling warmup: {docling_warmup}")
-    except Exception as e:
-        logger.warning(f"Docling warmup falhou (continuando sem pre-carga): {e}")
 
     logger.info("=== Modelos carregados! ===")
 
@@ -575,27 +563,19 @@ async def health():
         """Executa health checks (sync - roda em thread)."""
         embedder = get_embedder()
         reranker = get_reranker()
-        pipeline = get_pipeline()
 
         embedder_health = embedder.health_check()
         reranker_health = reranker.health_check()
 
-        docling_health = {
-            "status": "online" if pipeline.is_warmed_up() else "cold",
-            "warmed_up": pipeline.is_warmed_up(),
-        }
-
         all_online = (
             embedder_health.get("status") == "online"
             and reranker_health.get("status") == "online"
-            and docling_health.get("status") == "online"
         )
 
         return {
             "status": "healthy" if all_online else "degraded",
             "embedder": embedder_health,
             "reranker": reranker_health,
-            "docling": docling_health,
         }
 
     # Executa em thread para nao bloquear
@@ -605,7 +585,6 @@ async def health():
         status=result["status"],
         embedder=result["embedder"],
         reranker=result["reranker"],
-        docling=result["docling"],
         uptime_seconds=round(time.time() - _start_time, 2),
     )
 

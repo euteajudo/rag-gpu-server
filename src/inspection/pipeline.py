@@ -196,7 +196,7 @@ class InspectionPipeline:
             # Fase 4: Integridade — valida a extração
             report("integrity", 0.72)
             integrity_artifact = self._phase_integrity(
-                task_id, recon_artifact,
+                task_id, recon_artifact, vlm_artifact, pymupdf_artifact,
             )
             report("integrity", 0.80)
 
@@ -653,6 +653,8 @@ class InspectionPipeline:
         self,
         task_id: str,
         recon_artifact: ReconciliationArtifact,
+        vlm_artifact: Optional[VLMArtifact] = None,
+        pymupdf_artifact: Optional[PyMuPDFArtifact] = None,
     ) -> IntegrityArtifact:
         """Executa validações de integridade no texto extraído."""
         phase_start = time.perf_counter()
@@ -719,6 +721,44 @@ class InspectionPipeline:
             },
         ))
 
+        # =====================================================================
+        # NEW: 5 geometric-textual checks (Feature IV)
+        # =====================================================================
+
+        # Collect all matches for new checks
+        all_matches = []
+        for page in recon_artifact.pages:
+            all_matches.extend(page.matches)
+
+        # Collect all VLM elements for hierarchy checks
+        all_vlm_elements: dict[str, VLMElement] = {}
+        if vlm_artifact:
+            for vlm_page in vlm_artifact.pages:
+                for elem in vlm_page.elements:
+                    all_vlm_elements[elem.element_id] = elem
+
+        # Check 6: bbox_text_coherence
+        # For exact/partial matches: Jaccard of words between text_vlm and text_pymupdf >= 0.3
+        checks.append(self._check_bbox_text_coherence(all_matches))
+
+        # Check 7: bbox_containment
+        # Child bbox geometrically contained in parent bbox (overlap >= 50%)
+        checks.append(self._check_bbox_containment(all_vlm_elements))
+
+        # Check 8: offset_coverage
+        # Proportion of matched devices that produce valid offset via find() in canonical
+        checks.append(self._check_offset_coverage(all_matches, canonical))
+
+        # Check 9: hierarchy_consistency
+        # Child type depth > parent type depth
+        checks.append(self._check_hierarchy_consistency(all_vlm_elements))
+
+        # Check 10: cross_page_continuity
+        # Articles in consecutive pages: page gap <= 1
+        checks.append(self._check_cross_page_continuity(all_vlm_elements))
+
+        # =====================================================================
+
         if not has_articles:
             warnings.append("Nenhum artigo detectado — documento pode não ser legislação")
         if not has_vlm_matches:
@@ -748,6 +788,221 @@ class InspectionPipeline:
             f"score={overall_score:.2f} em {duration_ms:.0f}ms"
         )
         return artifact
+
+    # =========================================================================
+    # IntegrityValidator — 5 geometric-textual checks
+    # =========================================================================
+
+    @staticmethod
+    def _check_bbox_text_coherence(
+        matches: list[ReconciliationMatch],
+    ) -> IntegrityCheck:
+        """
+        Check 6: bbox_text_coherence.
+        For exact/partial matches: Jaccard of words between text_vlm and
+        text_pymupdf (both normalized) >= 0.3.
+        Passes if <= 10% of matches fail.
+        """
+        from ..utils.matching_normalization import normalize_for_matching
+
+        total = 0
+        failures = 0
+        for match in matches:
+            if match.match_quality not in ("exact", "partial"):
+                continue
+            if not match.text_vlm.strip() or not match.text_pymupdf.strip():
+                continue
+
+            total += 1
+            norm_vlm = normalize_for_matching(match.text_vlm)
+            norm_pymupdf = normalize_for_matching(match.text_pymupdf)
+            words_vlm = set(norm_vlm.split())
+            words_pymupdf = set(norm_pymupdf.split())
+            union = words_vlm | words_pymupdf
+            if not union:
+                continue
+            jaccard = len(words_vlm & words_pymupdf) / len(union)
+            if jaccard < 0.3:
+                failures += 1
+
+        if total == 0:
+            return IntegrityCheck(
+                check_name="bbox_text_coherence",
+                passed=True,
+                message="Nenhum match exact/partial para avaliar coerência textual",
+                details={"total": 0, "failures": 0},
+            )
+
+        failure_rate = failures / total
+        passed = failure_rate <= 0.1
+        return IntegrityCheck(
+            check_name="bbox_text_coherence",
+            passed=passed,
+            message=f"Coerência textual: {failures}/{total} failures ({failure_rate:.1%})"
+                    if not passed
+                    else f"Coerência textual OK: {total - failures}/{total} matches coerentes",
+            details={"total": total, "failures": failures, "failure_rate": round(failure_rate, 4)},
+        )
+
+    @staticmethod
+    def _check_bbox_containment(
+        vlm_elements: dict[str, "VLMElement"],
+    ) -> IntegrityCheck:
+        """
+        Check 7: bbox_containment.
+        Child bbox geometrically contained in parent bbox (overlap >= 50% of child area).
+        """
+        violations = 0
+        total_pairs = 0
+
+        for elem in vlm_elements.values():
+            if not elem.parent_id or elem.parent_id not in vlm_elements:
+                continue
+            parent = vlm_elements[elem.parent_id]
+            if elem.bbox is None or parent.bbox is None:
+                continue
+
+            total_pairs += 1
+            child_area = max(
+                (elem.bbox.x1 - elem.bbox.x0) * (elem.bbox.y1 - elem.bbox.y0),
+                1e-6,
+            )
+            # Intersection
+            x_left = max(elem.bbox.x0, parent.bbox.x0)
+            y_top = max(elem.bbox.y0, parent.bbox.y0)
+            x_right = min(elem.bbox.x1, parent.bbox.x1)
+            y_bottom = min(elem.bbox.y1, parent.bbox.y1)
+
+            if x_right > x_left and y_bottom > y_top:
+                intersection = (x_right - x_left) * (y_bottom - y_top)
+            else:
+                intersection = 0.0
+
+            containment = intersection / child_area
+            if containment < 0.5:
+                violations += 1
+
+        return IntegrityCheck(
+            check_name="bbox_containment",
+            passed=violations == 0,
+            message=f"Contenção bbox: {violations} violações em {total_pairs} pares"
+                    if violations > 0
+                    else f"Contenção bbox OK: {total_pairs} pares validados",
+            details={"total_pairs": total_pairs, "violations": violations},
+        )
+
+    @staticmethod
+    def _check_offset_coverage(
+        matches: list[ReconciliationMatch],
+        canonical: str,
+    ) -> IntegrityCheck:
+        """
+        Check 8: offset_coverage.
+        Proportion of matched devices that produce valid offset via find() >= 80%.
+        """
+        total = 0
+        has_offset = 0
+
+        for match in matches:
+            if match.match_quality in ("unmatched_vlm", "unmatched_pymupdf"):
+                continue
+            text = match.text_reconciled.strip()
+            if not text:
+                continue
+
+            total += 1
+            if canonical.find(text) >= 0:
+                has_offset += 1
+
+        if total == 0:
+            return IntegrityCheck(
+                check_name="offset_coverage",
+                passed=True,
+                message="Nenhum match para avaliar cobertura de offsets",
+                details={"total": 0, "has_offset": 0},
+            )
+
+        rate = has_offset / total
+        passed = rate >= 0.8
+        return IntegrityCheck(
+            check_name="offset_coverage",
+            passed=passed,
+            message=f"Cobertura de offsets: {has_offset}/{total} ({rate:.1%})",
+            details={"total": total, "has_offset": has_offset, "rate": round(rate, 4)},
+        )
+
+    @staticmethod
+    def _check_hierarchy_consistency(
+        vlm_elements: dict[str, "VLMElement"],
+    ) -> IntegrityCheck:
+        """
+        Check 9: hierarchy_consistency.
+        Child type depth > parent type depth.
+        """
+        violations = 0
+        total_pairs = 0
+
+        for elem in vlm_elements.values():
+            if not elem.parent_id or elem.parent_id not in vlm_elements:
+                continue
+            parent = vlm_elements[elem.parent_id]
+
+            child_depth = _DEVICE_DEPTH.get(elem.element_type.lower(), 0)
+            parent_depth = _DEVICE_DEPTH.get(parent.element_type.lower(), 0)
+
+            if child_depth == 0 or parent_depth == 0:
+                continue
+
+            total_pairs += 1
+            if child_depth <= parent_depth:
+                violations += 1
+
+        return IntegrityCheck(
+            check_name="hierarchy_consistency",
+            passed=violations == 0,
+            message=f"Hierarquia: {violations} violações (filho com depth <= pai)"
+                    if violations > 0
+                    else f"Hierarquia OK: {total_pairs} pares validados",
+            details={"total_pairs": total_pairs, "violations": violations},
+        )
+
+    @staticmethod
+    def _check_cross_page_continuity(
+        vlm_elements: dict[str, "VLMElement"],
+    ) -> IntegrityCheck:
+        """
+        Check 10: cross_page_continuity.
+        Articles in consecutive pages: gap of page <= 1.
+        """
+        # Collect article pages sorted
+        article_pages = sorted([
+            elem.page
+            for elem in vlm_elements.values()
+            if elem.element_type.lower() == "artigo"
+        ])
+
+        if len(article_pages) <= 1:
+            return IntegrityCheck(
+                check_name="cross_page_continuity",
+                passed=True,
+                message="Menos de 2 artigos — continuidade não aplicável",
+                details={"article_count": len(article_pages)},
+            )
+
+        violations = 0
+        for i in range(1, len(article_pages)):
+            gap = article_pages[i] - article_pages[i - 1]
+            if gap > 1:
+                violations += 1
+
+        return IntegrityCheck(
+            check_name="cross_page_continuity",
+            passed=violations == 0,
+            message=f"Continuidade: {violations} gaps > 1 página entre artigos"
+                    if violations > 0
+                    else f"Continuidade OK: artigos em {len(set(article_pages))} páginas consecutivas",
+            details={"article_count": len(article_pages), "violations": violations},
+        )
 
     # =========================================================================
     # Fase 5: Chunks — Preview dos chunks que seriam criados

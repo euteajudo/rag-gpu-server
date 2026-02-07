@@ -1,0 +1,36 @@
+document_id: "LEI-14133-2021"
+tipo_documento: "LEI"
+numero: "14.133"
+ano: 2021
+description: "Lei de Licitações e Contratos - páginas 1 a 3"
+expected_devices:
+  - span_id: "ART-001"
+    device_type: "article"
+    text_prefix: "Art. 1"
+    page: 1
+  - span_id: "ART-002"
+    device_type: "article"
+    text_prefix: "Art. 2"
+    page: 1
+  - span_id: "ART-003"
+    device_type: "article"
+    text_prefix: "Art. 3"
+    page: 1
+  - span_id: "PAR-001-1"
+    device_type: "paragraph"
+    parent_span_id: "ART-001"
+    text_prefix: "Parágrafo único"
+    page: 1
+  - span_id: "INC-002-1"
+    device_type: "inciso"
+    parent_span_id: "ART-002"
+    text_prefix: "I"
+    page: 1
+  - span_id: "INC-002-2"
+    device_type: "inciso"
+    parent_span_id: "ART-002"
+    text_prefix: "II"
+    page: 1
+invariants:
+  min_articles: 3
+  all_evidence_must_have_offsets: true

@@ -148,6 +148,8 @@ class ArtifactsUploader:
         canonical_md: str,
         offsets_json: Dict[str, Any],
         metadata: ArtifactMetadata,
+        vlm_debug_json: Optional[bytes] = None,
+        resolution_map_json: Optional[bytes] = None,
     ) -> ArtifactUploadResult:
         """
         Faz upload dos artifacts para a VPS.
@@ -186,6 +188,12 @@ class ArtifactsUploader:
             "canonical_md_file": ("canonical.md", canonical_md.encode("utf-8"), "text/markdown"),
             "offsets_json_file": ("offsets.json", json.dumps(offsets_payload, ensure_ascii=False).encode("utf-8"), "application/json"),
         }
+
+        # Debug artifacts (optional)
+        if vlm_debug_json:
+            files["vlm_debug_file"] = ("vlm_debug.json", vlm_debug_json, "application/json")
+        if resolution_map_json:
+            files["resolution_map_file"] = ("resolution_map.json", resolution_map_json, "application/json")
 
         # Prepara form data com metadados
         form_data = {

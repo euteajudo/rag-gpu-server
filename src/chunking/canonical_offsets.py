@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Canonical Offsets - Extração de offsets do ParsedDocument (PR13).
+Canonical Offsets — utilities para resolução de offsets (PR13).
 
-Este módulo extrai os offsets (start_pos, end_pos) de cada span
-do ParsedDocument, permitindo slicing puro sem find().
+Re-exporta funções de canonical_utils e fornece resolve_child_offsets()
+para resolução determinística de offsets de filhos dentro do range do pai.
 
 Princípio PR13:
 ==============
@@ -11,23 +11,6 @@ Princípio PR13:
         → usa slicing puro: canonical_text[start:end]
     Caso contrário:
         → fallback best-effort via find()
-
-Uso:
-====
-    from chunking.canonical_offsets import extract_offsets_from_parsed_doc
-
-    # Após SpanParser
-    parsed_doc = span_parser.parse(markdown)
-
-    # Extrai offsets
-    offsets_map, canonical_hash = extract_offsets_from_parsed_doc(parsed_doc)
-
-    # Passa para ChunkMaterializer
-    materializer = ChunkMaterializer(
-        document_id=...,
-        offsets_map=offsets_map,
-        canonical_hash=canonical_hash,
-    )
 """
 
 import logging
@@ -51,62 +34,6 @@ except (ImportError, SystemError):
     )
 
 logger = logging.getLogger(__name__)
-
-
-def extract_offsets_from_parsed_doc(
-    parsed_doc,  # ParsedDocument
-) -> Tuple[Dict[str, Tuple[int, int]], str]:
-    """
-    Extrai offsets de todos os spans de um ParsedDocument.
-
-    Cada span do ParsedDocument tem start_pos e end_pos que indicam
-    a posição no texto fonte. Esta função coleta esses offsets
-    e computa o hash do source_text para validação anti-mismatch.
-
-    Args:
-        parsed_doc: ParsedDocument com spans parseados
-
-    Returns:
-        Tupla (offsets_map, canonical_hash) onde:
-        - offsets_map: dict[span_id, (start_pos, end_pos)]
-        - canonical_hash: SHA256 do source_text normalizado
-    """
-    offsets_map: Dict[str, Tuple[int, int]] = {}
-
-    # Extrai offsets de cada span
-    # IMPORTANTE: offsets_map usa SEMPRE end_pos (structural range) para validação de hierarquia.
-    # O caput_end_pos é acessado diretamente do span quando necessário para indexação.
-    for span in parsed_doc.spans:
-        # Verifica se o span tem offsets válidos
-        # NOTA: Não usar "or -1" pois start_pos=0 é válido (início do documento)
-        start = getattr(span, 'start_pos', -1)
-        if start is None:
-            start = -1
-
-        end = getattr(span, 'end_pos', -1)
-        if end is None:
-            end = -1
-
-        # Usa SEMPRE end_pos (structural range) para offsets_map
-        # Isso garante que filhos estejam dentro do range do pai na validação de hierarquia
-        # Para artigos, caput_end_pos é acessado diretamente do span para indexação
-        if start >= 0 and end > start:
-            offsets_map[span.span_id] = (start, end)
-        else:
-            # Log span sem offsets válidos (não crítico)
-            logger.debug(f"Span {span.span_id} sem offsets válidos: start={start}, end={end}")
-
-    # Computa hash do source_text normalizado
-    source_text = getattr(parsed_doc, 'source_text', '') or ''
-    normalized_text = normalize_canonical_text(source_text)
-    canonical_hash = compute_canonical_hash(normalized_text) if normalized_text else ""
-
-    logger.info(
-        f"Extraídos offsets de {len(offsets_map)} spans. "
-        f"Hash: {canonical_hash[:16]}..."
-    )
-
-    return offsets_map, canonical_hash
 
 
 def extract_snippet_by_offsets(

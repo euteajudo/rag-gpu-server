@@ -94,8 +94,6 @@ def _set_task_result(task_id: str, result: PipelineResult):
                 "total_time_seconds": result.total_time_seconds,
                 "chunks": [c.model_dump() for c in result.chunks],
                 "document_hash": result.document_hash,
-                # Validacao de artigos (Fase Docling)
-                "validation_docling": result.validation_docling,
             }
 
 
@@ -139,7 +137,6 @@ class IngestResponse(BaseModel):
     total_time_seconds: float = 0.0
     chunks: List[dict] = []
     document_hash: str = ""
-    validation_docling: Optional[dict] = None
 
 
 def _background_process(task_id: str, pdf_content: bytes, request: IngestRequest):
@@ -335,9 +332,7 @@ async def ingest_health():
         pipeline = get_pipeline()
         return {
             "status": "healthy",
-            "docling_loaded": pipeline._docling_converter is not None,
-            "span_parser_loaded": pipeline._span_parser is not None,
-            "llm_client_loaded": pipeline._llm_client is not None,
+            "vlm_service_loaded": pipeline._vlm_service is not None,
             "embedder_loaded": pipeline._embedder is not None,
         }
 
