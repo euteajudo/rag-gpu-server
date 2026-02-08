@@ -80,21 +80,28 @@ class VLMClient:
         self.model = model
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self._client = httpx.AsyncClient(
-            base_url=base_url,
-            timeout=timeout,
-            headers={
-                "Content-Type": "application/json",
-            },
-        )
+        self._timeout = timeout
+        self._client = self._make_client()
         logger.info(f"VLMClient inicializado: {base_url} (model={model})")
+
+    def _make_client(self) -> httpx.AsyncClient:
+        """Cria um httpx.AsyncClient novo (desvinculado de event loops anteriores)."""
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self._timeout,
+            headers={"Content-Type": "application/json"},
+        )
+
+    def reset_client(self) -> None:
+        """Recria o httpx.AsyncClient para uso em um novo event loop."""
+        self._client = self._make_client()
 
     async def extract_page(
         self,
         image_base64: str,
         prompt: Optional[str] = None,
         temperature: float = 0.0,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
     ) -> dict:
         """
         Envia imagem de uma página + prompt ao Qwen3-VL e retorna JSON.

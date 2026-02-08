@@ -348,41 +348,19 @@ class IngestionPipeline:
         phase_start = time.perf_counter()
 
         try:
-            # Roda o pipeline VLM assíncrono no event loop
+            from ..config import config as app_config
+            # Roda o pipeline VLM assíncrono em um event loop limpo.
             # O process() é chamado de um thread background, então
-            # precisamos criar/obter um event loop
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Estamos em um thread com event loop rodando
-                    # Cria um novo loop para este thread
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        extraction = pool.submit(
-                            asyncio.run,
-                            self.vlm_service.extract_document(
-                                pdf_bytes=pdf_content,
-                                document_id=request.document_id,
-                                progress_callback=report_progress,
-                            ),
-                        ).result()
-                else:
-                    extraction = loop.run_until_complete(
-                        self.vlm_service.extract_document(
-                            pdf_bytes=pdf_content,
-                            document_id=request.document_id,
-                            progress_callback=report_progress,
-                        )
-                    )
-            except RuntimeError:
-                # Nenhum event loop — cria um novo
-                extraction = asyncio.run(
-                    self.vlm_service.extract_document(
-                        pdf_bytes=pdf_content,
-                        document_id=request.document_id,
-                        progress_callback=report_progress,
-                    )
+            # criamos sempre um loop novo para evitar "Event loop is closed"
+            # quando o httpx.AsyncClient tenta reusar um loop fechado.
+            self.vlm_service.vlm_client.reset_client()
+            extraction = asyncio.run(
+                self.vlm_service.extract_document(
+                    pdf_bytes=pdf_content,
+                    document_id=request.document_id,
+                    progress_callback=report_progress,
                 )
+            )
 
             report_progress("vlm_extraction", 0.80)
 
@@ -424,6 +402,26 @@ class IngestionPipeline:
             report_progress("vlm_materialization", 0.80)
 
             chunks = self._vlm_to_processed_chunks(extraction, request, result)
+
+            # === Canonical text swap (F1) ===
+            # Para chunks com offsets resolvidos, substituir o texto VLM (que pode
+            # conter conteúdo de dispositivos adjacentes) pelo slice exato do
+            # canonical_text do PyMuPDF. O texto VLM original já está preservado
+            # em extraction.debug_artifacts.
+            canonical_text = extraction.canonical_text
+            swap_count = 0
+            for chunk in chunks:
+                if chunk.canonical_start >= 0 and chunk.canonical_end > chunk.canonical_start:
+                    canon_slice = canonical_text[chunk.canonical_start:chunk.canonical_end]
+                    if canon_slice.strip():
+                        chunk.text = canon_slice
+                        chunk.retrieval_text = canon_slice
+                        swap_count += 1
+            if swap_count > 0:
+                logger.info(
+                    f"[{request.document_id}] Canonical text swap: "
+                    f"{swap_count}/{len(chunks)} chunks"
+                )
 
             # Origin Classification — detecta material externo (ex: artigos do CP inseridos)
             from ..classification.origin_classifier import classify_document
@@ -528,6 +526,15 @@ class IngestionPipeline:
             pix_h = page_data.img_height if page_data else 0
 
             for device in page.devices:
+                # Filhos sem parent_identifier são lixo do VLM (ementa/preâmbulo
+                # classificados como parágrafo). Dropar antes de criar chunk.
+                if device.device_type in ("paragrafo", "inciso", "alinea") and not device.parent_identifier:
+                    logger.debug(
+                        f"Dropping orphan {device.device_type} sem parent: "
+                        f"page={page.page_number}, text={device.text[:60]!r}"
+                    )
+                    continue
+
                 # Gera span_id baseado no tipo e identificador
                 span_id = self._device_to_span_id(device)
 
@@ -565,7 +572,17 @@ class IngestionPipeline:
                 )
 
                 # Conversão de coordenadas: image space → PDF space
-                bbox_img = device.bbox  # normalizado 0-1, como o VLM retornou
+                # O VLM pode retornar bbox em pixel absoluto OU 0-1 normalizado.
+                # Se qualquer coordenada > 1.0, são pixels → normalizar por img dims.
+                bbox_img = list(device.bbox) if device.bbox else []
+                if bbox_img and len(bbox_img) == 4 and pix_w > 0 and pix_h > 0:
+                    if any(v > 1.0 for v in bbox_img):
+                        bbox_img = [
+                            bbox_img[0] / pix_w,
+                            bbox_img[1] / pix_h,
+                            bbox_img[2] / pix_w,
+                            bbox_img[3] / pix_h,
+                        ]
                 bbox_pdf = image_bbox_to_pdf_bbox(bbox_img, page_width, page_height) if bbox_img else []
 
                 pc = ProcessedChunk(
@@ -870,6 +887,56 @@ class IngestionPipeline:
                            and c.device_type in ("paragraph", "inciso", "alinea")]
         child_resolved = 0
 
+        # Monta lista ordenada de inícios de artigos para expandir parent_end
+        # O range de um artigo vai do seu start até o start do próximo artigo
+        art_starts = sorted(
+            (start, span_id)
+            for span_id, (start, end) in resolved.items()
+            if span_id.startswith("ART-")
+        )
+
+        # Regex fallback: localiza "Art. Nº" no canonical_text
+        _RE_ART_HEADER = re.compile(r"Art\.\s+\d+[º°]?\s")
+
+        # C4: Prefix-anchored + structural delimiter + similarity validation
+        # Quando C3 falha (VLM text difere do canonical no meio do texto),
+        # ancoramos start pelo prefixo normalizado e end pelo próximo
+        # delimitador estrutural. Validamos com similaridade.
+        _C4_PREFIX_LEN = 30
+        _C4_SIMILARITY_THRESHOLD = 0.80
+        _RE_STRUCTURAL_DELIM = re.compile(
+            r'(?:^|\n)\s*(?:'
+            r'(?:[IVXLCDM]+|[0-9]+)\s*[-\u2013\u2014]\s+'   # inciso
+            r'|[a-z]\)\s+'                                     # alínea
+            r'|\u00a7\s*\d+'                                   # § parágrafo
+            r'|Par[aá]grafo\s+[uú]nico'                        # parágrafo único
+            r'|Art\.\s+\d+'                                    # artigo
+            r')',
+            re.MULTILINE,
+        )
+
+        def _expanded_parent_end(parent_start: int, parent_end: int) -> int:
+            """Expande parent_end até o início do próximo artigo.
+
+            O range resolvido de um artigo cobre apenas seu cabeçalho
+            (ex: 'Art. 2º ... considera-se:'). Os filhos (§, incisos, alíneas)
+            estão posicionados DEPOIS do cabeçalho no canonical_text.
+            Expandimos até o próximo artigo para incluí-los na busca.
+
+            Estratégia em 2 camadas:
+            1. Próximo artigo resolvido em `art_starts`
+            2. Fallback regex: busca 'Art. Nº' no canonical_text após parent_end
+            """
+            # Camada 1: próximo artigo já resolvido
+            for art_start, _ in art_starts:
+                if art_start > parent_start:
+                    return art_start
+            # Camada 2: regex no canonical_text (cobre artigos não resolvidos)
+            m = _RE_ART_HEADER.search(canonical_text, pos=parent_end)
+            if m:
+                return m.start()
+            return len(canonical_text)
+
         for child in still_unresolved:
             child_text = child.text.strip()
             if not child_text:
@@ -896,6 +963,9 @@ class IngestionPipeline:
 
             if parent_start < 0 or parent_end <= parent_start:
                 continue
+
+            # Expande parent_end para cobrir filhos (§, incisos, alíneas)
+            parent_end = _expanded_parent_end(parent_start, parent_end)
 
             # resolve_child_offsets() dentro do range do pai
             try:
@@ -949,9 +1019,68 @@ class IngestionPipeline:
                     logger.debug(f"Offset {child.span_id}: C3 normalized [{abs_start}:{abs_end}]")
                     continue
 
+            # =============================================================
+            # Fallback C4: prefix-anchored start + structural delimiter end
+            # + similarity validation (SequenceMatcher)
+            # =============================================================
+            from difflib import SequenceMatcher
+            c4_accepted = False
+            if norm_child and norm_parent and len(norm_child) >= _C4_PREFIX_LEN:
+                prefix = norm_child[:_C4_PREFIX_LEN]
+                prefix_pos = norm_parent.find(prefix)
+                if prefix_pos >= 0 and prefix_pos < len(norm2orig_parent):
+                    # Ancora start no canonical_text
+                    orig_rel_start = norm2orig_parent[prefix_pos]
+                    abs_start = parent_start + orig_rel_start
+
+                    # Busca próximo delimitador estrutural após start+20
+                    search_from = abs_start + 20
+                    delim_match = _RE_STRUCTURAL_DELIM.search(
+                        canonical_text, pos=search_from, endpos=parent_end,
+                    )
+                    abs_end = delim_match.start() if delim_match else parent_end
+
+                    # Trim trailing whitespace do snippet
+                    candidate = canonical_text[abs_start:abs_end].rstrip()
+                    abs_end = abs_start + len(candidate)
+
+                    # Similaridade entre candidato normalizado e VLM text
+                    norm_candidate = normalize_for_matching(candidate)
+                    similarity = SequenceMatcher(
+                        None, norm_candidate, norm_child,
+                    ).ratio()
+
+                    logger.info(
+                        f"[{document_id}] {child.span_id} C4: "
+                        f"prefix@{prefix_pos}, [{abs_start}:{abs_end}], "
+                        f"sim={similarity:.3f}"
+                    )
+
+                    if similarity >= _C4_SIMILARITY_THRESHOLD:
+                        resolved[child.span_id] = (abs_start, abs_end)
+                        resolution_phases[child.span_id] = "C4_prefix_delim"
+                        child_resolved += 1
+                        c4_accepted = True
+                    else:
+                        # C4 rejeitado — log vlm_text + candidate para análise
+                        logger.warning(
+                            f"[{document_id}] {child.span_id} C4 REJECTED "
+                            f"sim={similarity:.3f}<{_C4_SIMILARITY_THRESHOLD}"
+                        )
+                        logger.warning(
+                            f"  vlm[:100]={norm_child[:100]!r}"
+                        )
+                        logger.warning(
+                            f"  can[:100]={norm_candidate[:100]!r}"
+                        )
+
+            if c4_accepted:
+                continue
+
+            # Não resolvido em nenhuma fase — mantém sentinela
             logger.warning(
-                f"[{document_id}] {child.span_id} ({child.device_type}) não resolvido — "
-                f"offset sentinela"
+                f"[{document_id}] {child.span_id} ({child.device_type}) "
+                f"não resolvido — offset sentinela"
             )
 
         if child_resolved > 0:
@@ -968,6 +1097,49 @@ class IngestionPipeline:
                 chunk.canonical_end = end
                 chunk.canonical_hash = canonical_hash
                 resolved_count += 1
+            else:
+                # Sentinela: limpa hash para manter trio coerente [-1, -1, ""]
+                chunk.canonical_hash = ""
+
+        # =====================================================================
+        # Sibling overlap trim (F2)
+        # Chunks irmãos (mesmo parent_node_id) não devem ter offsets sobrepostos.
+        # Se VLM retornou text contendo dispositivos adjacentes, os offsets
+        # resolvidos podem se sobrepor. Trimmamos curr.canonical_end para
+        # não ultrapassar next.canonical_start.
+        # =====================================================================
+        from collections import defaultdict
+        sibling_groups: Dict[str, list] = defaultdict(list)
+        for chunk in chunks:
+            if chunk.canonical_start >= 0 and chunk.parent_node_id:
+                sibling_groups[chunk.parent_node_id].append(chunk)
+
+        overlap_trimmed = 0
+        for parent_id, siblings in sibling_groups.items():
+            siblings.sort(key=lambda c: c.canonical_start)
+            for i in range(len(siblings) - 1):
+                curr = siblings[i]
+                nxt = siblings[i + 1]
+                if curr.canonical_end > nxt.canonical_start:
+                    new_end = nxt.canonical_start
+                    if new_end <= curr.canonical_start:
+                        # Trim degenerado — reseta para sentinela
+                        curr.canonical_start = -1
+                        curr.canonical_end = -1
+                        curr.canonical_hash = ""
+                        resolved_count -= 1
+                        logger.warning(
+                            f"[{document_id}] Overlap trim degenerado: "
+                            f"{curr.span_id} resetado para sentinela"
+                        )
+                    else:
+                        curr.canonical_end = new_end
+                        overlap_trimmed += 1
+
+        if overlap_trimmed > 0:
+            logger.info(
+                f"[{document_id}] Sibling overlap trim: {overlap_trimmed} chunks"
+            )
 
         # --- Per-phase fallback rate instrumentation ---
         total = len(chunks) or 1
@@ -980,7 +1152,8 @@ class IngestionPipeline:
         # Build rate string: "A_bbox=30(60.0%) B_find=8(16.0%) ..."
         rate_parts = []
         for phase_name in ["A_bbox", "B_find", "B_find_ws", "B_normalized",
-                           "C_parent", "C_parent_ws", "C_normalized", "sentinel"]:
+                           "C_parent", "C_parent_ws", "C_normalized",
+                           "C4_prefix_delim", "sentinel"]:
             count = phase_counts.get(phase_name, 0)
             if count > 0:
                 pct = 100.0 * count / total

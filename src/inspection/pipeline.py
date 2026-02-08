@@ -314,7 +314,8 @@ class InspectionPipeline:
         logger.info("Inspeção Fase 2: VLM — extraindo estrutura com Qwen3-VL...")
 
         # Extrai páginas com PyMuPDFExtractor (300 DPI para VLM)
-        pages_data = self.pymupdf_extractor.extract_pages(pdf_bytes)
+        pages_data, canonical_text = self.pymupdf_extractor.extract_pages(pdf_bytes)
+        self._canonical_text = canonical_text
 
         # Armazena textos das páginas para Fase 3 (canonical_text)
         self._page_texts = [pd.text for pd in pages_data]
