@@ -50,6 +50,12 @@ class IngestRequest(BaseModel):
     expected_first_article: Optional[int] = Field(None, description="Primeiro artigo esperado (ex: 1)")
     expected_last_article: Optional[int] = Field(None, description="Último artigo esperado (ex: 193)")
 
+    # Modo de extração
+    extraction_mode: str = Field(
+        "pymupdf_regex",
+        description="Modo de extracao: 'pymupdf_regex' (default) ou 'vlm' (fallback)"
+    )
+
     # PDF será enviado como multipart/form-data
 
 

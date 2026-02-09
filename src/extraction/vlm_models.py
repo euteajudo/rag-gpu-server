@@ -23,6 +23,7 @@ class BlockData:
     bbox_pdf: list[float]     # [x0, y0, x1, y1] em pontos PDF (72 DPI)
     text: str                 # texto do bloco
     page_number: int          # página de origem (1-indexed)
+    lines: list = field(default_factory=list)  # line/span data para classifier
 
 
 @dataclass

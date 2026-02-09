@@ -300,13 +300,25 @@ class IngestionPipeline:
                 temp_path = f.name
 
             try:
-                # === PIPELINE VLM: PyMuPDF + Qwen3-VL ===
-                logger.info(f"Pipeline VLM ativo para {request.document_id}")
-                report_progress("vlm_extraction", 0.10)
+                extraction_mode = getattr(request, 'extraction_mode', 'pymupdf_regex')
 
-                self._phase_vlm_extraction(
-                    pdf_content, request, result, report_progress
-                )
+                if extraction_mode == 'vlm':
+                    # === PIPELINE VLM: PyMuPDF + Qwen3-VL ===
+                    logger.info(f"Pipeline VLM ativo para {request.document_id}")
+                    report_progress("vlm_extraction", 0.10)
+
+                    self._phase_vlm_extraction(
+                        pdf_content, request, result, report_progress
+                    )
+                else:
+                    # === PIPELINE PyMuPDF + Regex ===
+                    logger.info(f"Pipeline PyMuPDF+Regex ativo para {request.document_id}")
+                    report_progress("pymupdf_regex_extraction", 0.10)
+
+                    self._phase_pymupdf_regex_extraction(
+                        pdf_content, request, result, report_progress
+                    )
+
                 if result.status == IngestStatus.FAILED:
                     return result
 
@@ -456,8 +468,9 @@ class IngestionPipeline:
 
             # === Upload de artefatos para VPS ===
             report_progress("artifacts_upload", 0.94)
-            self._phase_vlm_artifacts_upload(
-                pdf_content, extraction, chunks, request, result,
+            self._phase_artifacts_upload(
+                pdf_content, extraction.canonical_text, extraction.canonical_hash,
+                chunks, request, result, debug_artifacts=extraction.debug_artifacts,
             )
             report_progress("artifacts_upload", 0.97)
 
@@ -1287,16 +1300,18 @@ class IngestionPipeline:
             return match.group(1) if match else ""
         return ""
 
-    def _phase_vlm_artifacts_upload(
+    def _phase_artifacts_upload(
         self,
         pdf_content: bytes,
-        extraction,  # DocumentExtraction
+        canonical_text: str,
+        canonical_hash: str,
         chunks: List[ProcessedChunk],
         request: IngestRequest,
         result: PipelineResult,
+        debug_artifacts: Optional[list] = None,
     ) -> bool:
         """
-        Upload de artefatos VLM para a VPS.
+        Upload de artefatos para a VPS.
 
         Envia PDF original, canonical.md e offsets.json.
 
@@ -1310,9 +1325,9 @@ class IngestionPipeline:
         try:
             uploader = self.artifacts_uploader
             if not uploader.is_configured():
-                logger.info("VLM artifacts upload: uploader não configurado, pulando")
+                logger.info("Artifacts upload: uploader não configurado, pulando")
                 result.phases.append({
-                    "name": "vlm_artifacts_upload",
+                    "name": "artifacts_upload",
                     "duration_seconds": 0.0,
                     "output": "Skipped (uploader não configurado)",
                     "success": True,
@@ -1320,7 +1335,7 @@ class IngestionPipeline:
                 })
                 return True
 
-            logger.info("VLM artifacts upload iniciando...")
+            logger.info("Artifacts upload iniciando...")
 
             from ..config import config as app_config
             from ..sinks.artifacts_uploader import (
@@ -1330,8 +1345,8 @@ class IngestionPipeline:
             )
 
             # Canonical text normalizado
-            canonical_md = normalize_canonical_text(extraction.canonical_text)
-            canonical_hash = compute_canonical_hash(canonical_md)
+            canonical_md = normalize_canonical_text(canonical_text)
+            c_hash = compute_canonical_hash(canonical_md)
 
             # Constrói offsets_map a partir dos chunks com offsets resolvidos
             offsets_map: Dict[str, Tuple[int, int]] = {}
@@ -1347,8 +1362,8 @@ class IngestionPipeline:
                 numero=request.numero,
                 ano=request.ano,
                 sha256_source=result.document_hash,
-                sha256_canonical_md=canonical_hash,
-                canonical_hash=canonical_hash,
+                sha256_canonical_md=c_hash,
+                canonical_hash=c_hash,
                 ingest_run_id=result.ingest_run_id,
                 pipeline_version=app_config.pipeline_version,
                 document_version=str(int(datetime.utcnow().timestamp())),
@@ -1359,9 +1374,9 @@ class IngestionPipeline:
             resolution_map_json = None
             if app_config.debug_artifacts:
                 import json as _json
-                if extraction.debug_artifacts:
+                if debug_artifacts:
                     vlm_debug_json = _json.dumps(
-                        extraction.debug_artifacts, ensure_ascii=False, indent=2,
+                        debug_artifacts, ensure_ascii=False, indent=2,
                     ).encode("utf-8")
                 if self._last_resolution_map:
                     resolution_map_json = _json.dumps(
@@ -1381,24 +1396,24 @@ class IngestionPipeline:
 
             if upload_result.success:
                 result.phases.append({
-                    "name": "vlm_artifacts_upload",
+                    "name": "artifacts_upload",
                     "duration_seconds": duration,
-                    "output": f"VLM artifacts uploaded: {upload_result.message}",
+                    "output": f"Artifacts uploaded: {upload_result.message}",
                     "storage_paths": upload_result.storage_paths,
                     "retries": upload_result.retries,
                     "success": True,
                 })
-                logger.info(f"VLM artifacts upload concluído em {duration}s")
+                logger.info(f"Artifacts upload concluído em {duration}s")
             else:
                 result.phases.append({
-                    "name": "vlm_artifacts_upload",
+                    "name": "artifacts_upload",
                     "duration_seconds": duration,
                     "output": f"WARNING: {upload_result.error}",
                     "retries": upload_result.retries,
                     "success": False,
                 })
                 logger.warning(
-                    f"VLM artifacts upload FALHOU em {duration}s — "
+                    f"Artifacts upload FALHOU em {duration}s — "
                     f"continuando pipeline"
                 )
 
@@ -1406,14 +1421,522 @@ class IngestionPipeline:
 
         except Exception as e:
             duration = round(time.perf_counter() - phase_start, 2)
-            logger.warning(f"Erro no VLM artifacts upload (continuando): {e}")
+            logger.warning(f"Erro no artifacts upload (continuando): {e}")
             result.phases.append({
-                "name": "vlm_artifacts_upload",
+                "name": "artifacts_upload",
                 "duration_seconds": duration,
                 "output": f"WARNING: {str(e)}",
                 "success": False,
             })
             return True
+
+    def _emit_regex_inspection_snapshot(
+        self,
+        classification_result: dict,
+        canonical_text: str,
+        canonical_hash: str,
+        duration_ms: float,
+        request: IngestRequest,
+        pages_data: list,
+    ) -> None:
+        """
+        Emite snapshot da classificação regex para o Redis (Inspector).
+        Falha silenciosa — não aborta o pipeline.
+        """
+        import unicodedata
+        from ..inspection.storage import InspectionStorage
+        from ..inspection.models import (
+            InspectionStage,
+            InspectionMetadata,
+            InspectionStatus,
+            RegexClassificationArtifact,
+            RegexDevice,
+            RegexFilteredBlock,
+            RegexUnclassifiedBlock,
+            RegexClassificationStats,
+            RegexIntegrityChecks,
+            RegexOffsetCheck,
+            PyMuPDFArtifact,
+            PyMuPDFPageResult,
+            PyMuPDFBlock,
+            BBox,
+        )
+
+        storage = InspectionStorage()
+
+        # --- Build regex artifact ---
+        regex_devices = []
+        for d in classification_result.get("devices", []):
+            regex_devices.append(RegexDevice(
+                span_id=d["span_id"],
+                device_type=d["device_type"],
+                identifier=d["identifier"] or "",
+                parent_span_id=d["parent_span_id"] or "",
+                children_span_ids=d.get("children_span_ids", []),
+                hierarchy_depth=d["hierarchy_depth"],
+                text=d["full_text"],
+                text_preview=d["text_preview"],
+                char_start=d["char_start"],
+                char_end=d["char_end"],
+                page_number=d["page_number"],
+                bbox=d.get("bbox", []),
+            ))
+
+        filtered = [
+            RegexFilteredBlock(
+                block_index=f["block_index"],
+                page_number=f["page_number"],
+                filter_type=f["filter_type"],
+                reason=f.get("reason", ""),
+                text_preview=f.get("text_preview", ""),
+            )
+            for f in classification_result.get("filtered", [])
+        ]
+
+        unclassified = [
+            RegexUnclassifiedBlock(
+                block_index=u["block_index"],
+                page_number=u["page_number"],
+                reason=u.get("reason", ""),
+                text_preview=u.get("text_preview", ""),
+            )
+            for u in classification_result.get("unclassified", [])
+        ]
+
+        raw_stats = classification_result.get("stats", {})
+        stats = RegexClassificationStats(
+            total_blocks=raw_stats.get("total_blocks", 0),
+            devices=raw_stats.get("devices", 0),
+            filtered=raw_stats.get("filtered", 0),
+            unclassified=raw_stats.get("unclassified", 0),
+            by_device_type=raw_stats.get("by_device_type", {}),
+            by_filter_type=raw_stats.get("by_filter_type", {}),
+            max_hierarchy_depth=raw_stats.get("max_hierarchy_depth", 0),
+        )
+
+        # --- Integrity checks ---
+        from ..chunking.canonical_offsets import normalize_canonical_text as norm_ct
+
+        # Check 1: offsets
+        offset_details = []
+        offsets_matches = 0
+        for d in regex_devices:
+            sliced = canonical_text[d.char_start:d.char_end] if d.char_start >= 0 else ""
+            match = sliced == d.text
+            if match:
+                offsets_matches += 1
+            offset_details.append(RegexOffsetCheck(
+                span_id=d.span_id,
+                page=d.page_number,
+                char_start=d.char_start,
+                char_end=d.char_end,
+                match=match,
+                expected_preview=d.text[:60],
+                got_preview=sliced[:60],
+            ))
+
+        # Check 2: normalization idempotent
+        norm_idempotent = canonical_text == norm_ct(canonical_text)
+
+        # Check 3: no trailing spaces per line
+        trailing_violations = sum(
+            1 for line in canonical_text.split("\n")
+            if line != line.rstrip()
+        )
+
+        # Check 4: unicode NFC
+        is_nfc = unicodedata.is_normalized("NFC", canonical_text)
+
+        # Check 5: trailing newline
+        has_trailing_nl = canonical_text.endswith("\n") if canonical_text else False
+
+        offsets_pass = offsets_matches == len(offset_details)
+        all_pass = (
+            offsets_pass
+            and norm_idempotent
+            and trailing_violations == 0
+            and is_nfc
+            and has_trailing_nl
+        )
+
+        checks = RegexIntegrityChecks(
+            all_pass=all_pass,
+            offsets_pass=offsets_pass,
+            offsets_total=len(offset_details),
+            offsets_matches=offsets_matches,
+            offsets_details=offset_details,
+            normalization_idempotent=norm_idempotent,
+            no_trailing_spaces=trailing_violations == 0,
+            trailing_space_violations=trailing_violations,
+            unicode_nfc=is_nfc,
+            trailing_newline=has_trailing_nl,
+        )
+
+        artifact = RegexClassificationArtifact(
+            devices=regex_devices,
+            filtered=filtered,
+            unclassified=unclassified,
+            stats=stats,
+            checks=checks,
+            canonical_text=canonical_text,
+            canonical_hash=canonical_hash,
+            canonical_length=len(canonical_text),
+            duration_ms=duration_ms * 1000,
+        )
+
+        # --- Build PyMuPDF artifact (page images + blocks) ---
+        pymupdf_pages = []
+        for pg in pages_data:
+            blocks = []
+            for b in pg.blocks:
+                blocks.append(PyMuPDFBlock(
+                    block_index=b.block_index,
+                    text=b.text[:200],
+                    bbox=BBox(
+                        x0=b.bbox_pdf[0], y0=b.bbox_pdf[1],
+                        x1=b.bbox_pdf[2], y1=b.bbox_pdf[3],
+                    ) if len(b.bbox_pdf) == 4 else BBox(x0=0, y0=0, x1=0, y1=0),
+                    page=pg.page_number,
+                ))
+            pymupdf_pages.append(PyMuPDFPageResult(
+                page_number=pg.page_number,
+                width=pg.width,
+                height=pg.height,
+                blocks=blocks,
+                image_base64=pg.image_base64,
+            ))
+
+        pymupdf_artifact = PyMuPDFArtifact(
+            pages=pymupdf_pages,
+            total_blocks=sum(len(p.blocks) for p in pages_data),
+            total_pages=len(pages_data),
+            total_chars=len(canonical_text),
+        )
+
+        # --- Save to Redis ---
+        task_id = f"regex_{request.document_id}_{int(time.time())}"
+
+        metadata = InspectionMetadata(
+            inspection_id=task_id,
+            document_id=request.document_id,
+            tipo_documento=request.tipo_documento,
+            numero=request.numero,
+            ano=request.ano,
+            total_pages=len(pages_data),
+            started_at=datetime.utcnow().isoformat(),
+            status=InspectionStatus.COMPLETED,
+        )
+
+        storage.save_metadata(task_id, metadata)
+        storage.save_artifact(
+            task_id, InspectionStage.REGEX_CLASSIFICATION,
+            artifact.model_dump_json(),
+        )
+        storage.save_artifact(
+            task_id, InspectionStage.PYMUPDF,
+            pymupdf_artifact.model_dump_json(),
+        )
+
+        logger.info(
+            f"Inspector snapshot emitted: {task_id} "
+            f"({len(regex_devices)} devices, checks={'PASS' if all_pass else 'FAIL'})"
+        )
+
+    def _convert_pages_to_classifier_format(self, pages_data) -> list:
+        """
+        Converte PageData/BlockData (do PyMuPDFExtractor) para o formato dict
+        que o regex classifier espera.
+        """
+        pages = []
+        for page in pages_data:
+            blocks = []
+            for block in page.blocks:
+                blocks.append({
+                    "block_index": block.block_index,
+                    "text": block.text,
+                    "char_start": block.char_start,
+                    "char_end": block.char_end,
+                    "bbox": block.bbox_pdf,
+                    "lines": block.lines,
+                })
+            pages.append({
+                "page_number": page.page_number,
+                "blocks": blocks,
+            })
+        return pages
+
+    def _regex_to_processed_chunks(
+        self,
+        devices,
+        canonical_text: str,
+        canonical_hash: str,
+        request: IngestRequest,
+    ) -> List[ProcessedChunk]:
+        """
+        Converte List[ClassifiedDevice] -> List[ProcessedChunk].
+
+        Offsets são nativos do PyMuPDF (nunca -1).
+        """
+        chunks = []
+
+        # Build span_id → device map for subtree aggregation
+        device_by_span = {d.span_id: d for d in devices}
+
+        def _build_retrieval_text(article_device):
+            """Concatena texto do artigo + toda a subárvore de filhos (recursivo)."""
+            parts = [article_device.text or ""]
+
+            def collect(span_id):
+                d = device_by_span.get(span_id)
+                if d:
+                    parts.append(d.text or "")
+                    for child_id in d.children_span_ids:
+                        collect(child_id)
+
+            for child_id in article_device.children_span_ids:
+                collect(child_id)
+
+            return "\n".join(parts)
+
+        for device in devices:
+            # node_id e chunk_id
+            chunk_id = f"{request.document_id}#{device.span_id}"
+            node_id = f"leis:{chunk_id}"
+
+            # parent_node_id
+            parent_node_id = ""
+            if device.parent_span_id:
+                parent_node_id = f"leis:{request.document_id}#{device.parent_span_id}"
+
+            # chunk_level
+            chunk_level = "article" if device.device_type == "article" else "device"
+
+            # Citações
+            citations = extract_citations_from_chunk(
+                text=device.text or "",
+                document_id=request.document_id,
+                chunk_node_id=node_id,
+                parent_chunk_id=parent_node_id or None,
+                document_type=request.tipo_documento,
+            )
+
+            pc = ProcessedChunk(
+                node_id=node_id,
+                chunk_id=chunk_id,
+                parent_node_id=parent_node_id,
+                span_id=device.span_id,
+                device_type=device.device_type,
+                chunk_level=chunk_level,
+                text=device.text or "",
+                parent_text="",
+                retrieval_text=_build_retrieval_text(device) if chunk_level == "article" else (device.text or ""),
+                document_id=request.document_id,
+                tipo_documento=request.tipo_documento,
+                numero=request.numero,
+                ano=request.ano,
+                article_number=str(device.article_number) if device.article_number else "",
+                citations=citations,
+                # PR13: offsets nativos (NUNCA -1)
+                canonical_start=device.char_start,
+                canonical_end=device.char_end,
+                canonical_hash=canonical_hash,
+                # Coordenadas
+                page_number=device.page_number,
+                bbox=device.bbox,
+                bbox_img=[],
+                img_width=0,
+                img_height=0,
+                confidence=1.0,  # regex determinístico
+                # Cross-page
+                is_cross_page=False,
+                bbox_spans=[],
+                # Campos Acórdão (vazios para LEI/DECRETO)
+                colegiado="",
+                processo="",
+                relator="",
+                data_sessao="",
+                unidade_tecnica="",
+            )
+            chunks.append(pc)
+
+        logger.info(f"Regex -> ProcessedChunk: {len(chunks)} chunks gerados")
+        return chunks
+
+    def _phase_pymupdf_regex_extraction(
+        self,
+        pdf_content: bytes,
+        request: IngestRequest,
+        result: PipelineResult,
+        report_progress,
+    ) -> None:
+        """
+        Pipeline PyMuPDF + Regex: extração estrutural sem GPU.
+
+        1. PyMuPDFExtractor.extract_pages() → pages_data, canonical_text
+        2. RegexClassifier → List[ClassifiedDevice]
+        3. _regex_to_processed_chunks() → List[ProcessedChunk]
+        4. OriginClassifier + Embeddings + Artifacts upload
+        """
+        phase_start = time.perf_counter()
+
+        try:
+            from ..config import config as app_config
+            from ..extraction.pymupdf_extractor import PyMuPDFExtractor
+            from ..extraction.regex_classifier import classify_to_devices
+
+            # 1. Extração PyMuPDF (MESMO extrator do VLM path)
+            extractor = PyMuPDFExtractor(dpi=app_config.vlm_page_dpi)
+            pages_data, raw_canonical = extractor.extract_pages(pdf_content)
+
+            report_progress("pymupdf_regex_extraction", 0.30)
+
+            # 2. canonical_text = raw do extractor (já normalizado inline: NFC + rstrip + trailing \n)
+            # Os offsets dos blocos são nativos a este texto — NÃO re-normalizar.
+            canonical_text = raw_canonical
+            normalized_check = normalize_canonical_text(raw_canonical)
+            if canonical_text != normalized_check:
+                logger.error(
+                    f"[{request.document_id}] OFFSET DRIFT: extract_pages() retornou texto "
+                    f"que difere de normalize_canonical_text() — offsets seriam inválidos! "
+                    f"raw_len={len(canonical_text)} norm_len={len(normalized_check)}"
+                )
+                raise RuntimeError(
+                    "extract_pages() output diverge de normalize_canonical_text(): "
+                    "offsets nativos seriam inválidos. Verifique normalização inline do extractor."
+                )
+            canonical_hash = compute_canonical_hash(canonical_text)
+
+            result.markdown_content = canonical_text
+            result.canonical_hash = canonical_hash
+
+            # 3. Drift detection
+            from ..utils.drift_detector import DriftDetector
+            drift_detector = DriftDetector()
+            drift = drift_detector.check(
+                document_id=request.document_id,
+                pdf_hash=result.document_hash,
+                pipeline_version=app_config.pipeline_version,
+                current_canonical_hash=canonical_hash,
+            )
+            if drift.is_drifted:
+                logger.warning(f"DRIFT DETECTADO: {drift.message}")
+                result.quality_issues.append(
+                    f"DRIFT: canonical_hash mudou para mesmo pdf_hash+pipeline_version "
+                    f"(prev={drift.previous_canonical_hash[:16]}... "
+                    f"curr={drift.current_canonical_hash[:16]}...)"
+                )
+
+            report_progress("pymupdf_regex_extraction", 0.40)
+
+            # 4. Converte pages para formato do classifier
+            pages_for_classifier = self._convert_pages_to_classifier_format(pages_data)
+
+            # 5. Classificação regex
+            from ..extraction.regex_classifier import classify_document as regex_classify_document
+            classification_result = regex_classify_document(pages_for_classifier)
+            devices = classify_to_devices(pages_for_classifier)
+            logger.info(
+                f"[{request.document_id}] RegexClassifier: {len(devices)} dispositivos"
+            )
+
+            report_progress("pymupdf_regex_extraction", 0.55)
+
+            # Registra fase
+            extract_duration = round(time.perf_counter() - phase_start, 2)
+            result.phases.append({
+                "name": "pymupdf_regex_extraction",
+                "duration_seconds": extract_duration,
+                "output": (
+                    f"Extraídos {len(devices)} dispositivos de "
+                    f"{len(pages_data)} páginas via PyMuPDF+Regex"
+                ),
+                "success": True,
+                "method": "pymupdf+regex",
+            })
+
+            # === EMIT INSPECTION SNAPSHOT (Redis) ===
+            try:
+                self._emit_regex_inspection_snapshot(
+                    classification_result, canonical_text, canonical_hash,
+                    extract_duration, request, pages_data,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit inspector snapshot: {e}")
+
+            # 6. Converte ClassifiedDevice -> ProcessedChunk
+            chunks = self._regex_to_processed_chunks(
+                devices, canonical_text, canonical_hash, request,
+            )
+
+            report_progress("pymupdf_regex_extraction", 0.65)
+
+            # 7. Origin Classification
+            from ..classification.origin_classifier import classify_document
+            chunks = classify_document(chunks, canonical_text, request.document_id)
+            external_count = sum(1 for c in chunks if c.origin_type == "external")
+            if external_count > 0:
+                logger.info(f"[{request.document_id}] OriginClassifier: {external_count}/{len(chunks)} external")
+
+            report_progress("pymupdf_regex_extraction", 0.70)
+
+            # 8. Embeddings (se não pular)
+            if not request.skip_embeddings:
+                report_progress("embedding", 0.70)
+                for chunk in chunks:
+                    text_for_embedding = chunk.retrieval_text or chunk.text
+                    embed_result = self.embedder.encode([text_for_embedding])
+                    chunk.dense_vector = embed_result.dense_embeddings[0]
+                    chunk.sparse_vector = (
+                        embed_result.sparse_embeddings[0]
+                        if embed_result.sparse_embeddings
+                        else {}
+                    )
+                report_progress("embedding", 0.88)
+
+                result.phases.append({
+                    "name": "embedding",
+                    "duration_seconds": round(time.perf_counter() - phase_start - extract_duration, 2),
+                    "output": f"Embeddings para {len(chunks)} chunks Regex",
+                    "success": True,
+                })
+
+            # 9. Artifacts upload
+            report_progress("artifacts_upload", 0.88)
+            self._phase_artifacts_upload(
+                pdf_content, canonical_text, canonical_hash,
+                chunks, request, result,
+            )
+            report_progress("artifacts_upload", 0.94)
+
+            # 10. Valida invariantes do contrato
+            validate_chunk_invariants(chunks, request.document_id)
+
+            # 11. Drift register + resultado
+            drift_detector.register_run(
+                document_id=request.document_id,
+                pdf_hash=result.document_hash,
+                pipeline_version=app_config.pipeline_version,
+                canonical_hash=canonical_hash,
+                ingest_run_id=result.ingest_run_id,
+            )
+
+            result.chunks = chunks
+            result.status = IngestStatus.COMPLETED
+
+            report_progress("completed", 1.0)
+
+            logger.info(
+                f"Pipeline PyMuPDF+Regex concluído: {len(chunks)} chunks, "
+                f"{len(devices)} dispositivos"
+            )
+
+        except Exception as e:
+            logger.error(f"Erro no pipeline PyMuPDF+Regex: {e}", exc_info=True)
+            result.status = IngestStatus.FAILED
+            result.errors.append(IngestError(
+                phase="pymupdf_regex",
+                message=str(e),
+            ))
 
     def _phase_milvus_sink(self, materialized, request: IngestRequest, result: PipelineResult):
         """Fase 5.5: Inserir chunks no Milvus remoto (se MILVUS_HOST configurado)."""

@@ -191,6 +191,8 @@ async def ingest_pdf(
     validate_articles: bool = Form(False, description="Habilita validacao de artigos"),
     expected_first_article: Optional[int] = Form(None, description="Primeiro artigo esperado (ex: 1)"),
     expected_last_article: Optional[int] = Form(None, description="Ultimo artigo esperado (ex: 193)"),
+    # Modo de extracao
+    extraction_mode: str = Form("pymupdf_regex", description="Modo de extracao: pymupdf_regex ou vlm"),
 ):
     """
     Inicia processamento de um PDF em background.
@@ -238,6 +240,7 @@ async def ingest_pdf(
         validate_articles=validate_articles,
         expected_first_article=expected_first_article,
         expected_last_article=expected_last_article,
+        extraction_mode=extraction_mode,
     )
 
     # Gera task_id

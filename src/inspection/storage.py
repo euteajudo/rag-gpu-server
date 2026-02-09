@@ -1,16 +1,12 @@
 """
 Storage temporário para artefatos de inspeção (Redis).
 
-Redis: armazenamento temporário durante revisão (TTL 2h, DB 2).
-
-Persistência permanente (MinIO) é feita via HTTP POST para a VPS
-pelo InspectionUploader (src/sinks/inspection_uploader.py),
-chamado pelo ApprovalService.
+Redis DB 2, TTL 2h.
 
 Keys Redis:
-    inspect:{task_id}:metadata   → InspectionMetadata (JSON)
-    inspect:{task_id}:{stage}    → Artefato da fase (JSON)
-    inspect:{task_id}:pdf        → PDF original (bytes)
+    inspect:{task_id}:metadata          → InspectionMetadata (JSON)
+    inspect:{task_id}:{stage}           → Artefato da fase (JSON)
+    inspect:{task_id}:pdf               → PDF original (bytes)
 """
 
 import json
@@ -23,11 +19,7 @@ import redis
 from .models import (
     InspectionMetadata,
     InspectionStage,
-    PyMuPDFArtifact,
-    VLMArtifact,
-    ReconciliationArtifact,
-    IntegrityArtifact,
-    ChunksPreviewArtifact,
+    RegexClassificationArtifact,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,20 +29,14 @@ REDIS_TTL_SECONDS = 2 * 60 * 60
 
 # Mapa de stage → modelo Pydantic para desserialização
 _STAGE_MODELS = {
-    InspectionStage.PYMUPDF: PyMuPDFArtifact,
-    InspectionStage.VLM: VLMArtifact,
-    InspectionStage.RECONCILIATION: ReconciliationArtifact,
-    InspectionStage.INTEGRITY: IntegrityArtifact,
-    InspectionStage.CHUNKS: ChunksPreviewArtifact,
+    InspectionStage.PYMUPDF: None,  # PyMuPDF artifact é dict genérico
+    InspectionStage.REGEX_CLASSIFICATION: RegexClassificationArtifact,
 }
 
 
 class InspectionStorage:
     """
-    Storage temporário para artefatos de inspeção (Redis).
-
-    Redis: armazenamento temporário durante revisão (TTL 2h, DB 2).
-    Persistência no MinIO é feita via HTTP pelo ApprovalService.
+    Storage temporário para artefatos de inspeção (Redis DB 2, TTL 2h).
     """
 
     def __init__(
@@ -62,10 +48,6 @@ class InspectionStorage:
         self._redis_db = redis_db
         self._redis: Optional[redis.Redis] = None
 
-    # =========================================================================
-    # Conexão lazy
-    # =========================================================================
-
     def _get_redis(self) -> redis.Redis:
         if self._redis is None:
             self._redis = redis.Redis.from_url(
@@ -74,10 +56,6 @@ class InspectionStorage:
                 decode_responses=False,
             )
         return self._redis
-
-    # =========================================================================
-    # Redis — Artefatos temporários
-    # =========================================================================
 
     def _redis_key(self, task_id: str, suffix: str) -> str:
         return f"inspect:{task_id}:{suffix}"
@@ -94,16 +72,6 @@ class InspectionStorage:
         if data is None:
             return None
         return InspectionMetadata.model_validate_json(data)
-
-    def save_pdf(self, task_id: str, pdf_bytes: bytes) -> None:
-        """Salva o PDF original no Redis temporariamente."""
-        key = self._redis_key(task_id, "pdf")
-        self._get_redis().setex(key, REDIS_TTL_SECONDS, pdf_bytes)
-
-    def get_pdf(self, task_id: str) -> Optional[bytes]:
-        """Obtém o PDF original do Redis."""
-        key = self._redis_key(task_id, "pdf")
-        return self._get_redis().get(key)
 
     def save_artifact(self, task_id: str, stage: InspectionStage, artifact_json: str) -> None:
         """Salva artefato de uma fase no Redis."""
@@ -144,4 +112,3 @@ class InspectionStorage:
         if keys:
             return self._get_redis().delete(*keys)
         return 0
-

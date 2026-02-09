@@ -1,46 +1,22 @@
 """
-Módulo de inspeção do pipeline (Pipeline Inspector).
+Módulo de inspeção — Pipeline Inspector v4 (Regex).
 
-Dry-run com aprovação: processa o PDF, mostra resultados intermediários
-para revisão humana, e ao aprovar, persiste artefatos no MinIO.
+Observer-mode: emite snapshots para Redis durante ingestão regex.
+Frontend SPA read-only em /inspect/inspector.
 """
 
 from .models import (
     InspectionStage,
     InspectionStatus,
-    InspectRequest,
-    PyMuPDFBlock,
-    PyMuPDFArtifact,
-    VLMElement,
-    VLMArtifact,
-    ReconciliationMatch,
-    ReconciliationArtifact,
-    IntegrityCheck,
-    IntegrityArtifact,
-    ChunkPreview,
-    ChunksPreviewArtifact,
     InspectionMetadata,
-    ApprovalResult,
+    RegexClassificationArtifact,
 )
-from .approval import ApprovalService
 from .storage import InspectionStorage
 
 __all__ = [
     "InspectionStage",
     "InspectionStatus",
-    "InspectRequest",
-    "PyMuPDFBlock",
-    "PyMuPDFArtifact",
-    "VLMElement",
-    "VLMArtifact",
-    "ReconciliationMatch",
-    "ReconciliationArtifact",
-    "IntegrityCheck",
-    "IntegrityArtifact",
-    "ChunkPreview",
-    "ChunksPreviewArtifact",
     "InspectionMetadata",
-    "ApprovalResult",
-    "ApprovalService",
+    "RegexClassificationArtifact",
     "InspectionStorage",
 ]

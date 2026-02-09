@@ -114,6 +114,10 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
         if path in PUBLIC_ENDPOINTS:
             return await call_next(request)
 
+        # Inspector endpoints são públicos (frontend + API de leitura)
+        if path.startswith("/inspect/inspector"):
+            return await call_next(request)
+
         # 1. Verifica IP Allowlist (se configurado)
         if ALLOWED_IPS is not None and client_ip not in ALLOWED_IPS:
             logger.warning(

@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VectorGov Pipeline Inspector</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  /* Fallback base styles in case Tailwind CDN fails */
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 0; background: #f9fafb; }
+  header { background: #fff; border-bottom: 1px solid #e5e7eb; padding: 1rem 1.5rem; }
+  main { max-width: 72rem; margin: 0 auto; padding: 1.5rem; }
+  h1 { font-size: 1.25rem; font-weight: bold; color: #1f2937; margin: 0; }
+  h2 { font-size: 1.1rem; font-weight: 600; color: #374151; }
+  button { cursor: pointer; }
+  .hidden { display: none !important; }
+
+  .tab-active { border-bottom: 3px solid #3b82f6; color: #3b82f6; font-weight: 600; }
+  .device-article { border-left: 4px solid #ef4444; }
+  .device-paragraph { border-left: 4px solid #f97316; }
+  .device-inciso { border-left: 4px solid #3b82f6; }
+  .device-alinea { border-left: 4px solid #22c55e; }
+  .tree-indent { padding-left: 1.5rem; }
+  .tree-indent-2 { padding-left: 3rem; }
+  .tree-indent-3 { padding-left: 4.5rem; }
+  .badge-pass { background: #dcfce7; color: #166534; }
+  .badge-fail { background: #fee2e2; color: #991b1b; }
+  .page-img-container { position: relative; }
+  .page-img-container canvas { position: absolute; top: 0; left: 0; }
+</style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+<div id="app">
+  <!-- Header -->
+  <header class="bg-white border-b px-6 py-4 shadow-sm">
+    <div class="flex items-center justify-between max-w-7xl mx-auto">
+      <h1 class="text-xl font-bold text-gray-800">VectorGov Pipeline Inspector</h1>
+      <button onclick="loadRecent()" class="text-sm bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">
+        Atualizar
+      </button>
+    </div>
+  </header>
+
+  <!-- Content -->
+  <main class="max-w-7xl mx-auto p-6">
+    <!-- List view -->
+    <div id="list-view">
+      <h2 class="text-lg font-semibold mb-4 text-gray-700">Execucoes recentes (TTL 2h)</h2>
+      <div id="list-container" class="space-y-2">
+        <div style="padding:1rem;color:#6b7280;">Carregando...</div>
+      </div>
+    </div>
+
+    <!-- Detail view (hidden by default) -->
+    <div id="detail-view" class="hidden">
+      <button onclick="showList()" class="text-sm text-blue-500 hover:underline mb-4 inline-block">&larr; Voltar</button>
+
+      <!-- Header with checks -->
+      <div id="detail-header" class="bg-white rounded-lg shadow p-4 mb-4"></div>
+
+      <!-- Tabs -->
+      <div class="bg-white rounded-lg shadow">
+        <div class="flex border-b">
+          <button onclick="switchTab('resumo')" id="tab-resumo" class="px-6 py-3 text-sm tab-active">RESUMO</button>
+          <button onclick="switchTab('hierarquia')" id="tab-hierarquia" class="px-6 py-3 text-sm text-gray-500 hover:text-gray-700">HIERARQUIA</button>
+          <button onclick="switchTab('paginas')" id="tab-paginas" class="px-6 py-3 text-sm text-gray-500 hover:text-gray-700">DISPOSITIVOS POR PAGINA</button>
+          <button onclick="switchTab('canonico')" id="tab-canonico" class="px-6 py-3 text-sm text-gray-500 hover:text-gray-700">TEXTO CANONICO</button>
+        </div>
+        <div id="tab-content" class="p-6"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+// Detect if accessed via jupyter-server-proxy (/proxy/8000/) or directly
+const pathMatch = window.location.pathname.match(/^(\/proxy\/\d+)/);
+const API_BASE = pathMatch ? window.location.origin + pathMatch[1] : window.location.origin;
+let currentData = null;
+let currentPage = 0;
+
+async function loadRecent() {
+  try {
+    const res = await fetch(`${API_BASE}/inspect/inspector/recent`);
+    const data = await res.json();
+    renderList(data);
+  } catch (e) {
+    document.getElementById('list-container').innerHTML =
+      `<div style="padding:1rem;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;">Erro ao carregar: ${e.message}</div>`;
+  }
+}
+
+function renderList(items) {
+  const c = document.getElementById('list-container');
+  if (!items.length) {
+    c.innerHTML = '<div style="padding:2rem;text-align:center;color:#6b7280;font-size:1rem;background:#fff;border-radius:8px;border:1px solid #e5e7eb;margin-top:1rem;">Nenhuma execucao recente.<br><span style="font-size:0.85rem;">Execute uma ingestao com <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;">extraction_mode=pymupdf_regex</code> para gerar dados.</span></div>';
+    return;
+  }
+  c.innerHTML = items.map(item => {
+    const ago = timeAgo(item.started_at);
+    const statusBadge = item.status === 'completed'
+      ? '<span class="badge-pass text-xs px-2 py-1 rounded">OK</span>'
+      : '<span class="badge-fail text-xs px-2 py-1 rounded">FAIL</span>';
+    return `
+      <div class="bg-white rounded-lg shadow-sm border p-4 flex items-center justify-between hover:shadow cursor-pointer"
+           onclick="loadDetail('${item.task_id}')">
+        <div class="flex items-center gap-4">
+          <div>
+            <div class="font-medium text-gray-800">${item.document_id}</div>
+            <div class="text-xs text-gray-400">${item.task_id}</div>
+          </div>
+          ${statusBadge}
+        </div>
+        <div class="flex items-center gap-4">
+          <span class="text-xs text-gray-400">${item.total_pages} pgs</span>
+          <span class="text-xs text-gray-400">${ago}</span>
+          <span class="text-gray-300">&rarr;</span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function loadDetail(taskId) {
+  try {
+    const res = await fetch(`${API_BASE}/inspect/inspector/${taskId}`);
+    currentData = await res.json();
+    showDetail();
+  } catch (e) {
+    alert('Erro ao carregar detalhe: ' + e.message);
+  }
+}
+
+function showDetail() {
+  document.getElementById('list-view').classList.add('hidden');
+  document.getElementById('detail-view').classList.remove('hidden');
+  renderHeader();
+  switchTab('resumo');
+}
+
+function showList() {
+  document.getElementById('detail-view').classList.add('hidden');
+  document.getElementById('list-view').classList.remove('hidden');
+}
+
+function renderHeader() {
+  const rc = currentData.regex_classification;
+  const checks = rc.checks;
+  const meta = currentData.metadata;
+  const docId = meta ? meta.document_id : currentData.task_id;
+
+  const badges = [
+    { label: 'Offsets', pass: checks.offsets_pass },
+    { label: 'NFC', pass: checks.unicode_nfc },
+    { label: 'Idempotent', pass: checks.normalization_idempotent },
+    { label: 'Spaces', pass: checks.no_trailing_spaces },
+    { label: '\\n', pass: checks.trailing_newline },
+  ];
+
+  document.getElementById('detail-header').innerHTML = `
+    <div class="flex items-center justify-between mb-3">
+      <div>
+        <h2 class="text-lg font-bold text-gray-800">${docId}</h2>
+        <div class="text-xs text-gray-400 mt-1">${currentData.task_id} | ${rc.canonical_length} chars</div>
+      </div>
+      <div class="flex gap-2">
+        ${badges.map(b => `
+          <span class="text-xs px-2 py-1 rounded ${b.pass ? 'badge-pass' : 'badge-fail'}">
+            ${b.pass ? '\u2713' : '\u2717'} ${b.label}
+          </span>`).join('')}
+      </div>
+    </div>
+    <div class="flex gap-2 pt-2 border-t border-gray-100">
+      <button onclick="downloadMd()" class="text-xs bg-gray-700 text-white px-3 py-1.5 rounded hover:bg-gray-800">
+        Download .md
+      </button>
+      <button onclick="downloadJson()" class="text-xs bg-gray-100 text-gray-700 px-3 py-1.5 rounded border hover:bg-gray-200">
+        Download .json
+      </button>
+    </div>`;
+}
+
+function switchTab(name) {
+  ['resumo','hierarquia','paginas','canonico'].forEach(t => {
+    document.getElementById('tab-'+t).classList.remove('tab-active');
+    document.getElementById('tab-'+t).classList.add('text-gray-500');
+  });
+  document.getElementById('tab-'+name).classList.add('tab-active');
+  document.getElementById('tab-'+name).classList.remove('text-gray-500');
+
+  const rc = currentData.regex_classification;
+  switch(name) {
+    case 'resumo': renderResumo(rc); break;
+    case 'hierarquia': renderHierarquia(rc); break;
+    case 'paginas': currentPage = 0; renderPaginas(rc); break;
+    case 'canonico': renderCanonico(rc); break;
+  }
+}
+
+function renderResumo(rc) {
+  const s = rc.stats;
+  const c = rc.checks;
+  document.getElementById('tab-content').innerHTML = `
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <div class="bg-gray-50 rounded-lg p-4 text-center">
+        <div class="text-2xl font-bold text-gray-800">${s.total_blocks}</div>
+        <div class="text-xs text-gray-500">Blocos totais</div>
+      </div>
+      <div class="bg-gray-50 rounded-lg p-4 text-center">
+        <div class="text-2xl font-bold text-blue-600">${s.devices}</div>
+        <div class="text-xs text-gray-500">Dispositivos</div>
+      </div>
+      <div class="bg-gray-50 rounded-lg p-4 text-center">
+        <div class="text-2xl font-bold text-yellow-600">${s.filtered}</div>
+        <div class="text-xs text-gray-500">Filtrados</div>
+      </div>
+      <div class="bg-gray-50 rounded-lg p-4 text-center">
+        <div class="text-2xl font-bold text-gray-400">${s.unclassified}</div>
+        <div class="text-xs text-gray-500">Nao classificados</div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-2 gap-6">
+      <div>
+        <h3 class="font-semibold text-sm text-gray-600 mb-2">Por tipo de dispositivo</h3>
+        <div class="space-y-1">
+          ${Object.entries(s.by_device_type || {}).map(([k,v]) => `
+            <div class="flex justify-between text-sm">
+              <span class="device-${k} pl-2">${k}</span>
+              <span class="font-mono">${v}</span>
+            </div>`).join('')}
+        </div>
+      </div>
+      <div>
+        <h3 class="font-semibold text-sm text-gray-600 mb-2">Blocos filtrados por tipo</h3>
+        <div class="space-y-1">
+          ${Object.entries(s.by_filter_type || {}).map(([k,v]) => `
+            <div class="flex justify-between text-sm">
+              <span>${k}</span>
+              <span class="font-mono">${v}</span>
+            </div>`).join('')}
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-6">
+      <h3 class="font-semibold text-sm text-gray-600 mb-2">Integridade</h3>
+      <div class="text-sm space-y-1">
+        <div>Offsets: ${c.offsets_matches}/${c.offsets_total} ${c.offsets_pass ? '\u2713' : '\u2717'}</div>
+        <div>Normalizacao idempotente: ${c.normalization_idempotent ? '\u2713' : '\u2717'}</div>
+        <div>Trailing spaces: ${c.no_trailing_spaces ? '\u2713 nenhum' : '\u2717 ' + c.trailing_space_violations + ' violacoes'}</div>
+        <div>Unicode NFC: ${c.unicode_nfc ? '\u2713' : '\u2717'}</div>
+        <div>Trailing \\n: ${c.trailing_newline ? '\u2713' : '\u2717'}</div>
+      </div>
+    </div>
+
+    <div class="mt-4 text-xs text-gray-400">
+      Profundidade maxima: ${s.max_hierarchy_depth} | Duracao: ${rc.duration_ms.toFixed(0)}ms
+    </div>`;
+}
+
+function renderHierarquia(rc) {
+  const devices = rc.devices;
+  const colors = { article: 'text-red-600', paragraph: 'text-orange-500', inciso: 'text-blue-600', alinea: 'text-green-600' };
+  const indents = { 0: '', 1: 'tree-indent', 2: 'tree-indent-2', 3: 'tree-indent-3' };
+
+  document.getElementById('tab-content').innerHTML = `
+    <div class="space-y-1 font-mono text-sm">
+      ${devices.map(d => {
+        const indent = indents[d.hierarchy_depth] || 'tree-indent-3';
+        const color = colors[d.device_type] || 'text-gray-600';
+        return `
+          <div class="${indent} ${color} py-1 border-b border-gray-100">
+            <span class="font-bold">${d.span_id}</span>
+            <span class="text-gray-400 ml-2">${d.identifier}</span>
+            <span class="text-gray-300 ml-2 text-xs">[${d.char_start}:${d.char_end}] p${d.page_number}</span>
+            <div class="text-gray-500 text-xs mt-0.5 truncate">${escHtml(d.text_preview)}</div>
+          </div>`;
+      }).join('')}
+    </div>`;
+}
+
+function renderPaginas(rc) {
+  const pymupdf = currentData.pymupdf;
+  if (!pymupdf || !pymupdf.pages.length) {
+    document.getElementById('tab-content').innerHTML = '<div class="text-gray-400">Sem dados PyMuPDF</div>';
+    return;
+  }
+
+  const totalPages = pymupdf.pages.length;
+  const page = pymupdf.pages[currentPage];
+  const pageDevices = rc.devices.filter(d => d.page_number === page.page_number);
+  const pageFiltered = rc.filtered.filter(f => f.page_number === page.page_number);
+
+  const colors = { article: '#ef4444', paragraph: '#f97316', inciso: '#3b82f6', alinea: '#22c55e' };
+
+  document.getElementById('tab-content').innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <button onclick="prevPage()" class="px-3 py-1 border rounded text-sm ${currentPage === 0 ? 'text-gray-300' : 'hover:bg-gray-100'}"
+              ${currentPage === 0 ? 'disabled' : ''}>&larr; Anterior</button>
+      <span class="text-sm font-medium">Pagina ${page.page_number} / ${totalPages}</span>
+      <button onclick="nextPage()" class="px-3 py-1 border rounded text-sm ${currentPage >= totalPages-1 ? 'text-gray-300' : 'hover:bg-gray-100'}"
+              ${currentPage >= totalPages-1 ? 'disabled' : ''}>Proxima &rarr;</button>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div>
+        <div class="page-img-container inline-block relative">
+          <img id="page-img" src="data:image/png;base64,${page.image_base64}"
+               class="max-w-full border rounded shadow-sm" onload="drawBboxes()">
+          <canvas id="bbox-canvas" class="absolute top-0 left-0 pointer-events-none"></canvas>
+        </div>
+      </div>
+      <div>
+        <h3 class="font-semibold text-sm text-gray-600 mb-2">Dispositivos (${pageDevices.length})</h3>
+        <div class="space-y-1 max-h-96 overflow-y-auto">
+          ${pageDevices.map(d => `
+            <div class="device-${d.device_type} bg-gray-50 rounded p-2 text-xs">
+              <span class="font-bold">${d.span_id}</span>
+              <span class="text-gray-400 ml-1">${d.identifier}</span>
+              <div class="text-gray-500 mt-0.5 truncate">${escHtml(d.text_preview)}</div>
+            </div>`).join('')}
+        </div>
+        ${pageFiltered.length ? `
+          <h3 class="font-semibold text-sm text-gray-600 mt-4 mb-2">Filtrados (${pageFiltered.length})</h3>
+          <div class="space-y-1 max-h-48 overflow-y-auto">
+            ${pageFiltered.map(f => `
+              <div class="bg-yellow-50 rounded p-2 text-xs border-l-4 border-yellow-300">
+                <span class="font-medium">${f.filter_type}</span>
+                <span class="text-gray-400 ml-1">${f.reason}</span>
+                <div class="text-gray-500 mt-0.5 truncate">${escHtml(f.text_preview)}</div>
+              </div>`).join('')}
+          </div>` : ''}
+      </div>
+    </div>`;
+
+  // Store data for bbox drawing
+  window._currentPageData = { page, pageDevices, colors };
+  setTimeout(drawBboxes, 100);
+}
+
+function drawBboxes() {
+  const data = window._currentPageData;
+  if (!data) return;
+
+  const img = document.getElementById('page-img');
+  const canvas = document.getElementById('bbox-canvas');
+  if (!img || !canvas || !img.naturalWidth) return;
+
+  canvas.width = img.clientWidth;
+  canvas.height = img.clientHeight;
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const scaleX = img.clientWidth / data.page.width;
+  const scaleY = img.clientHeight / data.page.height;
+
+  for (const d of data.pageDevices) {
+    if (!d.bbox || d.bbox.length !== 4) continue;
+    const [x0, y0, x1, y1] = d.bbox;
+    const color = data.colors[d.device_type] || '#888';
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.7;
+    ctx.strokeRect(x0 * scaleX, y0 * scaleY, (x1-x0) * scaleX, (y1-y0) * scaleY);
+
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.08;
+    ctx.fillRect(x0 * scaleX, y0 * scaleY, (x1-x0) * scaleX, (y1-y0) * scaleY);
+
+    ctx.globalAlpha = 1.0;
+    ctx.fillStyle = color;
+    ctx.font = '10px monospace';
+    ctx.fillText(d.span_id, x0 * scaleX + 2, y0 * scaleY - 3);
+  }
+}
+
+function prevPage() { if (currentPage > 0) { currentPage--; renderPaginas(currentData.regex_classification); } }
+function nextPage() {
+  const total = currentData.pymupdf ? currentData.pymupdf.pages.length : 0;
+  if (currentPage < total - 1) { currentPage++; renderPaginas(currentData.regex_classification); }
+}
+
+function renderCanonico(rc) {
+  const devices = rc.devices;
+  const checks = rc.checks;
+
+  document.getElementById('tab-content').innerHTML = `
+    <div class="mb-4">
+      <h3 class="font-semibold text-sm text-gray-600 mb-2">Verificacao de offsets (${checks.offsets_matches}/${checks.offsets_total})</h3>
+      <div class="max-h-48 overflow-y-auto border rounded">
+        <table class="w-full text-xs">
+          <thead class="bg-gray-50 sticky top-0">
+            <tr>
+              <th class="text-left p-2">span_id</th>
+              <th class="text-left p-2">pg</th>
+              <th class="text-left p-2">offsets</th>
+              <th class="text-left p-2">match</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${checks.offsets_details.map(o => `
+              <tr class="border-t ${o.match ? '' : 'bg-red-50'}">
+                <td class="p-2 font-mono">${o.span_id}</td>
+                <td class="p-2">${o.page}</td>
+                <td class="p-2 font-mono">[${o.char_start}:${o.char_end}]</td>
+                <td class="p-2">${o.match ? '\u2713' : '\u2717'}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <h3 class="font-semibold text-sm text-gray-600 mb-2">Dispositivos com texto</h3>
+    <div class="space-y-2 max-h-[60vh] overflow-y-auto">
+      ${devices.map(d => {
+        const color = { article: 'border-red-400', paragraph: 'border-orange-400', inciso: 'border-blue-400', alinea: 'border-green-400' }[d.device_type] || 'border-gray-300';
+        return `
+          <div class="border-l-4 ${color} bg-gray-50 rounded p-3">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="font-mono font-bold text-sm">${d.span_id}</span>
+              <span class="text-xs text-gray-400">${d.identifier}</span>
+              <span class="text-xs text-gray-300 font-mono">[${d.char_start}:${d.char_end}] p${d.page_number}</span>
+            </div>
+            <pre class="text-xs text-gray-700 whitespace-pre-wrap font-mono bg-white rounded p-2 border">${escHtml(d.text)}</pre>
+          </div>`;
+      }).join('')}
+    </div>`;
+}
+
+function escHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s || '';
+  return div.innerHTML;
+}
+
+function timeAgo(iso) {
+  if (!iso) return '';
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'agora';
+  if (mins < 60) return mins + 'min';
+  const hrs = Math.floor(mins / 60);
+  return hrs + 'h ' + (mins % 60) + 'min';
+}
+
+// ============================================================================
+// DOWNLOADS
+// ============================================================================
+
+function downloadFile(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function downloadJson() {
+  const docId = currentData.metadata ? currentData.metadata.document_id : currentData.task_id;
+  downloadFile(
+    JSON.stringify(currentData, null, 2),
+    `${docId}-inspecao.json`,
+    'application/json'
+  );
+}
+
+function downloadMd() {
+  const md = generateMarkdownReport();
+  const docId = currentData.metadata ? currentData.metadata.document_id : currentData.task_id;
+  downloadFile(md, `${docId}-relatorio-extracao.md`, 'text/markdown');
+}
+
+function generateMarkdownReport() {
+  const rc = currentData.regex_classification;
+  const meta = currentData.metadata || {};
+  const s = rc.stats;
+  const c = rc.checks;
+  const pymupdf = currentData.pymupdf;
+  const now = meta.started_at || new Date().toISOString();
+  const docId = meta.document_id || currentData.task_id;
+  const totalPages = meta.total_pages || (pymupdf ? pymupdf.pages.length : 0);
+
+  let md = '';
+
+  // --- HEADER ---
+  md += `# VectorGov — Relatorio de Extracao PyMuPDF + Regex\n\n`;
+  md += `**Documento:** ${docId}  \n`;
+  md += `**Data:** ${now.replace('T', ' ').slice(0, 19)}  \n`;
+  md += `**Pipeline:** pymupdf + regex v1  \n`;
+  md += `**Paginas:** ${totalPages}  \n`;
+  md += `**Canonical hash:** \`${rc.canonical_hash}\`  \n`;
+  md += `**Canonical length:** ${rc.canonical_length} chars  \n`;
+  md += `**Duracao:** ${rc.duration_ms.toFixed(0)}ms  \n\n`;
+  md += `---\n\n`;
+
+  // --- RESUMO ---
+  md += `## RESUMO DA CLASSIFICACAO\n\n`;
+  md += `| Metrica | Valor |\n`;
+  md += `|---|---|\n`;
+  md += `| Total de blocos extraidos | **${s.total_blocks}** |\n`;
+  md += `| Dispositivos normativos | **${s.devices}** |\n`;
+  for (const [tipo, n] of Object.entries(s.by_device_type || {})) {
+    md += `|   - ${tipo.charAt(0).toUpperCase() + tipo.slice(1)}s | ${n} |\n`;
+  }
+  md += `| Blocos filtrados | **${s.filtered}** |\n`;
+  md += `| Nao classificados | **${s.unclassified}** |\n`;
+  md += `| Prof. max. hierarquia | **${s.max_hierarchy_depth}** |\n\n`;
+
+  // --- INTEGRIDADE ---
+  md += `### Integridade\n\n`;
+  md += `| Check | Resultado |\n`;
+  md += `|---|---|\n`;
+  md += `| Offsets | ${c.offsets_matches}/${c.offsets_total} ${c.offsets_pass ? 'PASS' : 'FAIL'} |\n`;
+  md += `| Unicode NFC | ${c.unicode_nfc ? 'PASS' : 'FAIL'} |\n`;
+  md += `| Normalizacao idempotente | ${c.normalization_idempotent ? 'PASS' : 'FAIL'} |\n`;
+  md += `| Trailing spaces | ${c.no_trailing_spaces ? 'PASS (0)' : 'FAIL (' + c.trailing_space_violations + ')'} |\n`;
+  md += `| Trailing \\n | ${c.trailing_newline ? 'PASS' : 'FAIL'} |\n\n`;
+  md += `---\n\n`;
+
+  // --- HIERARQUIA ---
+  md += `## HIERARQUIA DOS DISPOSITIVOS\n\n`;
+  md += '```\n';
+
+  // Build parent→children map for tree connectors
+  const childrenOf = {};
+  for (const d of rc.devices) {
+    const parent = d.parent_span_id || '__root__';
+    if (!childrenOf[parent]) childrenOf[parent] = [];
+    childrenOf[parent].push(d);
+  }
+
+  function renderTree(spanId, prefix) {
+    const children = childrenOf[spanId] || [];
+    children.forEach((d, i) => {
+      const isLast = i === children.length - 1;
+      const connector = prefix === '' ? '' : (isLast ? '\u2514\u2500\u2500 ' : '\u251C\u2500\u2500 ');
+      const nextPrefix = prefix === '' ? '    ' : prefix + (isLast ? '    ' : '\u2502   ');
+      md += `${prefix}${connector}${d.span_id} ${d.identifier}\n`;
+      renderTree(d.span_id, nextPrefix);
+    });
+  }
+
+  // Root devices (no parent)
+  const roots = rc.devices.filter(d => !d.parent_span_id);
+  roots.forEach(d => {
+    md += `${d.span_id} ${d.identifier}\n`;
+    renderTree(d.span_id, '');
+  });
+
+  md += '```\n\n';
+  md += `---\n\n`;
+
+  // --- DISPOSITIVOS POR PAGINA ---
+  md += `## DISPOSITIVOS POR PAGINA\n\n`;
+
+  const pageNums = [...new Set(rc.devices.map(d => d.page_number))].sort((a, b) => a - b);
+  for (const pg of pageNums) {
+    const pageDevices = rc.devices.filter(d => d.page_number === pg);
+    const pageFiltered = rc.filtered.filter(f => f.page_number === pg);
+
+    let pageInfo = `### PAGINA ${pg}`;
+    if (pymupdf && pymupdf.pages) {
+      const pdata = pymupdf.pages.find(p => p.page_number === pg);
+      if (pdata) {
+        pageInfo += ` (${pdata.blocks.length} blocos, ${pdata.width.toFixed(1)} x ${pdata.height.toFixed(1)} pt)`;
+      }
+    }
+    md += `${pageInfo}\n\n`;
+
+    // Device table
+    md += `| span_id | tipo | ident. | parent | texto |\n`;
+    md += `|---|---|---|---|---|\n`;
+    for (const d of pageDevices) {
+      const txt = (d.text_preview || d.text || '').replace(/\n/g, ' ').slice(0, 90);
+      md += `| **${d.span_id}** | ${d.device_type} | ${d.identifier} | ${d.parent_span_id || '\u2014'} | ${txt} |\n`;
+    }
+    md += `\n`;
+
+    // Filtered
+    if (pageFiltered.length) {
+      md += `**Filtrados:** `;
+      md += pageFiltered.map(f => `"${(f.text_preview || '').replace(/\n/g, ' ').slice(0, 60)}"`).join(', ');
+      md += `\n\n`;
+    }
+  }
+
+  md += `---\n\n`;
+
+  // --- TEXTO CANONICO CLASSIFICADO ---
+  md += `## TEXTO CANONICO CLASSIFICADO\n\n`;
+
+  for (const d of rc.devices) {
+    const txt = (d.text || '').replace(/\n/g, ' ').slice(0, 120);
+    md += `[${d.char_start}:${d.char_end}]  **[${d.span_id}]**  ${txt}\n\n`;
+  }
+
+  md += `---\n\n`;
+
+  // --- BLOCOS FILTRADOS ---
+  md += `## BLOCOS FILTRADOS (nao-normativos)\n\n`;
+  if (rc.filtered.length) {
+    md += `| pag | filter_type | texto |\n`;
+    md += `|---|---|---|\n`;
+    for (const f of rc.filtered) {
+      const txt = (f.text_preview || '').replace(/\n/g, ' ').slice(0, 80);
+      md += `| ${f.page_number} | ${f.filter_type} | ${txt} |\n`;
+    }
+  } else {
+    md += `Nenhum bloco filtrado.\n`;
+  }
+
+  md += `\n`;
+  return md;
+}
+
+// Init
+loadRecent();
+</script>
+</body>
+</html>
