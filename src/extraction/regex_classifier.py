@@ -35,8 +35,9 @@ class ClassifiedDevice:
 # ============================================================
 
 RE_ARTICLE = re.compile(
-    r"^\s*Art\.\s*(\d+)"
+    r"^\s*Art\.\s*(\d+(?:\.\d+)*)"
     r"[º°o]?"
+    r"(-[A-Za-z]+)?"
     r"[\w-]*"
     r"[.\s]",
     re.IGNORECASE,
@@ -186,8 +187,14 @@ def classify_block(block):
     # PASSO 2: Dispositivos normativos (PRIORIDADE MAXIMA)
     m = RE_ARTICLE.match(text)
     if m:
-        num = int(m.group(1))
-        return "article", f"Art. {num}º", f"Art. {num}"
+        num_str = m.group(1)  # "337", "5", "1.048"
+        suffix = m.group(2) or ""  # "-E" or ""
+        num_int = int(num_str.replace(".", ""))
+        if suffix:
+            identifier = f"Art. {num_int}{suffix}"
+        else:
+            identifier = f"Art. {num_int}º"
+        return "article", identifier, identifier
 
     m = RE_PARAGRAPH.match(text)
     if m:
@@ -231,6 +238,22 @@ def _extract_article_number(identifier):
     m = re.search(r"(\d+)", identifier or "")
     return int(m.group(1)) if m else 0
 
+def _extract_article_parts(identifier):
+    """Extrai numero e sufixo do identifier de artigo.
+    'Art. 337-E' → (337, '-E')
+    'Art. 5º' → (5, '')
+    'Art. 1.048' → (1048, '')
+    'Art. 6-A' → (6, '-A')
+    """
+    if not identifier:
+        return 0, ""
+    m = re.search(r"(\d+(?:\.\d+)*)(?:[º°o])?(-[A-Za-z]+)?", identifier)
+    if not m:
+        return 0, ""
+    num = int(m.group(1).replace(".", ""))
+    suffix = m.group(2) or ""
+    return num, suffix
+
 def _extract_paragraph_number(identifier):
     if identifier and ("único" in identifier.lower() or "unico" in identifier.lower()):
         return 0
@@ -244,27 +267,28 @@ def _extract_article_number_from_span_id(span_id):
 
 def _build_span_id(device_type, identifier, parent_chain):
     if device_type == "article":
-        num = _extract_article_number(identifier)
-        return f"ART-{num:03d}"
+        num, suffix = _extract_article_parts(identifier)
+        return f"ART-{num:03d}{suffix}"
+    art_suffix = parent_chain.get("article_suffix", "")
     if device_type == "paragraph":
         art_num = parent_chain.get("article_num", 0)
         par_num = _extract_paragraph_number(identifier)
-        return f"PAR-{art_num:03d}-{par_num}"
+        return f"PAR-{art_num:03d}{art_suffix}-{par_num}"
     if device_type == "inciso":
         art_num = parent_chain.get("article_num", 0)
         par_num = parent_chain.get("paragraph_num", None)
         roman = identifier or ""
         inc_num = ROMAN_TO_INT.get(roman, 0)
         if par_num is not None:
-            return f"INC-{art_num:03d}-{par_num}-{inc_num}"
+            return f"INC-{art_num:03d}{art_suffix}-{par_num}-{inc_num}"
         else:
-            return f"INC-{art_num:03d}-{inc_num}"
+            return f"INC-{art_num:03d}{art_suffix}-{inc_num}"
     if device_type == "alinea":
         art_num = parent_chain.get("article_num", 0)
         par_num = parent_chain.get("paragraph_num", None)
         inc_num = parent_chain.get("inciso_num", None)
         letter = identifier or ""
-        parts = [f"ALI-{art_num:03d}"]
+        parts = [f"ALI-{art_num:03d}{art_suffix}"]
         if par_num is not None:
             parts.append(str(par_num))
         if inc_num is not None:
@@ -338,9 +362,9 @@ def classify_document(pages):
         hierarchy_depth = 0
 
         if dtype == "article":
-            art_num = _extract_article_number(ident)
-            parent_chain = {"article_num": art_num}
-            current_article = {"span_id": None, "num": art_num}
+            art_num, art_suffix = _extract_article_parts(ident)
+            parent_chain = {"article_num": art_num, "article_suffix": art_suffix}
+            current_article = {"span_id": None, "num": art_num, "suffix": art_suffix}
             current_paragraph = None
             current_inciso = None
             hierarchy_depth = 0
@@ -348,9 +372,9 @@ def classify_document(pages):
             par_num = _extract_paragraph_number(ident)
             if current_article:
                 parent_span_id = current_article["span_id"]
-                parent_chain = {"article_num": current_article["num"], "paragraph_num": par_num}
+                parent_chain = {"article_num": current_article["num"], "article_suffix": current_article.get("suffix", ""), "paragraph_num": par_num}
             else:
-                parent_chain = {"article_num": 0, "paragraph_num": par_num}
+                parent_chain = {"article_num": 0, "article_suffix": "", "paragraph_num": par_num}
             current_paragraph = {"span_id": None, "num": par_num}
             current_inciso = None
             hierarchy_depth = 1
@@ -361,28 +385,30 @@ def classify_document(pages):
                 parent_span_id = current_paragraph["span_id"]
                 parent_chain = {
                     "article_num": current_article["num"] if current_article else 0,
+                    "article_suffix": current_article.get("suffix", "") if current_article else "",
                     "paragraph_num": current_paragraph["num"],
                     "inciso_num": inc_num,
                 }
                 hierarchy_depth = 2
             elif current_article:
                 parent_span_id = current_article["span_id"]
-                parent_chain = {"article_num": current_article["num"], "inciso_num": inc_num}
+                parent_chain = {"article_num": current_article["num"], "article_suffix": current_article.get("suffix", ""), "inciso_num": inc_num}
                 hierarchy_depth = 1
             else:
-                parent_chain = {"article_num": 0, "inciso_num": inc_num}
+                parent_chain = {"article_num": 0, "article_suffix": "", "inciso_num": inc_num}
             current_inciso = {"span_id": None, "num": inc_num}
         elif dtype == "alinea":
             if current_inciso:
                 parent_span_id = current_inciso["span_id"]
                 parent_chain = {
                     "article_num": current_article["num"] if current_article else 0,
+                    "article_suffix": current_article.get("suffix", "") if current_article else "",
                     "paragraph_num": current_paragraph["num"] if current_paragraph else None,
                     "inciso_num": current_inciso["num"],
                 }
                 hierarchy_depth = 3 if current_paragraph else 2
             else:
-                parent_chain = {"article_num": current_article["num"] if current_article else 0}
+                parent_chain = {"article_num": current_article["num"] if current_article else 0, "article_suffix": current_article.get("suffix", "") if current_article else ""}
                 hierarchy_depth = 1
 
         span_id = _build_span_id(dtype, ident, parent_chain)

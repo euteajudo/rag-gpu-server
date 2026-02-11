@@ -94,6 +94,7 @@ def _set_task_result(task_id: str, result: PipelineResult):
                 "total_time_seconds": result.total_time_seconds,
                 "chunks": [c.model_dump() for c in result.chunks],
                 "document_hash": result.document_hash,
+                "manifest": result.manifest,
             }
 
 
@@ -137,6 +138,7 @@ class IngestResponse(BaseModel):
     total_time_seconds: float = 0.0
     chunks: List[dict] = []
     document_hash: str = ""
+    manifest: dict = {}
 
 
 def _background_process(task_id: str, pdf_content: bytes, request: IngestRequest):

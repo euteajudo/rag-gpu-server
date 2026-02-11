@@ -201,6 +201,8 @@ class PipelineResult:
     canonical_hash: str = ""
     # Pipeline version para reprodutibilidade
     pipeline_version: str = ""
+    # Manifesto de ingestão para reconciliação pela VPS
+    manifest: dict = field(default_factory=dict)
 
 
 class IngestionPipeline:
@@ -442,6 +444,15 @@ class IngestionPipeline:
             if external_count > 0:
                 logger.info(f"[{request.document_id}] OriginClassifier: {external_count}/{len(chunks)} external")
 
+            # Enriquecer retrieval_text para chunks external (proveniência)
+            for chunk in chunks:
+                if getattr(chunk, "is_external_material", False):
+                    ref_name = getattr(chunk, "origin_reference_name", "") or ""
+                    ref_id = getattr(chunk, "origin_reference", "") or ""
+                    if ref_name:
+                        prefix = f"{ref_name} ({ref_id})" if ref_id else ref_name
+                        chunk.retrieval_text = f"{prefix}\n{chunk.retrieval_text}"
+
             report_progress("vlm_materialization", 0.88)
 
             # === Embeddings (se não pular) ===
@@ -476,6 +487,11 @@ class IngestionPipeline:
 
             # === Valida invariantes do contrato ===
             validate_chunk_invariants(chunks, request.document_id)
+
+            # Manifesto de ingestão
+            result.manifest = self._build_manifest(
+                chunks, extraction.canonical_text, extraction.canonical_hash, request.document_id,
+            )
 
             result.chunks = chunks
             result.status = IngestStatus.COMPLETED
@@ -1205,44 +1221,57 @@ class IngestionPipeline:
         return chunks
 
     @staticmethod
+    def _extract_art_num_suffix(identifier: str):
+        """Extrai número e sufixo de um identifier de artigo.
+        'Art. 337-E' → ('337', '-E'), 'Art. 5º' → ('5', ''), 'Art. 1.048' → ('1048', '')
+        """
+        import re
+        m = re.search(r"(\d+(?:\.\d+)*)(?:[º°o])?(-[A-Za-z]+)?", identifier or "")
+        if not m:
+            return "000", ""
+        num = m.group(1).replace(".", "")
+        suffix = m.group(2) or ""
+        return num, suffix
+
+    @staticmethod
     def _device_to_span_id(device) -> str:
-        """Converte DeviceExtraction para span_id (ex: ART-005, PAR-005-1)."""
+        """Converte DeviceExtraction para span_id (ex: ART-005, PAR-005-1, ART-337-E)."""
         import re
 
         identifier = device.identifier.strip()
         dtype = device.device_type.lower()
 
         if dtype == "artigo":
-            # "Art. 5º" -> "ART-005"
-            match = re.search(r"(\d+)", identifier)
-            num = match.group(1) if match else "000"
-            return f"ART-{num.zfill(3)}"
+            # "Art. 5º" -> "ART-005", "Art. 337-E" -> "ART-337-E"
+            num, suffix = IngestionPipeline._extract_art_num_suffix(identifier)
+            return f"ART-{num.zfill(3)}{suffix}"
 
         elif dtype == "paragrafo":
-            # "§ 1º" -> precisa do pai para montar PAR-005-1
+            # "§ 1º" -> precisa do pai para montar PAR-005-1 ou PAR-337-E-1
             match = re.search(r"(\d+)", identifier)
             num = match.group(1) if match else "0"
-            # Tenta extrair número do artigo pai
+            # Tenta extrair número e sufixo do artigo pai
             parent_id = device.parent_identifier or ""
-            parent_match = re.search(r"(\d+)", parent_id)
-            parent_num = parent_match.group(1) if parent_match else "000"
-            return f"PAR-{parent_num.zfill(3)}-{num}"
+            parent_num, parent_suffix = IngestionPipeline._extract_art_num_suffix(parent_id)
+            return f"PAR-{parent_num.zfill(3)}{parent_suffix}-{num}"
 
         elif dtype == "inciso":
-            # "I" / "II" -> INC-005-1
+            # "I" / "II" -> INC-005-1 ou INC-337-E-1
             parent_id = device.parent_identifier or ""
-            parent_match = re.search(r"(\d+)", parent_id)
-            parent_num = parent_match.group(1) if parent_match else "000"
+            parent_num, parent_suffix = IngestionPipeline._extract_art_num_suffix(parent_id)
             # Converte romano ou numérico
             inc_num = IngestionPipeline._roman_to_int(identifier.strip().rstrip(").-"))
-            return f"INC-{parent_num.zfill(3)}-{inc_num}"
+            return f"INC-{parent_num.zfill(3)}{parent_suffix}-{inc_num}"
 
         elif dtype == "alinea":
-            # "a)" -> ALI-005-3-a (parent pode ser inciso romano)
+            # "a)" -> ALI-005-3-a ou ALI-337-E-3-a
             parent_id = device.parent_identifier or ""
             parent_match = re.search(r"(\d+)", parent_id)
             if parent_match:
                 parent_num = parent_match.group(1).zfill(3)
+                # Check for suffix in grandparent context (via parent_id)
+                _, parent_suffix = IngestionPipeline._extract_art_num_suffix(parent_id)
+                parent_num = f"{parent_num}{parent_suffix}"
             else:
                 # Parent é inciso romano (ex: "III")
                 parent_num = str(IngestionPipeline._roman_to_int(parent_id.strip()))
@@ -1256,18 +1285,18 @@ class IngestionPipeline:
     def _identifier_to_span_id(identifier: str, child_type: str) -> str:
         """Converte parent_identifier para span_id do pai."""
         import re
-        match = re.search(r"(\d+)", identifier)
-        num = match.group(1) if match else "000"
+        num, suffix = IngestionPipeline._extract_art_num_suffix(identifier)
 
         # Detecta tipo do pai pelo identificador
         ident_lower = identifier.lower().strip()
         if ident_lower.startswith("art"):
-            return f"ART-{num.zfill(3)}"
+            return f"ART-{num.zfill(3)}{suffix}"
         elif "§" in identifier or ident_lower.startswith("par"):
-            parent_match = re.search(r"(\d+)", identifier)
-            return f"PAR-{num.zfill(3)}-{parent_match.group(1) if parent_match else '0'}"
+            par_match = re.search(r"(\d+)", identifier)
+            par_num = par_match.group(1) if par_match else "0"
+            return f"PAR-{num.zfill(3)}{suffix}-{par_num}"
         else:
-            return f"ART-{num.zfill(3)}"
+            return f"ART-{num.zfill(3)}{suffix}"
 
     @staticmethod
     def _roman_to_int(s: str) -> int:
@@ -1877,6 +1906,15 @@ class IngestionPipeline:
             if external_count > 0:
                 logger.info(f"[{request.document_id}] OriginClassifier: {external_count}/{len(chunks)} external")
 
+            # 7.5. Enriquecer retrieval_text para chunks external (proveniência)
+            for chunk in chunks:
+                if getattr(chunk, "is_external_material", False):
+                    ref_name = getattr(chunk, "origin_reference_name", "") or ""
+                    ref_id = getattr(chunk, "origin_reference", "") or ""
+                    if ref_name:
+                        prefix = f"{ref_name} ({ref_id})" if ref_id else ref_name
+                        chunk.retrieval_text = f"{prefix}\n{chunk.retrieval_text}"
+
             report_progress("pymupdf_regex_extraction", 0.70)
 
             # 8. Embeddings (se não pular)
@@ -1920,6 +1958,11 @@ class IngestionPipeline:
                 ingest_run_id=result.ingest_run_id,
             )
 
+            # 12. Manifesto de ingestão
+            result.manifest = self._build_manifest(
+                chunks, canonical_text, canonical_hash, request.document_id,
+            )
+
             result.chunks = chunks
             result.status = IngestStatus.COMPLETED
 
@@ -1927,7 +1970,8 @@ class IngestionPipeline:
 
             logger.info(
                 f"Pipeline PyMuPDF+Regex concluído: {len(chunks)} chunks, "
-                f"{len(devices)} dispositivos"
+                f"{len(devices)} dispositivos, "
+                f"manifest: {result.manifest.get('total_spans')} spans"
             )
 
         except Exception as e:
@@ -1937,6 +1981,100 @@ class IngestionPipeline:
                 phase="pymupdf_regex",
                 message=str(e),
             ))
+
+    @staticmethod
+    def _build_manifest(
+        chunks: List[ProcessedChunk],
+        canonical_text: str,
+        canonical_hash: str,
+        document_id: str,
+    ) -> dict:
+        """
+        Gera manifesto de ingestão para reconciliação pela VPS.
+
+        Inclui contagens, lista de span_ids, cobertura de offsets,
+        e material externo detectado.
+        """
+        span_ids = []
+        spans_by_type: Dict[str, int] = {}
+        chunks_by_level: Dict[str, int] = {}
+        article_numbers = []
+        external_spans = []
+        vehicle_articles = []
+        target_documents_set: set = set()
+        covered_intervals = []
+
+        for c in chunks:
+            sid = c.span_id or ""
+            span_ids.append(sid)
+
+            dt = c.device_type or ""
+            spans_by_type[dt] = spans_by_type.get(dt, 0) + 1
+
+            cl = c.chunk_level or ""
+            chunks_by_level[cl] = chunks_by_level.get(cl, 0) + 1
+
+            if dt == "article":
+                # Extrai numero do artigo do span_id (ART-005 -> "5", ART-337-E -> "337-E")
+                art_part = sid.replace("ART-", "", 1) if sid.startswith("ART-") else ""
+                if art_part:
+                    # Remove leading zeros: "005" -> "5", "337-E" -> "337-E"
+                    parts = art_part.split("-", 1)
+                    num_str = str(int(parts[0])) if parts[0].isdigit() else parts[0]
+                    if len(parts) > 1:
+                        num_str += f"-{parts[1]}"
+                    article_numbers.append(num_str)
+
+            if getattr(c, "origin_type", "self") == "external":
+                external_spans.append(sid)
+            if getattr(c, "origin_reason", "") and "veiculo" in getattr(c, "origin_reason", ""):
+                vehicle_articles.append(sid)
+            origin_ref = getattr(c, "origin_reference", "") or ""
+            if origin_ref and origin_ref not in target_documents_set:
+                target_documents_set.add(origin_ref)
+
+            cs = getattr(c, "canonical_start", -1)
+            ce = getattr(c, "canonical_end", -1)
+            if cs >= 0 and ce > cs:
+                covered_intervals.append((cs, ce))
+
+        # Calcula cobertura de offsets (merge overlapping intervals)
+        covered_chars = 0
+        if covered_intervals:
+            covered_intervals.sort()
+            merged = [covered_intervals[0]]
+            for start, end in covered_intervals[1:]:
+                if start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            covered_chars = sum(end - start for start, end in merged)
+
+        total_chars = len(canonical_text) if canonical_text else 0
+        coverage_pct = round((covered_chars / total_chars * 100), 1) if total_chars > 0 else 0.0
+
+        return {
+            "document_id": document_id,
+            "canonical_hash": canonical_hash,
+            "canonical_length": total_chars,
+            "total_spans": len(span_ids),
+            "total_chunks": len(chunks),
+            "spans_by_type": spans_by_type,
+            "chunks_by_level": chunks_by_level,
+            "span_ids": span_ids,
+            "article_numbers": article_numbers,
+            "offsets_coverage": {
+                "total_chars": total_chars,
+                "covered_chars": covered_chars,
+                "coverage_pct": coverage_pct,
+            },
+            "external_material": {
+                "count": len(external_spans),
+                "spans": external_spans,
+                "target_documents": sorted(target_documents_set),
+                "vehicle_articles": vehicle_articles,
+            },
+        }
 
     def _phase_milvus_sink(self, materialized, request: IngestRequest, result: PipelineResult):
         """Fase 5.5: Inserir chunks no Milvus remoto (se MILVUS_HOST configurado)."""
