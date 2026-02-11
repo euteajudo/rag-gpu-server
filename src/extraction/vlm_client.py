@@ -224,6 +224,112 @@ class VLMClient:
             f"VLM falhou após {self.max_retries} tentativas: {last_error}"
         )
 
+    async def ocr_page(
+        self,
+        image_base64: str,
+        temperature: float = 0.0,
+        max_tokens: int = 8192,
+    ) -> str:
+        """
+        OCR de uma página via VLM. Retorna texto bruto (não JSON).
+
+        Args:
+            image_base64: Imagem da página em base64 (PNG)
+            temperature: Temperatura de geração (0.0 para determinístico)
+            max_tokens: Máximo de tokens na resposta
+
+        Returns:
+            Texto transcrito da página
+
+        Raises:
+            RuntimeError: Se todas as tentativas falharem
+        """
+        from .vlm_ocr import OCR_SYSTEM_PROMPT, OCR_PAGE_PROMPT
+
+        messages = [
+            {"role": "system", "content": OCR_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_base64}",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": OCR_PAGE_PROMPT,
+                    },
+                ],
+            },
+        ]
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                start_time = time.time()
+
+                response = await self._client.post(
+                    "/chat/completions",
+                    json=payload,
+                )
+                response.raise_for_status()
+
+                elapsed = time.time() - start_time
+                data = response.json()
+
+                # Extrai conteúdo da resposta
+                content = data["choices"][0]["message"]["content"]
+
+                # Remove bloco <think> se presente
+                content = _strip_thinking_block(content)
+
+                # Log métricas
+                usage = data.get("usage", {})
+                logger.debug(
+                    f"VLM OCR response: {elapsed:.2f}s, "
+                    f"prompt_tokens={usage.get('prompt_tokens', '?')}, "
+                    f"completion_tokens={usage.get('completion_tokens', '?')}"
+                )
+
+                return content.strip()
+
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                logger.warning(
+                    f"VLM OCR HTTP error (attempt {attempt + 1}/{self.max_retries}): "
+                    f"{e.response.status_code} - {e.response.text[:200]}"
+                )
+                if attempt < self.max_retries - 1:
+                    import asyncio
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+
+            except httpx.TimeoutException as e:
+                last_error = e
+                logger.warning(
+                    f"VLM OCR timeout (attempt {attempt + 1}/{self.max_retries}): {e}"
+                )
+                if attempt < self.max_retries - 1:
+                    import asyncio
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+
+            except Exception as e:
+                last_error = e
+                logger.error(f"VLM OCR unexpected error: {e}")
+                raise
+
+        raise RuntimeError(
+            f"VLM OCR falhou após {self.max_retries} tentativas: {last_error}"
+        )
+
     async def health_check(self) -> bool:
         """Verifica se o servidor VLM está respondendo."""
         try:

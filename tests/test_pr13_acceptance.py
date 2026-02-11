@@ -2,11 +2,12 @@
 """
 PR13 Acceptance Tests (A–E) — Contract Alignment.
 
-Validates that the VLM pipeline satisfies PR13 contracts:
+Validates that both pipelines (Entrada 1: PyMuPDF+Regex, Entrada 2: VLM OCR+Regex)
+satisfy PR13 contracts:
 - A: validate_chunk_invariants() gate aborts on violations
 - B: extract_snippet_by_offsets() pure slicing when hash matches
 - C: resolve_child_offsets() hierarchy containment
-- D: _resolve_vlm_offsets() resolves all evidence sentinel offsets
+- D: split_ocr_into_blocks() produces valid blocks with correct offsets
 - E: RunPod→VPS contract: required fields + snippet round-trip
 """
 
@@ -30,12 +31,10 @@ from src.utils.canonical_utils import (
     normalize_canonical_text,
     compute_canonical_hash,
 )
-from src.extraction.vlm_models import (
-    BlockData,
-    PageData,
-    DeviceExtraction,
-    PageExtraction,
-    DocumentExtraction,
+from src.extraction.vlm_ocr import (
+    split_ocr_into_blocks,
+    ocr_to_pages_data,
+    validate_ocr_quality,
 )
 
 
@@ -319,221 +318,117 @@ class TestC_HierarchyContainment:
 
 
 # =============================================================================
-# Test D — _resolve_vlm_offsets() resolves sentinel offsets
+# Test D — split_ocr_into_blocks() produces valid blocks with correct offsets
 # =============================================================================
 
-class TestD_ResolveVlmOffsets:
-    """After _resolve_vlm_offsets(), zero evidence chunks with sentinels."""
+class TestD_SplitOcrIntoBlocks:
+    """split_ocr_into_blocks() produces blocks with correct offsets for regex."""
 
-    @staticmethod
-    def _build_extraction(canonical_text: str, devices_per_page: dict):
-        """
-        Build a DocumentExtraction + pages_data with proper block offsets.
+    def test_D1_basic_split_articles(self):
+        """OCR text with articles splits into separate blocks."""
+        ocr_pages = [
+            (1, "Art. 1º O servidor público fica obrigado.\n§ 1º O prazo é de trinta dias."),
+        ]
+        blocks, canonical_text, page_boundaries = split_ocr_into_blocks(ocr_pages)
 
-        Args:
-            canonical_text: the full canonical text (normalized)
-            devices_per_page: {page_num: [(device_type, identifier, parent_id, text, bbox_norm), ...]}
+        # Should have at least 2 blocks (Art. 1º and § 1º)
+        assert len(blocks) >= 2, f"Expected >= 2 blocks, got {len(blocks)}"
 
-        Returns:
-            (DocumentExtraction, canonical_hash)
-        """
-        canonical_hash = compute_canonical_hash(canonical_text)
-        pages = []
-        pages_data_list = []
+        # Invariant: canonical_text[start:end] == block.text
+        for b in blocks:
+            assert canonical_text[b["char_start"]:b["char_end"]] == b["text"], \
+                f"Offset invariant broken for block {b['block_index']}: " \
+                f"expected {b['text'][:40]!r}, got {canonical_text[b['char_start']:b['char_end']][:40]!r}"
 
-        for page_num, devices in sorted(devices_per_page.items()):
-            # Build devices
-            dev_list = []
-            for dtype, ident, parent_ident, text, bbox in devices:
-                dev_list.append(DeviceExtraction(
-                    device_type=dtype,
-                    identifier=ident,
-                    text=text,
-                    parent_identifier=parent_ident,
-                    bbox=bbox,
-                    confidence=0.95,
-                ))
+    def test_D2_multi_page_concatenation(self):
+        """OCR pages are concatenated with page boundaries tracked."""
+        ocr_pages = [
+            (1, "Art. 1º Primeiro artigo."),
+            (2, "Art. 2º Segundo artigo."),
+        ]
+        blocks, canonical_text, page_boundaries = split_ocr_into_blocks(ocr_pages)
 
-            pages.append(PageExtraction(
-                page_number=page_num,
-                devices=dev_list,
-            ))
+        # Both pages present in boundaries
+        page_nums = [pn for pn, _, _ in page_boundaries]
+        assert 1 in page_nums
+        assert 2 in page_nums
 
-            # Build PageData with blocks covering the whole canonical text
-            # For simplicity, one big block per page covering the full text
-            page_text_start = canonical_text.find(
-                next((d[3] for d in devices if d[3].strip()), ""), 0
-            )
-            if page_text_start < 0:
-                page_text_start = 0
+        # Blocks from different pages
+        page_1_blocks = [b for b in blocks if b["page_number"] == 1]
+        page_2_blocks = [b for b in blocks if b["page_number"] == 2]
+        assert len(page_1_blocks) >= 1
+        assert len(page_2_blocks) >= 1
 
-            # Find the end of the last device text on this page
-            page_text_end = page_text_start
-            for d in devices:
-                pos = canonical_text.find(d[3].strip(), page_text_start)
-                if pos >= 0:
-                    end = pos + len(d[3].strip())
-                    if end > page_text_end:
-                        page_text_end = end
+        # Canonical text ends with newline
+        assert canonical_text.endswith("\n")
 
-            if page_text_end <= page_text_start:
-                page_text_end = len(canonical_text)
+    def test_D3_inciso_and_alinea_split(self):
+        """Incisos (roman numerals) and alíneas (a), b)) create separate blocks."""
+        ocr_pages = [
+            (1, "Art. 1º Caput do artigo:\nI - primeiro inciso;\nII - segundo inciso;\na) alínea a;\nb) alínea b;"),
+        ]
+        blocks, canonical_text, page_boundaries = split_ocr_into_blocks(ocr_pages)
 
-            # Create block that covers the device's text region
-            block = BlockData(
-                block_index=0,
-                char_start=page_text_start,
-                char_end=page_text_end,
-                bbox_pdf=[50.0, 50.0, 500.0, 700.0],
-                text=canonical_text[page_text_start:page_text_end],
-                page_number=page_num,
-            )
+        # Should have blocks for Art, I, II, a), b)
+        assert len(blocks) >= 4, f"Expected >= 4 blocks, got {len(blocks)}"
 
-            pd = PageData(
-                page_number=page_num,
-                image_png=b"",
-                image_base64="",
-                text=canonical_text[page_text_start:page_text_end],
-                width=612.0,
-                height=792.0,
-                img_width=1224,
-                img_height=1584,
-                blocks=[block],
-                char_start=page_text_start,
-                char_end=page_text_end,
-            )
-            pages_data_list.append(pd)
+        # All offsets valid
+        for b in blocks:
+            assert canonical_text[b["char_start"]:b["char_end"]] == b["text"]
 
-        extraction = DocumentExtraction(
-            document_id="DOC-TEST",
-            pages=pages,
-            canonical_text=canonical_text,
-            canonical_hash=canonical_hash,
-            total_devices=sum(len(d) for d in devices_per_page.values()),
-            pages_data=pages_data_list,
-        )
+    def test_D4_empty_page_skipped(self):
+        """Empty OCR pages are skipped without error."""
+        ocr_pages = [
+            (1, "Art. 1º Texto."),
+            (2, ""),
+            (3, "Art. 2º Mais texto."),
+        ]
+        blocks, canonical_text, page_boundaries = split_ocr_into_blocks(ocr_pages)
 
-        return extraction, canonical_hash
+        # Page 2 should not appear in boundaries
+        page_nums = [pn for pn, _, _ in page_boundaries]
+        assert 2 not in page_nums
+        assert 1 in page_nums
+        assert 3 in page_nums
 
-    def test_D1_bbox_matching_resolves_all(self):
-        """Devices with matching bboxes + blocks get resolved via Phase A."""
-        canonical = normalize_canonical_text(
-            "Art. 1\u00ba O servidor p\u00fablico fica obrigado.\n"
-            "\u00a7 1\u00ba O prazo \u00e9 de trinta dias.\n"
-            "\u00a7 2\u00ba A notifica\u00e7\u00e3o ser\u00e1 pessoal.\n"
-        )
+    def test_D5_normalization_nfc_and_rstrip(self):
+        """OCR text is NFC-normalized and lines are rstripped."""
+        import unicodedata
+        ocr_pages = [
+            (1, "Art. 1º Texto com espaços finais.   \nSegunda linha.  "),
+        ]
+        blocks, canonical_text, page_boundaries = split_ocr_into_blocks(ocr_pages)
 
-        # All devices on page 1 with bbox overlapping the single block
-        devices = {
-            1: [
-                ("artigo", "Art. 1\u00ba", "", "Art. 1\u00ba O servidor p\u00fablico fica obrigado.",
-                 [0.05, 0.05, 0.90, 0.35]),
-                ("paragrafo", "\u00a7 1\u00ba", "Art. 1\u00ba", "\u00a7 1\u00ba O prazo \u00e9 de trinta dias.",
-                 [0.05, 0.35, 0.90, 0.60]),
-                ("paragrafo", "\u00a7 2\u00ba", "Art. 1\u00ba", "\u00a7 2\u00ba A notifica\u00e7\u00e3o ser\u00e1 pessoal.",
-                 [0.05, 0.60, 0.90, 0.85]),
-            ]
-        }
+        # Should be NFC
+        assert unicodedata.is_normalized("NFC", canonical_text)
 
-        extraction, canonical_hash = self._build_extraction(canonical, devices)
-        request = IngestRequest(
-            document_id="DOC-TEST",
-            tipo_documento="LEI",
-            numero="1",
-            ano=2021,
-        )
-        result = PipelineResult(status=IngestStatus.PROCESSING, document_id="DOC-TEST")
+        # No trailing spaces on any line
+        for line in canonical_text.split("\n"):
+            assert line == line.rstrip(), f"Trailing space in line: {line!r}"
 
-        pipeline = IngestionPipeline()
-        chunks = pipeline._vlm_to_processed_chunks(extraction, request, result)
+    def test_D6_quality_gate_no_articles(self):
+        """Quality gate warns when no articles found."""
+        from dataclasses import dataclass
 
-        EVIDENCE = {"article", "paragraph", "inciso", "alinea"}
-        for chunk in chunks:
-            if chunk.device_type in EVIDENCE:
-                assert chunk.canonical_start >= 0, \
-                    f"{chunk.span_id} has sentinel start={chunk.canonical_start}"
-                assert chunk.canonical_end > chunk.canonical_start, \
-                    f"{chunk.span_id} has sentinel end={chunk.canonical_end}"
-                assert chunk.canonical_hash != "", \
-                    f"{chunk.span_id} has empty canonical_hash"
+        @dataclass
+        class FakeDevice:
+            device_type: str
 
-    def test_D2_find_fallback_resolves_without_bbox(self):
-        """Devices without bbox get resolved via Phase B (find)."""
-        canonical = normalize_canonical_text(
-            "Art. 2\u00ba As despesas ser\u00e3o cobertas.\n"
-        )
+        devices = [FakeDevice(device_type="paragraph")]
+        warnings = validate_ocr_quality(devices, "Texto qualquer\n", 3, "DOC-TEST")
+        assert any("nenhum artigo" in w for w in warnings)
 
-        # Device with empty bbox
-        devices = {
-            1: [
-                ("artigo", "Art. 2\u00ba", "",
-                 "Art. 2\u00ba As despesas ser\u00e3o cobertas.",
-                 []),  # No bbox
-            ]
-        }
+    def test_D7_quality_gate_short_text(self):
+        """Quality gate warns when text is suspiciously short."""
+        from dataclasses import dataclass
 
-        extraction, canonical_hash = self._build_extraction(canonical, devices)
-        request = IngestRequest(
-            document_id="DOC-TEST",
-            tipo_documento="LEI",
-            numero="2",
-            ano=2021,
-        )
-        result = PipelineResult(status=IngestStatus.PROCESSING, document_id="DOC-TEST")
+        @dataclass
+        class FakeDevice:
+            device_type: str
 
-        pipeline = IngestionPipeline()
-        chunks = pipeline._vlm_to_processed_chunks(extraction, request, result)
-
-        assert len(chunks) == 1
-        chunk = chunks[0]
-        assert chunk.canonical_start >= 0, "Should be resolved via find()"
-        assert chunk.canonical_end > chunk.canonical_start
-        assert chunk.canonical_hash == canonical_hash
-
-    def test_D3_child_resolved_via_parent_range(self):
-        """Child without bbox/find-match resolved via Phase C (parent range)."""
-        # Construct canonical where the inciso text is only findable within the article
-        canonical = normalize_canonical_text(
-            "Art. 1\u00ba O artigo que trata das obriga\u00e7\u00f5es.\n"
-            "I - primeira obriga\u00e7\u00e3o espec\u00edfica;\n"
-            "II - segunda obriga\u00e7\u00e3o espec\u00edfica;\n"
-        )
-
-        devices = {
-            1: [
-                ("artigo", "Art. 1\u00ba", "",
-                 "Art. 1\u00ba O artigo que trata das obriga\u00e7\u00f5es.\n"
-                 "I - primeira obriga\u00e7\u00e3o espec\u00edfica;\n"
-                 "II - segunda obriga\u00e7\u00e3o espec\u00edfica;",
-                 [0.05, 0.05, 0.95, 0.95]),
-                ("inciso", "I", "Art. 1\u00ba",
-                 "I - primeira obriga\u00e7\u00e3o espec\u00edfica;",
-                 []),  # No bbox — will need find or parent resolve
-                ("inciso", "II", "Art. 1\u00ba",
-                 "II - segunda obriga\u00e7\u00e3o espec\u00edfica;",
-                 []),  # No bbox
-            ]
-        }
-
-        extraction, canonical_hash = self._build_extraction(canonical, devices)
-        request = IngestRequest(
-            document_id="DOC-TEST",
-            tipo_documento="LEI",
-            numero="1",
-            ano=2021,
-        )
-        result = PipelineResult(status=IngestStatus.PROCESSING, document_id="DOC-TEST")
-
-        pipeline = IngestionPipeline()
-        chunks = pipeline._vlm_to_processed_chunks(extraction, request, result)
-
-        EVIDENCE = {"article", "paragraph", "inciso", "alinea"}
-        for chunk in chunks:
-            if chunk.device_type in EVIDENCE:
-                assert chunk.canonical_start >= 0, \
-                    f"{chunk.span_id} still sentinel after resolution"
-                assert chunk.canonical_end > chunk.canonical_start
-                assert chunk.canonical_hash == canonical_hash
+        devices = [FakeDevice(device_type="article")]
+        warnings = validate_ocr_quality(devices, "Curto\n", 5, "DOC-TEST")
+        assert any("chars/página" in w for w in warnings)
 
 
 # =============================================================================

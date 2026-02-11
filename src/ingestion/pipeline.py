@@ -212,7 +212,6 @@ class IngestionPipeline:
         self._embedder = None
         self._artifacts_uploader = None
         self._vlm_service = None
-        self._last_resolution_map: Dict[str, dict] = {}
 
     @property
     def embedder(self):
@@ -351,58 +350,58 @@ class IngestionPipeline:
         report_progress,
     ) -> None:
         """
-        Pipeline VLM completo: PyMuPDF + Qwen3-VL -> ProcessedChunks.
+        Pipeline VLM OCR: PyMuPDF (imagens) + Qwen3-VL (OCR) → mesmo regex.
 
-        Args:
-            pdf_content: Bytes do PDF original
-            request: Metadados do documento
-            result: PipelineResult em construção
-            report_progress: Callback de progresso
+        Entrada 2: a única diferença da Entrada 1 é DE ONDE vem o texto.
+        Aqui o texto vem do OCR do Qwen3-VL em vez do PyMuPDF nativo.
+        Todo o pipeline downstream (regex classifier, chunks, embeddings) é idêntico.
         """
         phase_start = time.perf_counter()
 
         try:
             from ..config import config as app_config
-            # Roda o pipeline VLM assíncrono em um event loop limpo.
-            # O process() é chamado de um thread background, então
-            # criamos sempre um loop novo para evitar "Event loop is closed"
-            # quando o httpx.AsyncClient tenta reusar um loop fechado.
+            from ..extraction.regex_classifier import classify_to_devices
+            from ..extraction.regex_classifier import classify_document as regex_classify_document
+            from ..extraction.vlm_ocr import validate_ocr_quality
+
+            # 1. VLM OCR: PyMuPDF (imagens) + Qwen3-VL (texto por página)
             self.vlm_service.vlm_client.reset_client()
-            extraction = asyncio.run(
-                self.vlm_service.extract_document(
+            pages_data, raw_canonical = asyncio.run(
+                self.vlm_service.ocr_document(
                     pdf_bytes=pdf_content,
                     document_id=request.document_id,
                     progress_callback=report_progress,
                 )
             )
 
-            report_progress("vlm_extraction", 0.80)
+            report_progress("vlm_extraction", 0.30)
 
-            # Registra fase VLM
-            vlm_duration = round(time.perf_counter() - phase_start, 2)
-            result.phases.append({
-                "name": "vlm_extraction",
-                "duration_seconds": vlm_duration,
-                "output": (
-                    f"Extraídos {extraction.total_devices} dispositivos de "
-                    f"{len(extraction.pages)} páginas via PyMuPDF+Qwen3-VL"
-                ),
-                "success": True,
-                "method": "pymupdf+qwen3vl",
-            })
+            # 2. Idempotency check (offsets nativos devem sobreviver normalize)
+            canonical_text = raw_canonical
+            normalized_check = normalize_canonical_text(raw_canonical)
+            if canonical_text != normalized_check:
+                logger.error(
+                    f"[{request.document_id}] OFFSET DRIFT: OCR canonical_text "
+                    f"diverge de normalize_canonical_text() — offsets seriam inválidos! "
+                    f"raw_len={len(canonical_text)} norm_len={len(normalized_check)}"
+                )
+                raise RuntimeError(
+                    "VLM OCR canonical_text diverge de normalize_canonical_text(): "
+                    "offsets nativos seriam inválidos."
+                )
+            canonical_hash = compute_canonical_hash(canonical_text)
 
-            # Armazena canonical para uso posterior
-            result.markdown_content = extraction.canonical_text
-            result.canonical_hash = extraction.canonical_hash
+            result.markdown_content = canonical_text
+            result.canonical_hash = canonical_hash
 
-            # === Drift detection ===
+            # 3. Drift detection
             from ..utils.drift_detector import DriftDetector
             drift_detector = DriftDetector()
             drift = drift_detector.check(
                 document_id=request.document_id,
                 pdf_hash=result.document_hash,
                 pipeline_version=app_config.pipeline_version,
-                current_canonical_hash=extraction.canonical_hash,
+                current_canonical_hash=canonical_hash,
             )
             if drift.is_drifted:
                 logger.warning(f"DRIFT DETECTADO: {drift.message}")
@@ -412,39 +411,66 @@ class IngestionPipeline:
                     f"curr={drift.current_canonical_hash[:16]}...)"
                 )
 
-            # === Converte DocumentExtraction -> list[ProcessedChunk] ===
-            report_progress("vlm_materialization", 0.80)
+            report_progress("vlm_extraction", 0.40)
 
-            chunks = self._vlm_to_processed_chunks(extraction, request, result)
+            # 4. Converte pages para formato do classifier
+            pages_for_classifier = self._convert_pages_to_classifier_format(pages_data)
 
-            # === Canonical text swap (F1) ===
-            # Para chunks com offsets resolvidos, substituir o texto VLM (que pode
-            # conter conteúdo de dispositivos adjacentes) pelo slice exato do
-            # canonical_text do PyMuPDF. O texto VLM original já está preservado
-            # em extraction.debug_artifacts.
-            canonical_text = extraction.canonical_text
-            swap_count = 0
-            for chunk in chunks:
-                if chunk.canonical_start >= 0 and chunk.canonical_end > chunk.canonical_start:
-                    canon_slice = canonical_text[chunk.canonical_start:chunk.canonical_end]
-                    if canon_slice.strip():
-                        chunk.text = canon_slice
-                        chunk.retrieval_text = canon_slice
-                        swap_count += 1
-            if swap_count > 0:
-                logger.info(
-                    f"[{request.document_id}] Canonical text swap: "
-                    f"{swap_count}/{len(chunks)} chunks"
+            # 5. Classificação regex (MESMO classifier da Entrada 1)
+            classification_result = regex_classify_document(pages_for_classifier)
+            devices = classify_to_devices(pages_for_classifier)
+            logger.info(
+                f"[{request.document_id}] VLM OCR + RegexClassifier: {len(devices)} dispositivos"
+            )
+
+            report_progress("vlm_extraction", 0.55)
+
+            # 5.1. Quality gate OCR
+            ocr_warnings = validate_ocr_quality(
+                devices, canonical_text, len(pages_data), request.document_id,
+            )
+            for w in ocr_warnings:
+                logger.warning(f"[{request.document_id}] {w}")
+                result.quality_issues.append(w)
+
+            # Registra fase
+            extract_duration = round(time.perf_counter() - phase_start, 2)
+            result.phases.append({
+                "name": "vlm_ocr_extraction",
+                "duration_seconds": extract_duration,
+                "output": (
+                    f"Extraídos {len(devices)} dispositivos de "
+                    f"{len(pages_data)} páginas via VLM OCR+Regex"
+                ),
+                "success": True,
+                "method": "vlm_ocr+regex",
+            })
+
+            # 6. Emit inspection snapshot (Redis) — reutiliza formato regex
+            try:
+                self._emit_regex_inspection_snapshot(
+                    classification_result, canonical_text, canonical_hash,
+                    extract_duration, request, pages_data,
+                    extraction_source="vlm_ocr",
                 )
+            except Exception as e:
+                logger.warning(f"Failed to emit inspector snapshot: {e}")
 
-            # Origin Classification — detecta material externo (ex: artigos do CP inseridos)
+            # 7. Converte ClassifiedDevice -> ProcessedChunk (MESMO da Entrada 1)
+            chunks = self._regex_to_processed_chunks(
+                devices, canonical_text, canonical_hash, request,
+            )
+
+            report_progress("vlm_extraction", 0.65)
+
+            # 8. Origin Classification
             from ..classification.origin_classifier import classify_document
-            chunks = classify_document(chunks, extraction.canonical_text, request.document_id)
+            chunks = classify_document(chunks, canonical_text, request.document_id)
             external_count = sum(1 for c in chunks if c.origin_type == "external")
             if external_count > 0:
                 logger.info(f"[{request.document_id}] OriginClassifier: {external_count}/{len(chunks)} external")
 
-            # Enriquecer retrieval_text para chunks external (proveniência)
+            # 8.5. Enriquecer retrieval_text para chunks external (proveniência)
             for chunk in chunks:
                 if getattr(chunk, "is_external_material", False):
                     ref_name = getattr(chunk, "origin_reference_name", "") or ""
@@ -453,12 +479,11 @@ class IngestionPipeline:
                         prefix = f"{ref_name} ({ref_id})" if ref_id else ref_name
                         chunk.retrieval_text = f"{prefix}\n{chunk.retrieval_text}"
 
-            report_progress("vlm_materialization", 0.88)
+            report_progress("vlm_extraction", 0.70)
 
-            # === Embeddings (se não pular) ===
+            # 9. Embeddings (se não pular)
             if not request.skip_embeddings:
-                report_progress("embedding", 0.88)
-                # Cria objetos compatíveis para embedding
+                report_progress("embedding", 0.70)
                 for chunk in chunks:
                     text_for_embedding = chunk.retrieval_text or chunk.text
                     embed_result = self.embedder.encode([text_for_embedding])
@@ -468,866 +493,58 @@ class IngestionPipeline:
                         if embed_result.sparse_embeddings
                         else {}
                     )
-                report_progress("embedding", 0.94)
+                report_progress("embedding", 0.88)
 
                 result.phases.append({
                     "name": "embedding",
-                    "duration_seconds": round(time.perf_counter() - phase_start - vlm_duration, 2),
-                    "output": f"Embeddings para {len(chunks)} chunks VLM",
+                    "duration_seconds": round(time.perf_counter() - phase_start - extract_duration, 2),
+                    "output": f"Embeddings para {len(chunks)} chunks VLM OCR",
                     "success": True,
                 })
 
-            # === Upload de artefatos para VPS ===
-            report_progress("artifacts_upload", 0.94)
+            # 10. Artifacts upload
+            report_progress("artifacts_upload", 0.88)
             self._phase_artifacts_upload(
-                pdf_content, extraction.canonical_text, extraction.canonical_hash,
-                chunks, request, result, debug_artifacts=extraction.debug_artifacts,
+                pdf_content, canonical_text, canonical_hash,
+                chunks, request, result,
             )
-            report_progress("artifacts_upload", 0.97)
+            report_progress("artifacts_upload", 0.94)
 
-            # === Valida invariantes do contrato ===
+            # 11. Valida invariantes do contrato
             validate_chunk_invariants(chunks, request.document_id)
 
-            # Manifesto de ingestão
+            # 12. Drift register + resultado
+            drift_detector.register_run(
+                document_id=request.document_id,
+                pdf_hash=result.document_hash,
+                pipeline_version=app_config.pipeline_version,
+                canonical_hash=canonical_hash,
+                ingest_run_id=result.ingest_run_id,
+            )
+
+            # 13. Manifesto de ingestão
             result.manifest = self._build_manifest(
-                chunks, extraction.canonical_text, extraction.canonical_hash, request.document_id,
+                chunks, canonical_text, canonical_hash, request.document_id,
             )
 
             result.chunks = chunks
             result.status = IngestStatus.COMPLETED
 
-            # Register successful run for drift detection
-            drift_detector.register_run(
-                document_id=request.document_id,
-                pdf_hash=result.document_hash,
-                pipeline_version=app_config.pipeline_version,
-                canonical_hash=extraction.canonical_hash,
-                ingest_run_id=result.ingest_run_id,
-            )
-
             report_progress("completed", 1.0)
 
             logger.info(
-                f"Pipeline VLM concluído: {len(chunks)} chunks, "
-                f"{extraction.total_devices} dispositivos"
+                f"Pipeline VLM OCR concluído: {len(chunks)} chunks, "
+                f"{len(devices)} dispositivos, "
+                f"manifest: {result.manifest.get('total_spans')} spans"
             )
 
         except Exception as e:
-            logger.error(f"Erro no pipeline VLM: {e}", exc_info=True)
+            logger.error(f"Erro no pipeline VLM OCR: {e}", exc_info=True)
             result.status = IngestStatus.FAILED
             result.errors.append(IngestError(
-                phase="vlm_extraction",
+                phase="vlm_ocr_extraction",
                 message=str(e),
             ))
-
-    def _vlm_to_processed_chunks(
-        self,
-        extraction,
-        request: IngestRequest,
-        result: PipelineResult,
-    ) -> List[ProcessedChunk]:
-        """
-        Converte DocumentExtraction (VLM) para list[ProcessedChunk].
-
-        Mapeia os dispositivos extraídos pelo VLM para o formato ProcessedChunk
-        esperado pelo pipeline downstream (VPS, Milvus, etc.).
-
-        Conversão de coordenadas:
-        - device.bbox: normalizado 0-1 (image space) → armazenado em bbox_img
-        - image_bbox_to_pdf_bbox(): converte para PDF points → armazenado em bbox
-        """
-        from ..chunking.citation_extractor import extract_citations_from_chunk
-        from ..extraction.coord_utils import image_bbox_to_pdf_bbox
-
-        chunks = []
-
-        # Indexa pages_data por page_number para acesso às dimensões
-        pages_data_map: Dict[int, Any] = {}
-        for pd in (extraction.pages_data or []):
-            pages_data_map[pd.page_number] = pd
-
-        for page in extraction.pages:
-            # Dimensões da página para conversão de bbox
-            page_data = pages_data_map.get(page.page_number)
-            page_width = page_data.width if page_data else 0.0
-            page_height = page_data.height if page_data else 0.0
-            pix_w = page_data.img_width if page_data else 0
-            pix_h = page_data.img_height if page_data else 0
-
-            for device in page.devices:
-                # Filhos sem parent_identifier são lixo do VLM (ementa/preâmbulo
-                # classificados como parágrafo). Dropar antes de criar chunk.
-                if device.device_type in ("paragrafo", "inciso", "alinea") and not device.parent_identifier:
-                    logger.debug(
-                        f"Dropping orphan {device.device_type} sem parent: "
-                        f"page={page.page_number}, text={device.text[:60]!r}"
-                    )
-                    continue
-
-                # Gera span_id baseado no tipo e identificador
-                span_id = self._device_to_span_id(device)
-
-                # node_id e chunk_id
-                chunk_id = f"{request.document_id}#{span_id}"
-                node_id = f"leis:{chunk_id}"
-
-                # parent_node_id
-                parent_node_id = ""
-                if device.parent_identifier and device.device_type != "artigo":
-                    parent_span_id = self._identifier_to_span_id(
-                        device.parent_identifier, device.device_type
-                    )
-                    parent_node_id = f"leis:{request.document_id}#{parent_span_id}"
-
-                # device_type normalizado
-                device_type_map = {
-                    "artigo": "article",
-                    "paragrafo": "paragraph",
-                    "inciso": "inciso",
-                    "alinea": "alinea",
-                }
-                dt = device_type_map.get(device.device_type, device.device_type)
-
-                # chunk_level
-                chunk_level = "article" if dt == "article" else "device"
-
-                # Citações
-                citations = extract_citations_from_chunk(
-                    text=device.text or "",
-                    document_id=request.document_id,
-                    chunk_node_id=node_id,
-                    parent_chunk_id=parent_node_id or None,
-                    document_type=request.tipo_documento,
-                )
-
-                # Conversão de coordenadas: image space → PDF space
-                # O VLM pode retornar bbox em pixel absoluto OU 0-1 normalizado.
-                # Se qualquer coordenada > 1.0, são pixels → normalizar por img dims.
-                bbox_img = list(device.bbox) if device.bbox else []
-                if bbox_img and len(bbox_img) == 4 and pix_w > 0 and pix_h > 0:
-                    if any(v > 1.0 for v in bbox_img):
-                        bbox_img = [
-                            bbox_img[0] / pix_w,
-                            bbox_img[1] / pix_h,
-                            bbox_img[2] / pix_w,
-                            bbox_img[3] / pix_h,
-                        ]
-                bbox_pdf = image_bbox_to_pdf_bbox(bbox_img, page_width, page_height) if bbox_img else []
-
-                pc = ProcessedChunk(
-                    node_id=node_id,
-                    chunk_id=chunk_id,
-                    parent_node_id=parent_node_id,
-                    span_id=span_id,
-                    device_type=dt,
-                    chunk_level=chunk_level,
-                    text=device.text or "",
-                    parent_text="",
-                    retrieval_text=device.text or "",
-                    document_id=request.document_id,
-                    tipo_documento=request.tipo_documento,
-                    numero=request.numero,
-                    ano=request.ano,
-                    article_number=self._extract_article_number(device),
-                    citations=citations,
-                    # PR13: canonical offsets (sentinela inicial, resolvido por _resolve_vlm_offsets)
-                    canonical_start=-1,
-                    canonical_end=-1,
-                    canonical_hash=extraction.canonical_hash,
-                    # VLM: coordenadas
-                    page_number=page.page_number,
-                    bbox=bbox_pdf,           # PDF points (72 DPI) — para highlight
-                    bbox_img=bbox_img,       # normalizado 0-1 — debug/reprodutibilidade
-                    img_width=pix_w,
-                    img_height=pix_h,
-                    confidence=device.confidence,
-                    # Campos Acórdão (vazios para LEI/DECRETO)
-                    colegiado="",
-                    processo="",
-                    relator="",
-                    data_sessao="",
-                    unidade_tecnica="",
-                )
-                chunks.append(pc)
-
-        logger.info(f"VLM -> ProcessedChunk: {len(chunks)} chunks gerados")
-
-        # Detecção cross-page: agrupa chunks por span_id
-        # Se mesmo span_id aparece em >1 página consecutiva, decide entre:
-        # - Duplicata verdadeira (Jaccard > 0.7): mantém primeiro + bbox_spans
-        # - Continuação (Jaccard ≤ 0.7): concatena textos + bbox_spans
-        from collections import defaultdict
-        span_pages: Dict[str, List[ProcessedChunk]] = defaultdict(list)
-        for chunk in chunks:
-            span_pages[chunk.span_id].append(chunk)
-
-        cross_page_count = 0
-        continuation_count = 0
-        chunks_to_remove: set[int] = set()  # indices to remove
-
-        for span_id, span_chunks in span_pages.items():
-            if len(span_chunks) <= 1:
-                continue
-
-            # Sort by page_number
-            span_chunks.sort(key=lambda c: c.page_number)
-
-            # Check if pages are consecutive
-            pages = [c.page_number for c in span_chunks]
-            is_consecutive = all(
-                pages[i+1] - pages[i] <= 1
-                for i in range(len(pages) - 1)
-            )
-
-            if is_consecutive and len(pages) > 1:
-                first = span_chunks[0]
-                bbox_spans = [
-                    {
-                        "page_number": c.page_number,
-                        "bbox_pdf": c.bbox,
-                        "bbox_img": c.bbox_img,
-                    }
-                    for c in span_chunks
-                ]
-
-                # Word-Jaccard similarity between first and subsequent chunks
-                first_words = set(first.text.lower().split())
-                is_duplicate = True
-                for other in span_chunks[1:]:
-                    other_words = set(other.text.lower().split())
-                    union = first_words | other_words
-                    intersection = first_words & other_words
-                    jaccard = len(intersection) / max(len(union), 1)
-                    if jaccard <= 0.7:
-                        is_duplicate = False
-                        break
-
-                first.is_cross_page = True
-                first.bbox_spans = bbox_spans
-
-                if is_duplicate:
-                    # True duplicate: keep first chunk only
-                    cross_page_count += 1
-                    logger.debug(
-                        f"Cross-page dedup {span_id}: true duplicate (Jaccard>0.7), "
-                        f"keeping page {first.page_number}"
-                    )
-                else:
-                    # Continuation: concatenate texts from subsequent pages
-                    continuation_count += 1
-                    for other in span_chunks[1:]:
-                        first.text = first.text.rstrip() + " " + other.text.lstrip()
-                    logger.debug(
-                        f"Cross-page continuation {span_id}: texts differ (Jaccard≤0.7), "
-                        f"concatenated from pages {pages}"
-                    )
-
-                # Mark subsequent chunks for removal in both cases
-                for c in span_chunks[1:]:
-                    idx = chunks.index(c)
-                    chunks_to_remove.add(idx)
-
-        if chunks_to_remove:
-            chunks = [c for i, c in enumerate(chunks) if i not in chunks_to_remove]
-            logger.info(
-                f"Cross-page: {cross_page_count} duplicatas, {continuation_count} continuações, "
-                f"{len(chunks_to_remove)} chunks secundários removidos"
-            )
-
-        if cross_page_count + continuation_count > 0:
-            logger.warning(
-                f"[{request.document_id}] {cross_page_count + continuation_count} chunks cross-page "
-                f"detectados ({cross_page_count} dedup, {continuation_count} concat)"
-            )
-
-        # Resolve offsets reais (substitui sentinelas -1/-1)
-        chunks = self._resolve_vlm_offsets(
-            chunks, extraction.canonical_text,
-            extraction.canonical_hash, request.document_id,
-            extraction.pages_data,
-        )
-
-        return chunks
-
-    def _resolve_vlm_offsets(
-        self,
-        chunks: List[ProcessedChunk],
-        canonical_text: str,
-        canonical_hash: str,
-        document_id: str,
-        pages_data: Optional[List] = None,
-    ) -> List[ProcessedChunk]:
-        """
-        Computa offsets reais para cada chunk VLM dentro do canonical_text.
-
-        Estratégia principal: bbox matching com blocos PyMuPDF que têm offsets nativos.
-        Para cada device VLM, encontra blocos cuja bbox PDF tem overlap significativo.
-        Os blocos matched já possuem char_start/char_end calculados durante a concatenação.
-
-        Fallback (se blocos não disponíveis ou matching falha):
-        - find() dentro do range da página (não global)
-        - resolve_child_offsets() dentro do range do pai
-
-        Args:
-            chunks: Lista de ProcessedChunk com offsets sentinela (-1, -1)
-            canonical_text: Texto canônico PyMuPDF normalizado
-            canonical_hash: SHA256 do canonical_text
-            document_id: ID do documento para logs
-            pages_data: Lista de PageData com blocos e offsets nativos
-
-        Returns:
-            Lista de ProcessedChunk com offsets reais
-        """
-        import re
-        from ..chunking.canonical_offsets import resolve_child_offsets, OffsetResolutionError
-        from ..extraction.coord_utils import image_bbox_to_pdf_bbox, compute_bbox_iou
-        from ..utils.matching_normalization import normalize_for_matching, normalize_with_offset_map
-
-        if not canonical_text:
-            logger.warning(f"[{document_id}] canonical_text vazio — offsets permanecem sentinela")
-            return chunks
-
-        # Indexa pages_data por page_number
-        page_map: Dict[int, Any] = {}
-        if pages_data:
-            for pd in pages_data:
-                page_map[pd.page_number] = pd
-
-        # Offsets resolvidos: span_id -> (start, end)
-        resolved: Dict[str, Tuple[int, int]] = {}
-        # Fase que resolveu cada span (para debug/resolution_map)
-        resolution_phases: Dict[str, str] = {}
-
-        # =====================================================================
-        # FASE A: Resolve via bbox matching com blocos PyMuPDF
-        # =====================================================================
-        bbox_resolved = 0
-        for chunk in chunks:
-            if chunk.page_number < 0 or not chunk.bbox:
-                continue
-
-            page_data = page_map.get(chunk.page_number)
-            if not page_data or not page_data.blocks:
-                continue
-
-            # bbox do chunk já está em PDF points (convertido em _vlm_to_processed_chunks)
-            chunk_bbox_pdf = chunk.bbox
-
-            # Encontra blocos com overlap significativo
-            matched_blocks = []
-            for block in page_data.blocks:
-                iou = compute_bbox_iou(chunk_bbox_pdf, block.bbox_pdf)
-                if iou > 0.1:
-                    matched_blocks.append((iou, block))
-
-            if not matched_blocks:
-                continue
-
-            # Ordena por char_start para compor range contíguo
-            matched_blocks.sort(key=lambda x: x[1].char_start)
-
-            # Range = do início do primeiro bloco matched ao fim do último
-            first_block = matched_blocks[0][1]
-            last_block = matched_blocks[-1][1]
-            start = first_block.char_start
-            end = last_block.char_end
-
-            if start >= 0 and end > start and end <= len(canonical_text):
-                resolved[chunk.span_id] = (start, end)
-                resolution_phases[chunk.span_id] = "A_bbox"
-                bbox_resolved += 1
-                logger.debug(
-                    f"Offset {chunk.span_id}: bbox match [{start}:{end}] "
-                    f"({len(matched_blocks)} blocos, IoU melhor={matched_blocks[0][0]:.2f})"
-                )
-
-        if bbox_resolved > 0:
-            logger.info(f"[{document_id}] Fase A (bbox): {bbox_resolved} chunks resolvidos via blocos")
-
-        # =====================================================================
-        # FASE B: Resolve remanescentes via find() dentro do range da página
-        # =====================================================================
-        unresolved = [c for c in chunks if c.span_id not in resolved]
-        find_resolved = 0
-        normalized_resolved = 0
-
-        for chunk in unresolved:
-            chunk_text = chunk.text.strip()
-            if not chunk_text:
-                continue
-
-            # Determina range de busca: página ou artigo pai
-            search_start, search_end = 0, len(canonical_text)
-
-            # Tenta restringir ao range da página
-            page_data = page_map.get(chunk.page_number) if chunk.page_number > 0 else None
-            if page_data:
-                search_start = page_data.char_start
-                search_end = page_data.char_end
-
-            # Busca dentro do range da página
-            region = canonical_text[search_start:search_end]
-            pos = region.find(chunk_text)
-            if pos >= 0:
-                abs_start = search_start + pos
-                abs_end = abs_start + len(chunk_text)
-                resolved[chunk.span_id] = (abs_start, abs_end)
-                resolution_phases[chunk.span_id] = "B_find"
-                find_resolved += 1
-                logger.debug(f"Offset {chunk.span_id}: page find [{abs_start}:{abs_end}]")
-                continue
-
-            # Fallback B2: find() com whitespace normalizado
-            normalized = " ".join(chunk_text.split())
-            pos = region.find(normalized)
-            if pos >= 0:
-                abs_start = search_start + pos
-                abs_end = abs_start + len(normalized)
-                resolved[chunk.span_id] = (abs_start, abs_end)
-                resolution_phases[chunk.span_id] = "B_find_ws"
-                find_resolved += 1
-                logger.debug(f"Offset {chunk.span_id}: page find normalized [{abs_start}:{abs_end}]")
-                continue
-
-            # Fallback B3: normalização agressiva (NFKC, OCR table, etc.)
-            norm_region, norm2orig = normalize_with_offset_map(region)
-            norm_vlm = normalize_for_matching(chunk_text)
-            if norm_vlm and norm_region:
-                pos = norm_region.find(norm_vlm)
-                if pos >= 0 and pos + len(norm_vlm) - 1 < len(norm2orig):
-                    abs_start = search_start + norm2orig[pos]
-                    abs_end = search_start + norm2orig[pos + len(norm_vlm) - 1] + 1
-                    resolved[chunk.span_id] = (abs_start, abs_end)
-                    resolution_phases[chunk.span_id] = "B_normalized"
-                    normalized_resolved += 1
-                    logger.debug(f"Offset {chunk.span_id}: B3 normalized [{abs_start}:{abs_end}]")
-                    continue
-
-        if find_resolved > 0:
-            logger.info(f"[{document_id}] Fase B (find): {find_resolved} chunks resolvidos via busca de texto")
-        if normalized_resolved > 0:
-            logger.info(f"[{document_id}] Fase B3 (normalized): {normalized_resolved} chunks resolvidos via normalização agressiva")
-
-        # =====================================================================
-        # FASE C: Resolve filhos remanescentes dentro do range do pai
-        # =====================================================================
-        still_unresolved = [c for c in chunks
-                           if c.span_id not in resolved
-                           and c.device_type in ("paragraph", "inciso", "alinea")]
-        child_resolved = 0
-
-        # Monta lista ordenada de inícios de artigos para expandir parent_end
-        # O range de um artigo vai do seu start até o start do próximo artigo
-        art_starts = sorted(
-            (start, span_id)
-            for span_id, (start, end) in resolved.items()
-            if span_id.startswith("ART-")
-        )
-
-        # Regex fallback: localiza "Art. Nº" no canonical_text
-        _RE_ART_HEADER = re.compile(r"Art\.\s+\d+[º°]?\s")
-
-        # C4: Prefix-anchored + structural delimiter + similarity validation
-        # Quando C3 falha (VLM text difere do canonical no meio do texto),
-        # ancoramos start pelo prefixo normalizado e end pelo próximo
-        # delimitador estrutural. Validamos com similaridade.
-        _C4_PREFIX_LEN = 30
-        _C4_SIMILARITY_THRESHOLD = 0.80
-        _RE_STRUCTURAL_DELIM = re.compile(
-            r'(?:^|\n)\s*(?:'
-            r'(?:[IVXLCDM]+|[0-9]+)\s*[-\u2013\u2014]\s+'   # inciso
-            r'|[a-z]\)\s+'                                     # alínea
-            r'|\u00a7\s*\d+'                                   # § parágrafo
-            r'|Par[aá]grafo\s+[uú]nico'                        # parágrafo único
-            r'|Art\.\s+\d+'                                    # artigo
-            r')',
-            re.MULTILINE,
-        )
-
-        def _expanded_parent_end(parent_start: int, parent_end: int) -> int:
-            """Expande parent_end até o início do próximo artigo.
-
-            O range resolvido de um artigo cobre apenas seu cabeçalho
-            (ex: 'Art. 2º ... considera-se:'). Os filhos (§, incisos, alíneas)
-            estão posicionados DEPOIS do cabeçalho no canonical_text.
-            Expandimos até o próximo artigo para incluí-los na busca.
-
-            Estratégia em 2 camadas:
-            1. Próximo artigo resolvido em `art_starts`
-            2. Fallback regex: busca 'Art. Nº' no canonical_text após parent_end
-            """
-            # Camada 1: próximo artigo já resolvido
-            for art_start, _ in art_starts:
-                if art_start > parent_start:
-                    return art_start
-            # Camada 2: regex no canonical_text (cobre artigos não resolvidos)
-            m = _RE_ART_HEADER.search(canonical_text, pos=parent_end)
-            if m:
-                return m.start()
-            return len(canonical_text)
-
-        for child in still_unresolved:
-            child_text = child.text.strip()
-            if not child_text:
-                continue
-
-            # Determina parent span_id
-            parent_span_id = ""
-            if child.parent_node_id:
-                parts = child.parent_node_id.split("#", 1)
-                if len(parts) == 2:
-                    parent_span_id = parts[1]
-
-            # Busca range do pai
-            parent_start, parent_end = -1, -1
-            if parent_span_id and parent_span_id in resolved:
-                parent_start, parent_end = resolved[parent_span_id]
-            elif parent_span_id:
-                # Tenta artigo ancestral
-                art_match = re.search(r"(\d{3})", parent_span_id)
-                if art_match:
-                    art_span = f"ART-{art_match.group(1)}"
-                    if art_span in resolved:
-                        parent_start, parent_end = resolved[art_span]
-
-            if parent_start < 0 or parent_end <= parent_start:
-                continue
-
-            # Expande parent_end para cobrir filhos (§, incisos, alíneas)
-            parent_end = _expanded_parent_end(parent_start, parent_end)
-
-            # resolve_child_offsets() dentro do range do pai
-            try:
-                abs_start, abs_end = resolve_child_offsets(
-                    canonical_text=canonical_text,
-                    parent_start=parent_start,
-                    parent_end=parent_end,
-                    chunk_text=child_text,
-                    document_id=document_id,
-                    span_id=child.span_id,
-                    device_type=child.device_type,
-                )
-                resolved[child.span_id] = (abs_start, abs_end)
-                resolution_phases[child.span_id] = "C_parent"
-                child_resolved += 1
-                continue
-            except OffsetResolutionError:
-                pass
-
-            # Fallback C2: whitespace normalizado
-            normalized = " ".join(child_text.split())
-            try:
-                abs_start, abs_end = resolve_child_offsets(
-                    canonical_text=canonical_text,
-                    parent_start=parent_start,
-                    parent_end=parent_end,
-                    chunk_text=normalized,
-                    document_id=document_id,
-                    span_id=child.span_id,
-                    device_type=child.device_type,
-                )
-                resolved[child.span_id] = (abs_start, abs_end)
-                resolution_phases[child.span_id] = "C_parent_ws"
-                child_resolved += 1
-                continue
-            except OffsetResolutionError:
-                pass
-
-            # Fallback C3: normalização agressiva dentro do range do pai
-            parent_region = canonical_text[parent_start:parent_end]
-            norm_parent, norm2orig_parent = normalize_with_offset_map(parent_region)
-            norm_child = normalize_for_matching(child_text)
-            if norm_child and norm_parent:
-                pos = norm_parent.find(norm_child)
-                if pos >= 0 and pos + len(norm_child) - 1 < len(norm2orig_parent):
-                    abs_start = parent_start + norm2orig_parent[pos]
-                    abs_end = parent_start + norm2orig_parent[pos + len(norm_child) - 1] + 1
-                    resolved[child.span_id] = (abs_start, abs_end)
-                    resolution_phases[child.span_id] = "C_normalized"
-                    normalized_resolved += 1
-                    logger.debug(f"Offset {child.span_id}: C3 normalized [{abs_start}:{abs_end}]")
-                    continue
-
-            # =============================================================
-            # Fallback C4: prefix-anchored start + structural delimiter end
-            # + similarity validation (SequenceMatcher)
-            # =============================================================
-            from difflib import SequenceMatcher
-            c4_accepted = False
-            if norm_child and norm_parent and len(norm_child) >= _C4_PREFIX_LEN:
-                prefix = norm_child[:_C4_PREFIX_LEN]
-                prefix_pos = norm_parent.find(prefix)
-                if prefix_pos >= 0 and prefix_pos < len(norm2orig_parent):
-                    # Ancora start no canonical_text
-                    orig_rel_start = norm2orig_parent[prefix_pos]
-                    abs_start = parent_start + orig_rel_start
-
-                    # Busca próximo delimitador estrutural após start+20
-                    search_from = abs_start + 20
-                    delim_match = _RE_STRUCTURAL_DELIM.search(
-                        canonical_text, pos=search_from, endpos=parent_end,
-                    )
-                    abs_end = delim_match.start() if delim_match else parent_end
-
-                    # Trim trailing whitespace do snippet
-                    candidate = canonical_text[abs_start:abs_end].rstrip()
-                    abs_end = abs_start + len(candidate)
-
-                    # Similaridade entre candidato normalizado e VLM text
-                    norm_candidate = normalize_for_matching(candidate)
-                    similarity = SequenceMatcher(
-                        None, norm_candidate, norm_child,
-                    ).ratio()
-
-                    logger.info(
-                        f"[{document_id}] {child.span_id} C4: "
-                        f"prefix@{prefix_pos}, [{abs_start}:{abs_end}], "
-                        f"sim={similarity:.3f}"
-                    )
-
-                    if similarity >= _C4_SIMILARITY_THRESHOLD:
-                        resolved[child.span_id] = (abs_start, abs_end)
-                        resolution_phases[child.span_id] = "C4_prefix_delim"
-                        child_resolved += 1
-                        c4_accepted = True
-                    else:
-                        # C4 rejeitado — log vlm_text + candidate para análise
-                        logger.warning(
-                            f"[{document_id}] {child.span_id} C4 REJECTED "
-                            f"sim={similarity:.3f}<{_C4_SIMILARITY_THRESHOLD}"
-                        )
-                        logger.warning(
-                            f"  vlm[:100]={norm_child[:100]!r}"
-                        )
-                        logger.warning(
-                            f"  can[:100]={norm_candidate[:100]!r}"
-                        )
-
-            if c4_accepted:
-                continue
-
-            # Não resolvido em nenhuma fase — mantém sentinela
-            logger.warning(
-                f"[{document_id}] {child.span_id} ({child.device_type}) "
-                f"não resolvido — offset sentinela"
-            )
-
-        if child_resolved > 0:
-            logger.info(f"[{document_id}] Fase C (parent): {child_resolved} filhos resolvidos via range do pai")
-
-        # =====================================================================
-        # Aplica offsets resolvidos aos chunks
-        # =====================================================================
-        resolved_count = 0
-        for chunk in chunks:
-            if chunk.span_id in resolved:
-                start, end = resolved[chunk.span_id]
-                chunk.canonical_start = start
-                chunk.canonical_end = end
-                chunk.canonical_hash = canonical_hash
-                resolved_count += 1
-            else:
-                # Sentinela: limpa hash para manter trio coerente [-1, -1, ""]
-                chunk.canonical_hash = ""
-
-        # =====================================================================
-        # Sibling overlap trim (F2)
-        # Chunks irmãos (mesmo parent_node_id) não devem ter offsets sobrepostos.
-        # Se VLM retornou text contendo dispositivos adjacentes, os offsets
-        # resolvidos podem se sobrepor. Trimmamos curr.canonical_end para
-        # não ultrapassar next.canonical_start.
-        # =====================================================================
-        from collections import defaultdict
-        sibling_groups: Dict[str, list] = defaultdict(list)
-        for chunk in chunks:
-            if chunk.canonical_start >= 0 and chunk.parent_node_id:
-                sibling_groups[chunk.parent_node_id].append(chunk)
-
-        overlap_trimmed = 0
-        for parent_id, siblings in sibling_groups.items():
-            siblings.sort(key=lambda c: c.canonical_start)
-            for i in range(len(siblings) - 1):
-                curr = siblings[i]
-                nxt = siblings[i + 1]
-                if curr.canonical_end > nxt.canonical_start:
-                    new_end = nxt.canonical_start
-                    if new_end <= curr.canonical_start:
-                        # Trim degenerado — reseta para sentinela
-                        curr.canonical_start = -1
-                        curr.canonical_end = -1
-                        curr.canonical_hash = ""
-                        resolved_count -= 1
-                        logger.warning(
-                            f"[{document_id}] Overlap trim degenerado: "
-                            f"{curr.span_id} resetado para sentinela"
-                        )
-                    else:
-                        curr.canonical_end = new_end
-                        overlap_trimmed += 1
-
-        if overlap_trimmed > 0:
-            logger.info(
-                f"[{document_id}] Sibling overlap trim: {overlap_trimmed} chunks"
-            )
-
-        # --- Per-phase fallback rate instrumentation ---
-        total = len(chunks) or 1
-        sentinel_count = len(chunks) - resolved_count
-        phase_counts: Dict[str, int] = {}
-        for phase in resolution_phases.values():
-            phase_counts[phase] = phase_counts.get(phase, 0) + 1
-        phase_counts["sentinel"] = sentinel_count
-
-        # Build rate string: "A_bbox=30(60.0%) B_find=8(16.0%) ..."
-        rate_parts = []
-        for phase_name in ["A_bbox", "B_find", "B_find_ws", "B_normalized",
-                           "C_parent", "C_parent_ws", "C_normalized",
-                           "C4_prefix_delim", "sentinel"]:
-            count = phase_counts.get(phase_name, 0)
-            if count > 0:
-                pct = 100.0 * count / total
-                rate_parts.append(f"{phase_name}={count}({pct:.1f}%)")
-
-        logger.info(
-            f"[{document_id}] VLM offsets resolvidos: {resolved_count}/{len(chunks)} "
-            f"(bbox={bbox_resolved}, find={find_resolved}, normalized={normalized_resolved}, "
-            f"parent={child_resolved}, sentinela={sentinel_count})"
-        )
-        logger.info(
-            f"[{document_id}] Fallback rates: {' | '.join(rate_parts)}"
-        )
-
-        # Build resolution_map for debug (attached to chunks as metadata)
-        resolution_map = {}
-        for chunk in chunks:
-            resolution_map[chunk.span_id] = {
-                "canonical_start": chunk.canonical_start,
-                "canonical_end": chunk.canonical_end,
-                "phase": resolution_phases.get(chunk.span_id, "sentinel"),
-                "confidence": chunk.confidence,
-                "page_number": chunk.page_number,
-            }
-        # Attach summary rates to resolution_map
-        resolution_map["_summary"] = {
-            "total_chunks": len(chunks),
-            "resolved": resolved_count,
-            "phase_counts": phase_counts,
-            "phase_rates": {k: round(v / total, 4) for k, v in phase_counts.items()},
-        }
-
-        # Store resolution_map for debug artifacts upload
-        self._last_resolution_map = resolution_map
-
-        return chunks
-
-    @staticmethod
-    def _extract_art_num_suffix(identifier: str):
-        """Extrai número e sufixo de um identifier de artigo.
-        'Art. 337-E' → ('337', '-E'), 'Art. 5º' → ('5', ''), 'Art. 1.048' → ('1048', '')
-        """
-        import re
-        m = re.search(r"(\d+(?:\.\d+)*)(?:[º°o])?(-[A-Za-z]+)?", identifier or "")
-        if not m:
-            return "000", ""
-        num = m.group(1).replace(".", "")
-        suffix = m.group(2) or ""
-        return num, suffix
-
-    @staticmethod
-    def _device_to_span_id(device) -> str:
-        """Converte DeviceExtraction para span_id (ex: ART-005, PAR-005-1, ART-337-E)."""
-        import re
-
-        identifier = device.identifier.strip()
-        dtype = device.device_type.lower()
-
-        if dtype == "artigo":
-            # "Art. 5º" -> "ART-005", "Art. 337-E" -> "ART-337-E"
-            num, suffix = IngestionPipeline._extract_art_num_suffix(identifier)
-            return f"ART-{num.zfill(3)}{suffix}"
-
-        elif dtype == "paragrafo":
-            # "§ 1º" -> precisa do pai para montar PAR-005-1 ou PAR-337-E-1
-            match = re.search(r"(\d+)", identifier)
-            num = match.group(1) if match else "0"
-            # Tenta extrair número e sufixo do artigo pai
-            parent_id = device.parent_identifier or ""
-            parent_num, parent_suffix = IngestionPipeline._extract_art_num_suffix(parent_id)
-            return f"PAR-{parent_num.zfill(3)}{parent_suffix}-{num}"
-
-        elif dtype == "inciso":
-            # "I" / "II" -> INC-005-1 ou INC-337-E-1
-            parent_id = device.parent_identifier or ""
-            parent_num, parent_suffix = IngestionPipeline._extract_art_num_suffix(parent_id)
-            # Converte romano ou numérico
-            inc_num = IngestionPipeline._roman_to_int(identifier.strip().rstrip(").-"))
-            return f"INC-{parent_num.zfill(3)}{parent_suffix}-{inc_num}"
-
-        elif dtype == "alinea":
-            # "a)" -> ALI-005-3-a ou ALI-337-E-3-a
-            parent_id = device.parent_identifier or ""
-            parent_match = re.search(r"(\d+)", parent_id)
-            if parent_match:
-                parent_num = parent_match.group(1).zfill(3)
-                # Check for suffix in grandparent context (via parent_id)
-                _, parent_suffix = IngestionPipeline._extract_art_num_suffix(parent_id)
-                parent_num = f"{parent_num}{parent_suffix}"
-            else:
-                # Parent é inciso romano (ex: "III")
-                parent_num = str(IngestionPipeline._roman_to_int(parent_id.strip()))
-            letter = re.search(r"([a-z])", identifier.lower())
-            letter_str = letter.group(1) if letter else "a"
-            return f"ALI-{parent_num}-{letter_str}"
-
-        return f"DEV-{identifier[:20]}"
-
-    @staticmethod
-    def _identifier_to_span_id(identifier: str, child_type: str) -> str:
-        """Converte parent_identifier para span_id do pai."""
-        import re
-        num, suffix = IngestionPipeline._extract_art_num_suffix(identifier)
-
-        # Detecta tipo do pai pelo identificador
-        ident_lower = identifier.lower().strip()
-        if ident_lower.startswith("art"):
-            return f"ART-{num.zfill(3)}{suffix}"
-        elif "§" in identifier or ident_lower.startswith("par"):
-            par_match = re.search(r"(\d+)", identifier)
-            par_num = par_match.group(1) if par_match else "0"
-            return f"PAR-{num.zfill(3)}{suffix}-{par_num}"
-        else:
-            return f"ART-{num.zfill(3)}{suffix}"
-
-    @staticmethod
-    def _roman_to_int(s: str) -> int:
-        """Converte numeral romano para inteiro."""
-        roman = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
-        s = s.upper().strip()
-        result = 0
-        for i, c in enumerate(s):
-            if c not in roman:
-                # Tenta como número decimal
-                try:
-                    return int(s)
-                except ValueError:
-                    return 0
-            if i + 1 < len(s) and roman.get(c, 0) < roman.get(s[i + 1], 0):
-                result -= roman[c]
-            else:
-                result += roman[c]
-        return result
-
-    @staticmethod
-    def _extract_article_number(device) -> str:
-        """Extrai número do artigo de um DeviceExtraction."""
-        import re
-        if device.device_type == "artigo":
-            match = re.search(r"(\d+)", device.identifier)
-            return match.group(1) if match else ""
-        elif device.parent_identifier:
-            match = re.search(r"(\d+)", device.parent_identifier)
-            return match.group(1) if match else ""
-        return ""
 
     def _phase_artifacts_upload(
         self,
@@ -1467,6 +684,7 @@ class IngestionPipeline:
         duration_ms: float,
         request: IngestRequest,
         pages_data: list,
+        extraction_source: str = "pymupdf_native",
     ) -> None:
         """
         Emite snapshot da classificação regex para o Redis (Inspector).
@@ -1611,6 +829,7 @@ class IngestionPipeline:
             canonical_hash=canonical_hash,
             canonical_length=len(canonical_text),
             duration_ms=duration_ms * 1000,
+            extraction_source=extraction_source,
         )
 
         # --- Build PyMuPDF artifact (page images + blocks) ---

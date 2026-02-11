@@ -20,6 +20,7 @@ from .models import (
     InspectionMetadata,
     InspectionStage,
     RegexClassificationArtifact,
+    VLMClassificationArtifact,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ REDIS_TTL_SECONDS = 2 * 60 * 60
 _STAGE_MODELS = {
     InspectionStage.PYMUPDF: None,  # PyMuPDF artifact é dict genérico
     InspectionStage.REGEX_CLASSIFICATION: RegexClassificationArtifact,
+    InspectionStage.VLM_CLASSIFICATION: VLMClassificationArtifact,
 }
 
 

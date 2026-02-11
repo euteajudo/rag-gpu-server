@@ -49,32 +49,43 @@ async def inspector_ui():
 
 @router.get("/inspector/recent")
 async def list_recent_inspections():
-    """Lista inspeções regex recentes (últimas 2h, TTL do Redis)."""
+    """Lista inspeções recentes — regex e VLM (últimas 2h, TTL do Redis)."""
     storage = _get_storage()
     try:
         r = storage._get_redis()
     except Exception:
         return []
 
-    # Scan por chaves inspect:*:regex_classification
-    keys = list(r.scan_iter(match="inspect:*:regex_classification"))
+    # Scan por chaves de ambas as entradas
+    regex_keys = list(r.scan_iter(match="inspect:*:regex_classification"))
+    vlm_keys = list(r.scan_iter(match="inspect:*:vlm_classification"))
 
-    results = []
-    for key in keys:
+    # Deduplica por task_id e determina extraction_mode
+    seen: dict[str, str] = {}  # task_id → extraction_mode
+    for key in regex_keys:
         key_str = key.decode() if isinstance(key, bytes) else key
         parts = key_str.split(":")
         if len(parts) >= 2:
-            task_id = parts[1]
-            metadata = storage.get_metadata(task_id)
-            if metadata:
-                results.append({
-                    "task_id": task_id,
-                    "document_id": metadata.document_id,
-                    "tipo_documento": metadata.tipo_documento,
-                    "status": metadata.status.value,
-                    "started_at": metadata.started_at,
-                    "total_pages": metadata.total_pages,
-                })
+            seen[parts[1]] = "pymupdf_regex"
+    for key in vlm_keys:
+        key_str = key.decode() if isinstance(key, bytes) else key
+        parts = key_str.split(":")
+        if len(parts) >= 2:
+            seen[parts[1]] = "vlm"
+
+    results = []
+    for task_id, extraction_mode in seen.items():
+        metadata = storage.get_metadata(task_id)
+        if metadata:
+            results.append({
+                "task_id": task_id,
+                "document_id": metadata.document_id,
+                "tipo_documento": metadata.tipo_documento,
+                "status": metadata.status.value,
+                "started_at": metadata.started_at,
+                "total_pages": metadata.total_pages,
+                "extraction_mode": extraction_mode,
+            })
 
     results.sort(key=lambda x: x.get("started_at", ""), reverse=True)
     return results
@@ -82,13 +93,14 @@ async def list_recent_inspections():
 
 @router.get("/inspector/{task_id}")
 async def get_inspection_detail(task_id: str):
-    """Retorna artefatos completos de uma inspeção regex."""
+    """Retorna artefatos completos de uma inspeção (regex ou VLM)."""
     storage = _get_storage()
 
     pymupdf_raw = storage.get_artifact(task_id, InspectionStage.PYMUPDF)
     regex_raw = storage.get_artifact(task_id, InspectionStage.REGEX_CLASSIFICATION)
+    vlm_raw = storage.get_artifact(task_id, InspectionStage.VLM_CLASSIFICATION)
 
-    if not regex_raw:
+    if not regex_raw and not vlm_raw:
         raise HTTPException(
             status_code=404,
             detail=f"Inspeção {task_id} não encontrada ou expirada (TTL 2h)",
@@ -100,7 +112,8 @@ async def get_inspection_detail(task_id: str):
         "task_id": task_id,
         "metadata": metadata.model_dump() if metadata else None,
         "pymupdf": json.loads(pymupdf_raw) if pymupdf_raw else None,
-        "regex_classification": json.loads(regex_raw),
+        "regex_classification": json.loads(regex_raw) if regex_raw else None,
+        "vlm_classification": json.loads(vlm_raw) if vlm_raw else None,
     }
 
 

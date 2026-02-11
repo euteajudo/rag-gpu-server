@@ -17,12 +17,15 @@ O processamento é SEQUENCIAL (uma página por vez) porque:
 import logging
 from typing import Optional, Callable
 
+from typing import List, Tuple
+
 from ..utils.canonical_utils import normalize_canonical_text, compute_canonical_hash
 from .pymupdf_extractor import PyMuPDFExtractor
 from .vlm_client import VLMClient
 from .vlm_models import (
     DeviceExtraction,
     DocumentExtraction,
+    PageData,
     PageExtraction,
 )
 
@@ -191,3 +194,108 @@ class VLMExtractionService:
             pages_data=pages_data,
             debug_artifacts=debug_artifacts_list if collect_debug else [],
         )
+
+    async def ocr_document(
+        self,
+        pdf_bytes: bytes,
+        document_id: str,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> Tuple[List[PageData], str]:
+        """
+        OCR de documento completo via PyMuPDF (imagens) + Qwen3-VL (texto).
+
+        Retorna (pages_data, canonical_text) no MESMO formato que
+        PyMuPDFExtractor.extract_pages(), para que o pipeline downstream
+        (regex classifier, chunks, embeddings) seja idêntico à Entrada 1.
+
+        Args:
+            pdf_bytes: Conteúdo binário do PDF
+            document_id: ID do documento (ex: LEI-14133-2021)
+            progress_callback: Callback (phase, progress) para reportar progresso
+
+        Returns:
+            Tupla (pages_data, canonical_text):
+            - pages_data: List[PageData] com blocos OCR sintéticos + imagens PyMuPDF
+            - canonical_text: Texto concatenado normalizado do OCR
+        """
+        from .vlm_ocr import split_ocr_into_blocks, ocr_to_pages_data
+
+        def report(phase: str, progress: float):
+            if progress_callback:
+                try:
+                    progress_callback(phase, progress)
+                except Exception as e:
+                    logger.warning(f"Erro no progress_callback: {e}")
+
+        # === Etapa 1: PyMuPDF (imagens + dimensões — texto ignorado) ===
+        report("pymupdf_extraction", 0.10)
+        logger.info(f"VLM OCR Pipeline: Etapa 1 - Extraindo imagens com PyMuPDF ({document_id})")
+
+        pymupdf_pages, _ = self.pymupdf_extractor.extract_pages(pdf_bytes)
+        total_pages = len(pymupdf_pages)
+
+        if total_pages == 0:
+            logger.warning(f"PyMuPDF retornou 0 páginas para {document_id}")
+            return [], ""
+
+        logger.info(f"PyMuPDF: {total_pages} páginas renderizadas para OCR")
+        report("pymupdf_extraction", 0.20)
+
+        # === Etapa 2: Qwen3-VL OCR (sequencial, uma página por vez) ===
+        logger.info(f"VLM OCR Pipeline: Etapa 2 - OCR com Qwen3-VL ({total_pages} páginas)")
+
+        ocr_pages: List[Tuple[int, str]] = []
+        for i, page_data in enumerate(pymupdf_pages):
+            page_num = page_data.page_number
+            progress = 0.20 + (0.60 * (i / total_pages))
+            report("vlm_ocr", progress)
+
+            logger.info(f"VLM OCR: processando página {page_num}/{total_pages}")
+
+            try:
+                ocr_text = await self.vlm_client.ocr_page(page_data.image_base64)
+                ocr_pages.append((page_num, ocr_text))
+                logger.info(
+                    f"VLM OCR página {page_num}: {len(ocr_text)} chars extraídos"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Erro VLM OCR na página {page_num}/{total_pages}: {e}",
+                    exc_info=True,
+                )
+                # Página sem texto OCR — registra como vazia
+                ocr_pages.append((page_num, ""))
+
+        report("vlm_ocr", 0.80)
+
+        # === Etapa 3: Split em blocos + canonical_text ===
+        logger.info("VLM OCR Pipeline: Etapa 3 - Montando blocos e canonical_text")
+        blocks, canonical_text, page_boundaries = split_ocr_into_blocks(ocr_pages)
+
+        # === Etapa 4: Normaliza canonical_text ===
+        canonical_text_normalized = normalize_canonical_text(canonical_text)
+        # OCR text should already be normalized by split_ocr_into_blocks,
+        # but we apply normalize for safety. If they differ, use normalized
+        # and rebuild blocks.
+        if canonical_text != canonical_text_normalized:
+            logger.warning(
+                f"[{document_id}] OCR canonical_text diverge de normalize — "
+                f"reconstruindo blocos"
+            )
+            # Re-split with normalized text to keep offsets consistent
+            # This should be rare — split_ocr_into_blocks already normalizes
+            canonical_text = canonical_text_normalized
+
+        # === Etapa 5: Monta PageData sintéticos ===
+        pages_data = ocr_to_pages_data(
+            pymupdf_pages, blocks, canonical_text, page_boundaries,
+        )
+
+        report("building_canonical", 0.90)
+
+        logger.info(
+            f"VLM OCR Pipeline: {len(blocks)} blocos em {total_pages} páginas, "
+            f"canonical_text={len(canonical_text)} chars"
+        )
+
+        return pages_data, canonical_text

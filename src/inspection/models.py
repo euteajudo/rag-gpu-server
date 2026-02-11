@@ -19,6 +19,7 @@ class InspectionStage(str, Enum):
     """Fases do pipeline de inspeção."""
     PYMUPDF = "pymupdf"
     REGEX_CLASSIFICATION = "regex_classification"
+    VLM_CLASSIFICATION = "vlm_classification"
 
 
 class InspectionStatus(str, Enum):
@@ -103,7 +104,7 @@ class RegexIntegrityChecks(BaseModel):
 
 
 class RegexClassificationArtifact(BaseModel):
-    """Artefato completo da classificação regex (Entrada 1)."""
+    """Artefato completo da classificação regex (Entrada 1 e 2)."""
     devices: list[RegexDevice] = Field(default_factory=list)
     filtered: list[RegexFilteredBlock] = Field(default_factory=list)
     unclassified: list[RegexUnclassifiedBlock] = Field(default_factory=list)
@@ -113,6 +114,63 @@ class RegexClassificationArtifact(BaseModel):
     canonical_hash: str = Field("")
     canonical_length: int = Field(0)
     duration_ms: float = Field(0.0)
+    extraction_source: str = Field("pymupdf_native", description="pymupdf_native ou vlm_ocr")
+
+
+# ============================================================================
+# Fase VLM — Classificação de dispositivos via Qwen3-VL (Entrada 2)
+# ============================================================================
+
+class VLMDevice(BaseModel):
+    """Dispositivo classificado pelo VLM (Qwen3-VL)."""
+    span_id: str = Field(..., description="ART-005, PAR-005-1, etc.")
+    device_type: str = Field(..., description="article, paragraph, inciso, alinea")
+    identifier: str = Field(..., description="Span ID usado como identifier")
+    parent_span_id: str = Field("", description="Span ID do pai")
+    text_preview: str = Field("", description="Primeiros 120 chars")
+    char_start: int = Field(-1, description="Offset resolvido (-1 se sentinel)")
+    char_end: int = Field(-1, description="Offset resolvido (-1 se sentinel)")
+    page_number: int = Field(0)
+    bbox_pdf: list[float] = Field(default_factory=list, description="PDF points")
+    bbox_img: list[float] = Field(default_factory=list, description="0-1 normalized")
+    confidence: float = Field(0.0, description="VLM confidence")
+    resolution_phase: str = Field("", description="A_bbox, B_find, C_parent, etc.")
+    is_cross_page: bool = Field(False)
+
+
+class VLMResolutionSummary(BaseModel):
+    """Sumário da resolução de offsets VLM."""
+    total_chunks: int = Field(0)
+    resolved: int = Field(0)
+    sentinel: int = Field(0, description="Chunks sem offset resolvido")
+    by_phase: dict[str, int] = Field(default_factory=dict, description="Ex: A_bbox=30, B_find=8")
+    resolution_rate_pct: float = Field(0.0)
+
+
+class VLMIntegrityChecks(BaseModel):
+    """Verificações de integridade para pipeline VLM."""
+    all_pass: bool = Field(False)
+    offsets_pass: bool = Field(False)
+    offsets_total: int = Field(0)
+    offsets_matches: int = Field(0)
+    normalization_idempotent: bool = Field(False)
+    unicode_nfc: bool = Field(False)
+    trailing_newline: bool = Field(False)
+    cross_page_count: int = Field(0)
+    orphan_drops: int = Field(0, description="Filhos sem parent_identifier dropados")
+
+
+class VLMClassificationArtifact(BaseModel):
+    """Artefato completo da classificação VLM (Entrada 2)."""
+    devices: list[VLMDevice] = Field(default_factory=list)
+    resolution: VLMResolutionSummary = Field(default_factory=VLMResolutionSummary)
+    checks: VLMIntegrityChecks = Field(default_factory=VLMIntegrityChecks)
+    canonical_text: str = Field("", description="Texto canônico completo")
+    canonical_hash: str = Field("")
+    canonical_length: int = Field(0)
+    duration_ms: float = Field(0.0)
+    vlm_model: str = Field("", description="Ex: Qwen/Qwen3-VL-8B-Instruct")
+    total_pages: int = Field(0)
 
 
 # ============================================================================
