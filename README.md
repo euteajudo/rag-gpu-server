@@ -10,52 +10,94 @@ Servidor GPU para embeddings (BGE-M3), reranking (BGE-Reranker) e LLM (vLLM) do 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    GOOGLE CLOUD VM (GPU)                                    │
-│                    IP: 34.44.157.159                                        │
-│                    Tipo: g2-standard-4 + NVIDIA L4 (24GB)                   │
+│                      RUNPOD (GPU A40 48GB)                                  │
 │                                                                             │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                 RAG GPU Server (FastAPI)                            │   │
-│   │                 Porta: 8000                                         │   │
+│   │                 RAG GPU Server (FastAPI :8000)                      │   │
 │   │                                                                     │   │
-│   │   POST /embed   →  BGE-M3 (embeddings dense 1024d + sparse)         │   │
-│   │   POST /rerank  →  BGE-Reranker-v2-m3 (cross-encoder)               │   │
+│   │   POST /embed   →  BGE-M3 (embeddings dense 1024d + sparse)        │   │
+│   │   POST /rerank  →  BGE-Reranker-v2-m3 (cross-encoder)              │   │
+│   │   POST /ingest  →  Pipeline de ingestão dual-entry                  │   │
 │   │   GET  /health  →  Status dos modelos + GPU                         │   │
-│   │                                                                     │   │
-│   │   Modelos carregados na GPU (~4GB VRAM)                             │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                 vLLM Container                                      │   │
-│   │                 Porta: 8001 (interno) → exposto como 8001           │   │
+│   │                 vLLM Server (:8002)                                 │   │
 │   │                                                                     │   │
-│   │   POST /v1/chat/completions  →  Qwen/Qwen3-8B-AWQ                   │   │
-│   │                                                                     │   │
-│   │   Modelo AWQ quantizado (~6GB VRAM)                                 │   │
+│   │   POST /v1/chat/completions  →  Qwen/Qwen3-VL-8B-Instruct          │   │
+│   │   - OCR de páginas de PDF (Entrada 2)                               │   │
+│   │   - max_model_len: 8192                                             │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                     │
+│   │   BGE-M3     │  │ BGE-Reranker │  │    Redis     │                     │
+│   │   (~2GB)     │  │   (~1GB)     │  │   :6379      │                     │
+│   └──────────────┘  └──────────────┘  └──────────────┘                     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
-                                    │ HTTPS / HTTP
+                         Cloudflare Tunnel
+                    gpu.vectorgov.io / llm.vectorgov.io
+                                    │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         VPS HOSTINGER                                       │
-│                         IP: 77.37.43.160                                    │
 │                                                                             │
 │   ┌─────────────────────┐  ┌─────────────┐  ┌─────────────┐                │
-│   │   FastAPI (RAG API) │  │   Milvus    │  │   Redis     │                │
-│   │   Porta: 8000       │  │   19530     │  │   6379      │                │
+│   │   FastAPI (RAG API) │  │   Milvus    │  │   MinIO     │                │
+│   │   Porta: 8000       │  │   19530     │  │   9100      │                │
 │   │                     │  │             │  │             │                │
-│   │   RemoteEmbedder    │  │  leis_v3    │  │  Cache      │                │
-│   │   RemoteReranker    │  │  (1312 docs)│  │  Semântico  │                │
-│   │   RemoteLLM         │  │             │  │             │                │
+│   │   RemoteEmbedder    │  │  leis_v3    │  │  vectorgov  │                │
+│   │   RemoteReranker    │  │             │  │  -evidence  │                │
 │   └─────────────────────┘  └─────────────┘  └─────────────┘                │
 │                                                                             │
-│   ┌─────────────────────┐                                                  │
-│   │   PostgreSQL        │                                                  │
-│   │   Porta: 5432       │                                                  │
-│   │   (Usuários, Logs)  │                                                  │
-│   └─────────────────────┘                                                  │
+│   ┌─────────────────────┐  ┌──────────────┐                                │
+│   │   PostgreSQL        │  │    Redis     │                                │
+│   │   Porta: 5432       │  │    6379      │                                │
+│   └─────────────────────┘  └──────────────┘                                │
 └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pipeline de Ingestão (Dual-Entry)
+
+```
+  ENTRADA 1 (PyMuPDF nativo)         ENTRADA 2 (VLM OCR)
+  ─────────────────────────          ──────────────────────
+  PDF                                PDF
+   │                                  │
+   ▼                                  ▼
+  PyMuPDF                            PyMuPDF (imagens)
+  extract_pages()                         │
+   │                                      ▼
+   │                                 Qwen3-VL OCR
+   │                                 (página por página)
+   │                                      │
+   │                                 split_ocr_into_blocks()
+   │                                      │
+   ├── pages_data                    ├── pages_data (sintéticos)
+   └── canonical_text                └── canonical_text (OCR)
+              │                                │
+              └──────────┬─────────────────────┘
+                         │
+                         ▼
+                  Regex Classifier
+                  classify_to_devices()
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  ProcessedChunks     │
+              │  com span_ids,       │
+              │  offsets, hierarquia  │
+              └──────────────────────┘
+                         │
+              ┌──────────┼──────────┐
+              │          │          │
+              ▼          ▼          ▼
+         OriginClass  BGE-M3    Artifacts
+         (citations)  Embeddings  Upload
+                         │
+                         ▼
+                   IngestResponse
+                   (chunks + vetores)
 ```
 
 ---
@@ -257,11 +299,13 @@ Retorna os chunks processados (só disponível quando status == "completed").
 |------|----------|-----------|
 | `queued` | 0.0 | Aguardando início |
 | `initializing` | 0.05 | Iniciando pipeline |
-| `docling` | 0.1-0.3 | Convertendo PDF → Markdown |
-| `parsing` | 0.3-0.4 | SpanParser extraindo spans |
-| `extraction` | 0.4-0.7 | ArticleOrchestrator (LLM) |
-| `materialization` | 0.7-0.8 | ChunkMaterializer |
-| `embedding` | 0.8-0.95 | BGE-M3 embeddings |
+| `pymupdf_extraction` | 0.10-0.20 | PyMuPDF: extração de páginas (texto nativo ou imagens) |
+| `vlm_ocr` | 0.20-0.80 | *Entrada 2 only:* Qwen3-VL OCR (página por página) |
+| `regex_classification` | 0.30-0.50 | Regex Classifier: dispositivos legais |
+| `building_chunks` | 0.50-0.70 | Montagem de ProcessedChunks + retrieval_text |
+| `origin_classification` | 0.70-0.75 | OriginClassifier: citations cruzadas |
+| `embedding` | 0.75-0.90 | BGE-M3 embeddings (dense + sparse) |
+| `artifacts_upload` | 0.90-0.95 | Upload de artefatos (evidência) |
 | `completed` | 1.0 | Finalizado com sucesso |
 
 ### Fluxo de Polling Recomendado
@@ -1045,6 +1089,29 @@ sudo -u ragapp /srv/app/.venv/bin/pip install -r /srv/app/requirements.txt
 ---
 
 ## Histórico de Mudanças
+
+### 2026-02-11
+
+- **Entrada 2 Realinhada — VLM como OCR + Regex**
+  - Refatoração completa da Entrada 2 (modo VLM) para alinhar com design original
+  - VLM (Qwen3-VL) agora faz **OCR puro** (retorna texto bruto), não classificação
+  - Texto OCR entra no **mesmo Regex Classifier** da Entrada 1
+  - "A única variável é DE ONDE vem o texto" — PyMuPDF nativo (E1) ou VLM OCR (E2)
+  - Novo módulo `src/extraction/vlm_ocr.py`:
+    - `split_ocr_into_blocks()`: divide texto OCR em blocos sintéticos
+    - `ocr_to_pages_data()`: combina imagens PyMuPDF + blocos OCR
+    - `validate_ocr_quality()`: quality gate (artigos, chars/página, dispositivos/página)
+  - Novo método `VLMClient.ocr_page()`: OCR de página via Qwen3-VL (retorna `str`)
+  - Novo método `VLMExtractionService.ocr_document()`: OCR de documento completo
+  - `RegexClassificationArtifact` agora tem campo `extraction_source` (pymupdf_native / vlm_ocr)
+  - Removidos ~830 linhas de código morto VLM (9 métodos de pipeline.py):
+    - `_vlm_to_processed_chunks()`, `_resolve_vlm_offsets()` (4-phase offset resolution)
+    - `_rebuild_vlm_retrieval_text()`, `_emit_vlm_inspection_snapshot()`
+    - `_device_to_span_id()`, `_identifier_to_span_id()`, `_extract_art_num_suffix()`
+    - `_roman_to_int()`, `_extract_article_number()`
+  - Offsets agora são sempre nativos (nunca -1 sentinel) em ambas as entradas
+  - 7 novos testes para `split_ocr_into_blocks()` e quality gate
+  - 329 testes passando, 0 falhas
 
 ### 2026-01-28
 

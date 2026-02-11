@@ -1,7 +1,7 @@
 # 🗺️ Mapa do Aplicativo - RAG GPU Server
 
 > **Repositório**: https://github.com/euteajudo/rag-gpu-server
-> **Última Atualização**: 28/01/2026
+> **Última Atualização**: 11/02/2026
 > **Status**: Produção (RunPod A40 48GB)
 
 Este documento serve como guia de navegação para desenvolvedores que precisam entender a estrutura do código e localizar funcionalidades específicas.
@@ -27,7 +27,7 @@ O **RAG GPU Server** é responsável pelo processamento intensivo em GPU do sist
 
 - **Embeddings**: Geração de vetores semânticos com BGE-M3 (1024 dimensões dense + sparse)
 - **Reranking**: Reordenação de documentos por relevância com BGE-Reranker-v2-m3
-- **Ingestão de PDFs**: Pipeline completo de processamento (Docling → SpanParser → LLM → Chunks → Embeddings)
+- **Ingestão de PDFs**: Pipeline dual-entry (PyMuPDF/VLM OCR → Regex Classifier → Chunks → Embeddings)
 
 O servidor roda no **RunPod** com GPU NVIDIA A40 (48GB VRAM) e se comunica com a VPS via **Cloudflare Tunnel**.
 
@@ -37,7 +37,7 @@ O servidor roda no **RunPod** com GPU NVIDIA A40 (48GB VRAM) e se comunica com a
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          RAG GPU SERVER (RunPod)                            │
+│                          RAG GPU SERVER (RunPod A40 48GB)                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -46,30 +46,24 @@ O servidor roda no **RunPod** com GPU NVIDIA A40 (48GB VRAM) e se comunica com a
 │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────────┐ │   │
 │  │  │   /embed    │  │  /rerank    │  │       /ingest               │ │   │
 │  │  │             │  │             │  │                             │ │   │
-│  │  │ BGE-M3      │  │ BGE-Reranker│  │ Docling → SpanParser →      │ │   │
-│  │  │ (embeddings)│  │ (cross-enc) │  │ ArticleOrchestrator →       │ │   │
-│  │  │             │  │             │  │ ChunkMaterializer →         │ │   │
-│  │  │ BatchCollect│  │ BatchCollect│  │ Embeddings                  │ │   │
+│  │  │ BGE-M3      │  │ BGE-Reranker│  │ PyMuPDF / VLM OCR →        │ │   │
+│  │  │ (embeddings)│  │ (cross-enc) │  │ Regex Classifier →          │ │   │
+│  │  │             │  │             │  │ Chunks → Embeddings         │ │   │
+│  │  │ BatchCollect│  │ BatchCollect│  │                             │ │   │
 │  │  └─────────────┘  └─────────────┘  └─────────────────────────────┘ │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
-│                              │                                              │
-│                              │ GPU                                          │
-│                              ▼                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                    NVIDIA A40 (48GB VRAM)                           │   │
-│  │                                                                     │   │
-│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐ │   │
-│  │  │    BGE-M3       │  │  BGE-Reranker   │  │   Docling (Layout)  │ │   │
-│  │  │    (~2GB)       │  │    (~1GB)       │  │      (~3GB)         │ │   │
-│  │  └─────────────────┘  └─────────────────┘  └─────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │   BGE-M3     │  │ BGE-Reranker │  │    Redis     │  │   PyMuPDF    │   │
+│  │   (~2GB)     │  │   (~1GB)     │  │   :6379      │  │  (CPU only)  │   │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘   │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                    vLLM Server (:8001)                              │   │
+│  │                    vLLM Server (:8002)                              │   │
 │  │                                                                     │   │
-│  │  Qwen/Qwen3-8B-AWQ                                                  │   │
+│  │  Qwen/Qwen3-VL-8B-Instruct (multimodal)                            │   │
+│  │  - OCR de páginas de PDF (Entrada 2)                                │   │
 │  │  - max_model_len: 8192                                              │   │
-│  │  - prefix_caching: enabled                                          │   │
 │  │  - API OpenAI-compatible                                            │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -84,7 +78,7 @@ O servidor roda no **RunPod** com GPU NVIDIA A40 (48GB VRAM) e se comunica com a
 │                                                                             │
 │  RemoteEmbedder ──► gpu.vectorgov.io/embed                                 │
 │  RemoteReranker ──► gpu.vectorgov.io/rerank                                │
-│  RemoteLLM ──────► llm.vectorgov.io/v1/chat/completions                    │
+│  MinIO (:9100) ◄── RunPod POST multipart (artefatos)                       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,55 +90,60 @@ O servidor roda no **RunPod** com GPU NVIDIA A40 (48GB VRAM) e se comunica com a
 rag-gpu-server/
 ├── src/
 │   ├── main.py                 # Entrada FastAPI, endpoints principais
-│   ├── config.py               # Configurações (modelos, URLs)
+│   ├── config.py               # Configurações (modelos, URLs, pipeline)
 │   ├── auth.py                 # Autenticação por API Key
 │   ├── embedder.py             # BGE-M3 wrapper
 │   ├── reranker.py             # BGE-Reranker wrapper
 │   ├── batch_collector.py      # Micro-batching para performance
 │   │
+│   ├── extraction/             # Extração de texto e OCR
+│   │   ├── pymupdf_extractor.py # PyMuPDF: páginas → blocos + canonical_text
+│   │   ├── regex_classifier.py  # Regex Classifier: blocos → dispositivos legais
+│   │   ├── vlm_client.py       # Cliente HTTP para Qwen3-VL (extract + OCR)
+│   │   ├── vlm_service.py      # Orquestrador: PyMuPDF → VLM → DocumentExtraction
+│   │   ├── vlm_ocr.py          # OCR: prompts, split_ocr_into_blocks, quality gate
+│   │   ├── vlm_models.py       # PageData, BlockData, DocumentExtraction
+│   │   ├── vlm_prompts.py      # Prompts para classificação VLM (legado)
+│   │   └── coord_utils.py      # Conversão coordenadas (img 0-1 ↔ PDF pts)
+│   │
 │   ├── ingestion/              # Pipeline de ingestão de PDFs
-│   │   ├── router.py           # Endpoint /ingest
-│   │   ├── pipeline.py         # Pipeline completo (5 fases)
-│   │   ├── models.py           # Modelos Pydantic
-│   │   ├── article_validator.py # Validação de artigos pós-Docling
-│   │   └── quality_validator.py # Validação de qualidade
+│   │   ├── router.py           # Endpoints /ingest, /ingest/status, /ingest/result
+│   │   ├── pipeline.py         # Pipeline dual-entry (PyMuPDF + VLM OCR)
+│   │   └── models.py           # IngestRequest, IngestResult, ProcessedChunk
 │   │
-│   ├── parsing/                # Parsing de documentos legais
-│   │   ├── span_parser.py      # Regex-first parser (determinístico)
-│   │   ├── article_orchestrator.py # Extração por artigo com LLM
-│   │   ├── span_models.py      # Span, SpanType, ParsedDocument
-│   │   ├── span_extraction_models.py # ArticleSpans (schema LLM)
-│   │   └── span_extractor.py   # Extrator de spans
+│   ├── inspection/             # Pipeline de inspeção visual (QA)
+│   │   ├── router.py           # Endpoints /inspect/*
+│   │   ├── pipeline.py         # Pipeline de inspeção (PyMuPDF + Regex)
+│   │   ├── models.py           # RegexClassificationArtifact, PyMuPDFArtifact
+│   │   ├── storage.py          # Redis storage para artefatos de inspeção
+│   │   └── static/             # Frontend HTML para visualização
 │   │
-│   ├── chunking/               # Materialização de chunks
-│   │   ├── chunk_materializer.py # Parent-child chunks
-│   │   ├── chunk_models.py     # LegalChunk, ChunkLevel
-│   │   ├── enrichment_prompts.py # Prompts Contextual Retrieval
-│   │   └── law_chunker.py      # Chunker legado
+│   ├── classification/         # Classificação de origem
+│   │   └── origin_classifier.py # OriginClassifier: identifica citations cruzadas
 │   │
-│   ├── enrichment/             # Enriquecimento de chunks
-│   │   ├── chunk_enricher.py   # Geração context/thesis/questions
-│   │   ├── celery_app.py       # Configuração Celery
-│   │   ├── tasks.py            # Tasks principais
-│   │   ├── tasks_http.py       # Tasks via HTTP
-│   │   └── tasks_pod.py        # Tasks específicas do pod
+│   ├── chunking/               # Utilitários de chunking
+│   │   ├── canonical_offsets.py # Offsets canônicos (char_start/char_end)
+│   │   ├── citation_extractor.py # Extração de citações cruzadas
+│   │   └── rel_type_classifier.py # Classificação de tipo de relação
 │   │
-│   ├── llm/                    # Cliente LLM
-│   │   └── vllm_client.py      # VLLMClient (API OpenAI-compatible)
+│   ├── sinks/                  # Upload de artefatos
+│   │   ├── artifacts_uploader.py # Upload de chunks → VPS → MinIO
+│   │   └── inspection_uploader.py # Upload de inspeção → VPS → MinIO
 │   │
-│   ├── models/                 # Modelos de domínio
-│   │   ├── legal_document.py   # LegalDocument, Chapter, Article
-│   │   └── extraction_utils.py # Utilitários de extração
-│   │
-│   └── remote/                 # Clientes remotos (quando VPS chama GPU)
-│       ├── embedder.py         # RemoteEmbedder
-│       ├── reranker.py         # RemoteReranker
-│       └── llm.py              # RemoteLLM
+│   └── utils/                  # Utilitários compartilhados
+│       ├── canonical_utils.py  # normalize_canonical_text, compute_canonical_hash
+│       ├── matching_normalization.py # NFKC, OCR table, hyphen break
+│       └── normalization.py    # normalize_document_id
 │
 ├── docs/                       # Documentação
-│   └── MAPA_DO_APLICATIVO.md   # Este arquivo
+│   ├── MAPA_DO_APLICATIVO.md   # Este arquivo
+│   └── QWEN3_PIPELINE_ROLE.md  # Papel do Qwen3-VL no pipeline
 │
-└── tests/                      # Testes
+└── tests/                      # Testes (329 testes)
+    ├── test_pr13_acceptance.py  # Testes de aceitação (regex + OCR blocks)
+    ├── test_c4_fallback.py     # Testes de fallback C4
+    ├── test_origin_classifier.py # Testes do classificador de origem
+    └── ...
 ```
 
 ---
@@ -204,174 +203,151 @@ rag-gpu-server/
 
 ### Visão Geral (`src/ingestion/pipeline.py`)
 
+O pipeline suporta duas entradas que convergem no mesmo processamento downstream:
+
 ```
-PDF → Fase 1 → Fase 2 → Fase 3 → Fase 4 → Fase 5 → Chunks
-       │         │         │         │         │
-       ▼         ▼         ▼         ▼         ▼
-    Docling   SpanParser ArticleOrch Materializer Embeddings
+  ENTRADA 1 (PyMuPDF nativo)           ENTRADA 2 (VLM OCR)
+  ─────────────────────────            ──────────────────────
+  PDF                                  PDF
+   │                                    │
+   ▼                                    ▼
+  PyMuPDF                              PyMuPDF (imagens only)
+  extract_pages()                           │
+   │                                        ▼
+   │                                   Qwen3-VL OCR
+   │                                   ocr_page() por página
+   │                                        │
+   │                                   split_ocr_into_blocks()
+   │                                   ocr_to_pages_data()
+   │                                        │
+   ├── pages_data                      ├── pages_data (sintéticos)
+   └── canonical_text                  └── canonical_text (OCR)
+              │                                  │
+              └──────────┬───────────────────────┘
+                         │
+                         ▼
+              ┌──────────────────────────────────────┐
+              │  _convert_pages_to_classifier_format()│
+              │  classify_to_devices()                │
+              │  (Regex Classifier — MESMO para E1/E2)│
+              └──────────────────────────────────────┘
+                         │
+                         ▼
+              _regex_to_processed_chunks()
+              _build_retrieval_text()
+                         │
+              ┌──────────┼──────────┬──────────┐
+              │          │          │          │
+              ▼          ▼          ▼          ▼
+         OriginClass  BGE-M3    Artifacts   Contract
+         (citations)  Embeddings  Upload    Validation
+                         │
+                         ▼
+                   IngestResponse
+                   (chunks + vetores)
 ```
+
+> **"A única variável é DE ONDE vem o texto."** — Design doc v3
 
 ### Fases do Pipeline
 
 | Fase | Módulo | Descrição | Output |
 |------|--------|-----------|--------|
-| 1 | Docling | PDF → Markdown estruturado | Texto markdown |
-| 2 | SpanParser | Markdown → Spans determinísticos | ParsedDocument |
-| 3 | ArticleOrchestrator | Extração LLM por artigo | ArticleChunks |
-| 4 | ChunkMaterializer | Parent-child chunks | MaterializedChunks |
-| 5 | BGE-M3 | Geração de embeddings | Vetores dense+sparse |
+| 1a (E1) | PyMuPDF | PDF → páginas + canonical_text | pages_data, canonical_text |
+| 1b (E2) | PyMuPDF + Qwen3-VL | PDF → imagens → OCR por página | pages_data, canonical_text |
+| 2 | Regex Classifier | Texto → dispositivos legais hierárquicos | ClassifiedDevice[] |
+| 3 | Chunk Builder | Dispositivos → ProcessedChunks com retrieval_text | ProcessedChunk[] |
+| 4 | OriginClassifier | Identifica citações cruzadas entre normas | citations[] |
+| 5 | BGE-M3 | Geração de embeddings | Vetores dense (1024d) + sparse |
+| 6 | Artifacts Upload | Upload de evidência (PDF, chunks, inspeção) | MinIO via VPS |
 
 ### Módulos do Pipeline
 
-#### SpanParser (`src/parsing/span_parser.py`)
+#### PyMuPDF Extractor (`src/extraction/pymupdf_extractor.py`)
 
 | Funcionalidade | Localização | Descrição |
 |----------------|-------------|-----------|
-| Parser regex | `SpanParser` | Identifica estrutura hierárquica |
-| Padrão Artigo | `PATTERN_ARTIGO` | `Art. 1º`, `Art. 10` |
-| Padrão Parágrafo | `PATTERN_PARAGRAFO` | `§ 1º`, `Parágrafo único` |
-| Padrão Inciso | `PATTERN_INCISO` | `I -`, `II -` |
-| Padrão Alínea | `PATTERN_ALINEA` | `a)`, `b)` |
-| Output | `ParsedDocument` | Documento com spans identificados |
+| Extração | `PyMuPDFExtractor.extract_pages()` | Extrai blocos de texto + imagens PNG |
+| Output | `(List[PageData], str)` | pages_data + canonical_text (NFC normalizado) |
+| Offsets | Nativos | char_start/char_end computados durante concatenação |
+| Blocos | `BlockData` | block_index, text, bbox_pdf, char_start, char_end |
 
-#### ArticleOrchestrator (`src/parsing/article_orchestrator.py`)
+#### Regex Classifier (`src/extraction/regex_classifier.py`)
 
 | Funcionalidade | Localização | Descrição |
 |----------------|-------------|-----------|
-| Orquestrador | `ArticleOrchestrator` | Processa artigo por artigo |
-| Extração LLM | `extract_article()` | Usa Qwen para extrair hierarquia |
-| Validação | `ValidationStatus` | VALID, SUSPECT, INVALID |
-| Cobertura | `ArticleChunk.coverage_*` | Métricas de cobertura |
+| Classificação | `classify_to_devices()` | Identifica Art., §, incisos, alíneas |
+| Hierarquia | `ClassifiedDevice` | parent_span_id, children_span_ids, hierarchy_depth |
+| Span IDs | `ART-001`, `PAR-001-1`, `INC-001-1` | Formato determinístico |
+| Filtros | metadata, cabeçalho, preâmbulo | Blocos não-normativos separados |
 
-#### ChunkMaterializer (`src/chunking/chunk_materializer.py`)
-
-| Funcionalidade | Localização | Descrição |
-|----------------|-------------|-----------|
-| Materialização | `ChunkMaterializer` | Transforma em chunks indexáveis |
-| Parent-child | `MaterializedChunk` | chunk_id, parent_chunk_id |
-| Tipos | `DeviceType` | ARTICLE, PARAGRAPH, INCISO, ALINEA |
-| Metadados | `ChunkMetadata` | schema_version, document_hash |
-
-#### ArticleValidator (`src/ingestion/article_validator.py`)
+#### VLM OCR (`src/extraction/vlm_ocr.py`) — Entrada 2 only
 
 | Funcionalidade | Localização | Descrição |
 |----------------|-------------|-----------|
-| Validador | `ArticleValidator` | Valida sequência de artigos extraídos |
-| Padrão Artigo | `ARTICLE_PATTERN` | Regex `^ART-(\d+)(?:-P(\d+))?$` |
-| Gaps | `missing_articles` | Artigos faltando na sequência |
-| Duplicatas | `duplicate_articles` | Artigos repetidos |
-| Splits | `split_articles` | Artigos divididos (ART-006-P1, P2...) |
-| Manifesto | `chunks_manifest` | Lista de span_ids para validação pós-Milvus |
-| Status | `status` | passed, warning (>=95%), failed |
+| Prompt OCR | `OCR_SYSTEM_PROMPT` | Transcrição precisa de documentos legais |
+| Split em blocos | `split_ocr_into_blocks()` | Texto OCR → blocos sintéticos com offsets |
+| Montagem | `ocr_to_pages_data()` | Combina imagens PyMuPDF + blocos OCR |
+| Quality Gate | `validate_ocr_quality()` | 3 checks: artigos, chars/página, dispositivos/página |
 
 ---
 
-## 🔄 Arquitetura de Enriquecimento
+## 🔄 Fluxo Detalhado por Entrada
 
-O enriquecimento de chunks adiciona contexto semântico (context_header, thesis_text, synthetic_questions) para melhorar a qualidade da busca. A arquitetura difere entre **Normas** e **Acordãos**.
-
-### Comparativo: Normas vs Acordãos
-
-| Aspecto | Normas (Leis/Decretos/INs) | Acordãos (TCU) |
-|---------|---------------------------|----------------|
-| **Orquestração** | VPS (Celery workers) | GPU Server (pipeline.py) |
-| **Quando executa** | Após inserção no Milvus/Neo4j | Durante ingestão |
-| **Parâmetro** | Sempre separado | `skip_enrichment` (checkbox) |
-| **Trabalho GPU** | vLLM + BGE-M3 | vLLM + BGE-M3 |
-
-### Pipeline de Normas (Enrichment Pós-Indexação)
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         INGESTÃO (GPU Server)                                │
-│  PDF → Docling → SpanParser → ArticleOrchestrator → Materializer → Embeddings│
-└─────────────────────────────────────┬────────────────────────────────────────┘
-                                      │ Chunks (sem enrichment)
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              VPS                                             │
-│  1. Insere chunks no Milvus                                                  │
-│  2. Cria nodes/edges no Neo4j                                                │
-│  3. Dispara Celery tasks para enrichment                                     │
-└─────────────────────────────────────┬────────────────────────────────────────┘
-                                      │
-                    ┌─────────────────┴─────────────────┐
-                    │                                   │
-                    ▼                                   ▼
-┌───────────────────────────────┐    ┌────────────────────────────────────────┐
-│  VPS: Celery (Orquestração)   │    │        GPU Server (Trabalho Pesado)    │
-│                               │    │                                        │
-│  Fila: llm_enrich (6 workers) │───►│  vLLM (Qwen3-8B-AWQ)                   │
-│  • Lê chunk do Milvus         │    │  • Gera context_header                 │
-│  • Chama vLLM via HTTP        │    │  • Gera thesis_text                    │
-│  • Dispara embed_and_store    │    │  • Gera synthetic_questions            │
-│                               │    │                                        │
-│  Fila: embed_store (2 workers)│───►│  BGE-M3                                │
-│  • Recebe enrichment          │    │  • Gera embeddings do enriched_text    │
-│  • Chama BGE-M3 via HTTP      │    │  • Retorna dense + sparse vectors      │
-│  • Atualiza chunk no Milvus   │    │                                        │
-└───────────────────────────────┘    └────────────────────────────────────────┘
-```
-
-### Pipeline de Acordãos (Enrichment Durante Ingestão)
+### Entrada 1 — PyMuPDF nativo (`extraction_mode != "vlm"`)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                         GPU Server (pipeline.py)                             │
 │                                                                              │
-│  PDF → Docling → AcordaoParser → AcordaoChunker                              │
-│                                       │                                      │
-│                                       ▼                                      │
-│                          ┌────────────────────────┐                          │
-│                          │  Enrichment (se ativo) │                          │
-│                          │                        │                          │
-│                          │  vLLM (Qwen3-8B-AWQ)   │                          │
-│                          │  • context_header      │                          │
-│                          │  • thesis_text         │                          │
-│                          │  • synthetic_questions │                          │
-│                          └────────────────────────┘                          │
-│                                       │                                      │
-│                                       ▼                                      │
-│                          BGE-M3 (Embeddings)                                 │
-│                                       │                                      │
-└───────────────────────────────────────┼──────────────────────────────────────┘
-                                        │ Chunks (JÁ enriquecidos)
-                                        ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              VPS                                             │
-│  1. Insere chunks no Milvus (já com enriched_text)                           │
-│  2. Cria nodes/edges no Neo4j                                                │
+│  PDF ─► PyMuPDF extract_pages()                                              │
+│              │                                                               │
+│              ├── pages_data (blocos com bbox, offsets nativos)                │
+│              └── canonical_text (NFC normalizado)                             │
+│                       │                                                      │
+│                       ▼                                                      │
+│              Regex Classifier ─► ClassifiedDevice[]                           │
+│                       │                                                      │
+│                       ▼                                                      │
+│              ProcessedChunks ─► OriginClassifier ─► BGE-M3 ─► Artifacts      │
+│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Módulos de Enrichment
+### Entrada 2 — VLM OCR (`extraction_mode == "vlm"`)
 
-| Módulo | Localização | Descrição |
-|--------|-------------|-----------|
-| ChunkEnricher | `src/enrichment/chunk_enricher.py` | Classe principal de enriquecimento |
-| Celery App | `src/enrichment/celery_app.py` | Configuração Celery (broker Redis) |
-| Tasks | `src/enrichment/tasks.py` | Tasks `enrich_chunk_llm` e `embed_and_store` |
-| Prompts | `src/chunking/enrichment_prompts.py` | Prompts para geração de contexto |
-
-### Parâmetro `skip_enrichment`
-
-```python
-# No endpoint /ingest (router.py)
-skip_enrichment: bool = Form(False, description="Pular enriquecimento LLM")
-
-# Efeito por tipo de documento:
-# - Acordãos: Se True, pula enrichment no pipeline (pode enriquecer depois via Celery)
-# - Normas: Não afeta (enrichment sempre via Celery após indexação)
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         GPU Server (pipeline.py)                             │
+│                                                                              │
+│  PDF ─► PyMuPDF extract_pages() ─► imagens PNG (texto descartado)            │
+│              │                                                               │
+│              ▼                                                               │
+│         Qwen3-VL ocr_page() (sequencial, 1 página por vez)                   │
+│              │                                                               │
+│              ▼                                                               │
+│         split_ocr_into_blocks() ─► blocos sintéticos + canonical_text        │
+│         ocr_to_pages_data()     ─► pages_data (mesmo formato de E1)          │
+│              │                                                               │
+│              ▼                                                               │
+│         validate_ocr_quality()  ─► warnings (artigos, chars, dispositivos)   │
+│              │                                                               │
+│              ▼                                                               │
+│         MESMO pipeline de E1:                                                │
+│         Regex Classifier ─► ProcessedChunks ─► OriginClassifier ─► ...       │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Onde o Trabalho GPU Acontece
 
-**Importante**: Independente de onde está a orquestração, o trabalho pesado SEMPRE acontece no GPU Server:
-
-| Operação | Orquestrador | Executor (GPU) |
-|----------|--------------|----------------|
-| LLM (gerar contexto) | VPS Celery ou GPU pipeline | vLLM no RunPod |
-| Embeddings | VPS Celery ou GPU pipeline | BGE-M3 no RunPod |
+| Operação | Módulo | GPU? |
+|----------|--------|------|
+| PyMuPDF (extração de texto/imagens) | `pymupdf_extractor.py` | Não (CPU) |
+| Qwen3-VL OCR (Entrada 2) | `vlm_client.py` → vLLM :8002 | Sim |
+| Regex Classifier | `regex_classifier.py` | Não (CPU) |
+| BGE-M3 Embeddings | `embedder.py` | Sim |
+| BGE-Reranker | `reranker.py` | Sim |
 
 ---
 
@@ -468,7 +444,7 @@ Response:
   "status": "healthy",
   "embedder": {"status": "online", "model": "BAAI/bge-m3"},
   "reranker": {"status": "online", "model": "BAAI/bge-reranker-v2-m3"},
-  "docling": {"status": "online", "warmed_up": true},
+  "vlm_service": {"status": "online"},
   "uptime_seconds": 3600.5
 }
 ```
@@ -506,29 +482,32 @@ EmbedResponse → VPS
 ### Fluxo de Ingestão Completo
 
 ```
-VPS ──► POST /ingest (PDF)
+VPS ──► POST /ingest (PDF + extraction_mode)
             │
             ▼
         ┌───────────────────────────────────────────────────────┐
         │                  GPU Server                            │
         │                                                        │
-        │  1. Docling ──► Markdown                               │
+        │  extraction_mode == "vlm"?                             │
+        │      │                                                 │
+        │      ├── NÃO (Entrada 1):                              │
+        │      │   PyMuPDF ──► pages_data + canonical_text       │
+        │      │                                                 │
+        │      └── SIM (Entrada 2):                              │
+        │          PyMuPDF (imgs) + Qwen3-VL (OCR)               │
+        │          ──► pages_data + canonical_text                │
+        │                    │                                   │
+        │                    ▼                                   │
+        │  Regex Classifier ──► ClassifiedDevice[]               │
         │       │                                                │
         │       ▼                                                │
-        │  2. SpanParser ──► ParsedDocument (spans)              │
+        │  ProcessedChunks ──► OriginClassifier (citations)      │
         │       │                                                │
         │       ▼                                                │
-        │  3. ArticleOrchestrator ──► ArticleChunks              │
-        │       │       │                                        │
-        │       │       └──► vLLM (Qwen 8B)                      │
-        │       │              │                                 │
-        │       │              ▼                                 │
-        │       │           ArticleSpans JSON                    │
-        │       ▼                                                │
-        │  4. ChunkMaterializer ──► MaterializedChunks           │
+        │  BGE-M3 ──► Embeddings (dense 1024d + sparse)          │
         │       │                                                │
         │       ▼                                                │
-        │  5. BGE-M3 ──► Embeddings (dense + sparse)             │
+        │  Artifacts Upload ──► VPS ──► MinIO                    │
         │                                                        │
         └───────────────────────────────────────────────────────┘
             │
@@ -536,7 +515,7 @@ VPS ──► POST /ingest (PDF)
         IngestResponse (chunks com embeddings) ──► VPS
             │
             ▼
-        VPS insere no Milvus
+        VPS insere no Milvus + Neo4j
 ```
 
 ---
@@ -580,7 +559,7 @@ VPS ──► POST /ingest (PDF)
 | Repositório | Responsabilidade | Componentes |
 |-------------|------------------|-------------|
 | **vector_govi_2** | Monorepo principal, documentação, frontend | extracao/, frontend/, scripts/ |
-| **rag-gpu-server** | Processamento GPU, ingestão, embeddings | FastAPI, BGE-M3, Docling, Pipeline |
+| **rag-gpu-server** | Processamento GPU, ingestão, embeddings | FastAPI, BGE-M3, PyMuPDF, Qwen3-VL, Pipeline |
 | **vectorgov-sdk** | SDK Python para integração | VectorGov client, LangChain, MCP |
 
 ### Comunicação entre Repositórios
@@ -605,8 +584,8 @@ VPS ──► POST /ingest (PDF)
 | `PORT` | 8000 | Porta do servidor |
 | `EMBEDDING_MODEL` | BAAI/bge-m3 | Modelo de embeddings |
 | `RERANKER_MODEL` | BAAI/bge-reranker-v2-m3 | Modelo de reranking |
-| `VLLM_BASE_URL` | http://localhost:8001/v1 | URL do vLLM |
-| `VLLM_MODEL` | Qwen/Qwen3-8B-AWQ | Modelo LLM |
+| `VLLM_BASE_URL` | http://localhost:8002/v1 | URL do vLLM |
+| `VLLM_MODEL` | Qwen/Qwen3-VL-8B-Instruct | Modelo VLM (multimodal) |
 | `GPU_API_KEYS` | vg_gpu_internal_2025 | API Keys válidas |
 | `ALLOWED_IPS` | * | IPs permitidos |
 | `DEVICE` | cuda | Dispositivo (cuda/cpu) |
@@ -621,8 +600,8 @@ class Config:
     port: int = 8000
     embedding_model: str = "BAAI/bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    vllm_base_url: str = "http://localhost:8001/v1"
-    vllm_model: str = "Qwen/Qwen3-8B-AWQ"
+    vllm_base_url: str = "http://localhost:8002/v1"
+    vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
     use_fp16: bool = True
     device: str = "cuda"
 ```
@@ -691,7 +670,8 @@ nohup /workspace/venv/bin/python -m uvicorn src.main:app \
 ## 📚 Referências
 
 - [FlagEmbedding (BGE-M3)](https://github.com/FlagOpen/FlagEmbedding)
-- [Docling (IBM)](https://github.com/DS4SD/docling)
+- [PyMuPDF](https://pymupdf.readthedocs.io/)
+- [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
 - [vLLM](https://docs.vllm.ai/)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/)
