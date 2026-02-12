@@ -94,6 +94,11 @@ class ProcessedChunk(BaseModel):
     data_sessao: str = Field("", description="Data da sessão (DD/MM/YYYY)")
     unidade_tecnica: str = Field("", description="Unidade técnica responsável")
 
+    # Campos de hierarquia/tipo para Acórdãos (string vazia para LEIs)
+    section_type: str = Field("", description="relatorio, voto, acordao (vazio para LEIs)")
+    authority_level: str = Field("", description="vinculante, fundamentacao, opinativo (vazio para LEIs)")
+    section_path: str = Field("", description="Caminho hierárquico: RELATÓRIO > EXAME TÉCNICO > I.3.1")
+
     # Vetores (opcionais, preenchidos se skip_embeddings=False)
     dense_vector: Optional[list[float]] = Field(None, description="Embedding dense 1024d")
     sparse_vector: Optional[dict[int, float]] = Field(None, description="Embedding sparse")

@@ -51,11 +51,11 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
     Valida invariantes do contrato antes de retornar para VPS.
 
     Invariantes:
-    1. node_id DEVE começar com "leis:" e NÃO conter "@P"
-    2. parent_node_id (quando não vazio) DEVE começar com "leis:" e NÃO conter "@P"
+    1. node_id DEVE começar com "leis:" ou "acordaos:" e NÃO conter "@P"
+    2. parent_node_id (quando não vazio) DEVE começar com prefixo válido e NÃO conter "@P"
     3. Filhos devem ter parent_node_id
     4. PR13 trio deve ser coerente (sentinela ou válido, nunca misturado)
-    5. EVIDENCE CHUNKS (article/paragraph/inciso/alinea) DEVEM ter offsets válidos
+    5. EVIDENCE CHUNKS DEVEM ter offsets válidos
        - Sentinela (-1,-1,"") é PROIBIDO para evidence
        - Evidence sem offset = snippet não determinístico = ABORT
 
@@ -64,21 +64,30 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
     """
     violations = []
 
-    # Device types que são "evidence" (aparecem no Evidence Drawer)
-    EVIDENCE_DEVICE_TYPES = {"article", "paragraph", "inciso", "alinea"}
+    VALID_PREFIXES = ("leis:", "acordaos:")
+    EVIDENCE_LEI = {"article", "paragraph", "inciso", "alinea"}
+    EVIDENCE_ACORDAO = {"section", "paragraph", "item_dispositivo"}
 
     for i, chunk in enumerate(chunks):
         node_id = chunk.node_id or ""
         parent_node_id = chunk.parent_node_id or ""
         device_type = chunk.device_type or ""
         span_id = chunk.span_id or ""
-        is_evidence = device_type in EVIDENCE_DEVICE_TYPES
 
-        # Invariante 1: node_id deve começar com "leis:"
-        if not node_id.startswith("leis:"):
+        # Determina prefixo e evidence types
+        if node_id.startswith("acordaos:"):
+            prefix = "acordaos:"
+            evidence_types = EVIDENCE_ACORDAO
+        elif node_id.startswith("leis:"):
+            prefix = "leis:"
+            evidence_types = EVIDENCE_LEI
+        else:
             violations.append(
-                f"[{span_id}] node_id sem prefixo 'leis:': '{node_id}'"
+                f"[{span_id}] node_id com prefixo desconhecido: '{node_id}'"
             )
+            continue
+
+        is_evidence = device_type in evidence_types
 
         # Invariante 2: node_id não pode conter @Pxx
         if "@P" in node_id:
@@ -86,10 +95,10 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
                 f"[{span_id}] node_id contém @Pxx (proibido): '{node_id}'"
             )
 
-        # Invariante 3: parent_node_id (quando não vazio) deve começar com "leis:"
-        if parent_node_id and not parent_node_id.startswith("leis:"):
+        # Invariante 3: parent_node_id (quando não vazio) deve começar com prefixo válido
+        if parent_node_id and not parent_node_id.startswith(prefix):
             violations.append(
-                f"[{span_id}] parent_node_id sem prefixo 'leis:': '{parent_node_id}'"
+                f"[{span_id}] parent_node_id sem prefixo '{prefix}': '{parent_node_id}'"
             )
 
         # Invariante 4: parent_node_id não pode conter @Pxx
@@ -98,8 +107,11 @@ def validate_chunk_invariants(chunks: List["ProcessedChunk"], document_id: str) 
                 f"[{span_id}] parent_node_id contém @Pxx (proibido): '{parent_node_id}'"
             )
 
-        # Invariante 5: filhos (não-artigos) devem ter parent_node_id não vazio
-        if device_type in ("paragraph", "inciso", "alinea") and not parent_node_id:
+        # Invariante 5: filhos devem ter parent_node_id não vazio
+        child_types_lei = ("paragraph", "inciso", "alinea")
+        child_types_acordao = ("paragraph", "item_dispositivo")
+        child_types = child_types_acordao if prefix == "acordaos:" else child_types_lei
+        if device_type in child_types and not parent_node_id:
             violations.append(
                 f"[{span_id}] {device_type} sem parent_node_id (obrigatório para filhos)"
             )
@@ -303,7 +315,21 @@ class IngestionPipeline:
             try:
                 extraction_mode = getattr(request, 'extraction_mode', 'pymupdf_regex')
 
-                if extraction_mode == 'vlm':
+                if request.tipo_documento == "ACORDAO":
+                    # === PIPELINE ACÓRDÃO ===
+                    if extraction_mode == 'vlm':
+                        logger.info(f"Pipeline Acórdão+VLM ativo para {request.document_id}")
+                        report_progress("acordao_vlm_extraction", 0.10)
+                        self._phase_acordao_vlm_extraction(
+                            pdf_content, request, result, report_progress
+                        )
+                    else:
+                        logger.info(f"Pipeline Acórdão+Regex ativo para {request.document_id}")
+                        report_progress("acordao_extraction", 0.10)
+                        self._phase_acordao_extraction(
+                            pdf_content, request, result, report_progress
+                        )
+                elif extraction_mode == 'vlm':
                     # === PIPELINE VLM: PyMuPDF + Qwen3-VL ===
                     logger.info(f"Pipeline VLM ativo para {request.document_id}")
                     report_progress("vlm_extraction", 0.10)
@@ -1207,6 +1233,7 @@ class IngestionPipeline:
         canonical_text: str,
         canonical_hash: str,
         document_id: str,
+        acordao_metadata: Optional[dict] = None,
     ) -> dict:
         """
         Gera manifesto de ingestão para reconciliação pela VPS.
@@ -1272,7 +1299,7 @@ class IngestionPipeline:
         total_chars = len(canonical_text) if canonical_text else 0
         coverage_pct = round((covered_chars / total_chars * 100), 1) if total_chars > 0 else 0.0
 
-        return {
+        manifest = {
             "document_id": document_id,
             "canonical_hash": canonical_hash,
             "canonical_length": total_chars,
@@ -1294,6 +1321,628 @@ class IngestionPipeline:
                 "vehicle_articles": vehicle_articles,
             },
         }
+
+        # Acórdão-specific fields
+        if acordao_metadata:
+            section_types: Dict[str, int] = {}
+            authority_levels: Dict[str, int] = {}
+            for c in chunks:
+                st = getattr(c, "section_type", "") or ""
+                al = getattr(c, "authority_level", "") or ""
+                if st:
+                    section_types[st] = section_types.get(st, 0) + 1
+                if al:
+                    authority_levels[al] = authority_levels.get(al, 0) + 1
+            manifest["section_types"] = section_types
+            manifest["authority_levels"] = authority_levels
+            manifest["metadata"] = acordao_metadata
+
+        return manifest
+
+    # =================================================================
+    # ACÓRDÃO PIPELINE
+    # =================================================================
+
+    def _phase_acordao_extraction(
+        self,
+        pdf_content: bytes,
+        request: IngestRequest,
+        result: PipelineResult,
+        report_progress,
+    ) -> None:
+        """Pipeline Acórdão: PyMuPDF + AcordaoParser."""
+        phase_start = time.perf_counter()
+        try:
+            from ..config import config as app_config
+            from ..extraction.pymupdf_extractor import PyMuPDFExtractor
+
+            # 1. Extração PyMuPDF
+            extractor = PyMuPDFExtractor(dpi=app_config.vlm_page_dpi)
+            pages_data, raw_canonical = extractor.extract_pages(pdf_content)
+
+            report_progress("acordao_extraction", 0.30)
+
+            self._process_acordao(
+                pages_data, raw_canonical, pdf_content,
+                request, result, report_progress,
+                phase_start, extraction_source="pymupdf_native",
+            )
+
+        except Exception as e:
+            logger.error(f"Erro no pipeline Acórdão: {e}", exc_info=True)
+            result.status = IngestStatus.FAILED
+            result.errors.append(IngestError(
+                phase="acordao_extraction",
+                message=str(e),
+            ))
+
+    def _phase_acordao_vlm_extraction(
+        self,
+        pdf_content: bytes,
+        request: IngestRequest,
+        result: PipelineResult,
+        report_progress,
+    ) -> None:
+        """Pipeline Acórdão + VLM OCR."""
+        phase_start = time.perf_counter()
+        try:
+            # 1. VLM OCR
+            self.vlm_service.vlm_client.reset_client()
+            pages_data, raw_canonical = asyncio.run(
+                self.vlm_service.ocr_document(
+                    pdf_bytes=pdf_content,
+                    document_id=request.document_id,
+                    progress_callback=report_progress,
+                )
+            )
+
+            report_progress("acordao_vlm_extraction", 0.30)
+
+            self._process_acordao(
+                pages_data, raw_canonical, pdf_content,
+                request, result, report_progress,
+                phase_start, extraction_source="vlm_ocr",
+            )
+
+        except Exception as e:
+            logger.error(f"Erro no pipeline Acórdão+VLM: {e}", exc_info=True)
+            result.status = IngestStatus.FAILED
+            result.errors.append(IngestError(
+                phase="acordao_vlm_extraction",
+                message=str(e),
+            ))
+
+    def _process_acordao(
+        self,
+        pages_data: list,
+        raw_canonical: str,
+        pdf_content: bytes,
+        request: IngestRequest,
+        result: PipelineResult,
+        report_progress,
+        phase_start: float,
+        extraction_source: str = "pymupdf_native",
+    ) -> None:
+        """
+        Lógica compartilhada do pipeline de acórdãos (PyMuPDF e VLM).
+
+        1. Idempotency check
+        2. Drift detection
+        3. Header parse
+        4. AcordaoParser
+        5. Inspection snapshot
+        6. _acordao_to_processed_chunks
+        7. OriginClassifier (simplificado: all self)
+        8. Embeddings
+        9. Artifacts
+        10. Validate + Manifest
+        """
+        from ..config import config as app_config
+        from ..extraction.acordao_header_parser import AcordaoHeaderParser
+        from ..extraction.acordao_parser import AcordaoParser
+
+        # 2. Idempotency check
+        canonical_text = raw_canonical
+        normalized_check = normalize_canonical_text(raw_canonical)
+        if canonical_text != normalized_check:
+            logger.error(
+                f"[{request.document_id}] OFFSET DRIFT: canonical_text "
+                f"diverge de normalize_canonical_text() — offsets inválidos! "
+                f"raw_len={len(canonical_text)} norm_len={len(normalized_check)}"
+            )
+            raise RuntimeError(
+                "canonical_text diverge de normalize_canonical_text(): "
+                "offsets nativos seriam inválidos."
+            )
+        canonical_hash = compute_canonical_hash(canonical_text)
+
+        result.markdown_content = canonical_text
+        result.canonical_hash = canonical_hash
+
+        # 3. Drift detection
+        from ..utils.drift_detector import DriftDetector
+        drift_detector = DriftDetector()
+        drift = drift_detector.check(
+            document_id=request.document_id,
+            pdf_hash=result.document_hash,
+            pipeline_version=app_config.pipeline_version,
+            current_canonical_hash=canonical_hash,
+        )
+        if drift.is_drifted:
+            logger.warning(f"DRIFT DETECTADO: {drift.message}")
+            result.quality_issues.append(
+                f"DRIFT: canonical_hash mudou para mesmo pdf_hash+pipeline_version "
+                f"(prev={drift.previous_canonical_hash[:16]}... "
+                f"curr={drift.current_canonical_hash[:16]}...)"
+            )
+
+        report_progress("acordao_extraction", 0.40)
+
+        # 4. Header parse
+        header_parser = AcordaoHeaderParser()
+        header_metadata = header_parser.parse_header(canonical_text)
+
+        # 5. Build page_boundaries
+        page_boundaries = []
+        for pg in pages_data:
+            if pg.blocks:
+                pg_start = pg.blocks[0].char_start
+                pg_end = pg.blocks[-1].char_end
+            else:
+                pg_start = 0
+                pg_end = 0
+            page_boundaries.append((pg_start, pg_end))
+
+        # 6. AcordaoParser
+        parser = AcordaoParser()
+        acordao_devices = parser.parse(canonical_text, page_boundaries)
+        logger.info(
+            f"[{request.document_id}] AcordaoParser: {len(acordao_devices)} dispositivos"
+        )
+
+        report_progress("acordao_extraction", 0.55)
+
+        # Registra fase
+        extract_duration = round(time.perf_counter() - phase_start, 2)
+        result.phases.append({
+            "name": "acordao_extraction",
+            "duration_seconds": extract_duration,
+            "output": (
+                f"Extraídos {len(acordao_devices)} dispositivos de "
+                f"{len(pages_data)} páginas via AcordaoParser ({extraction_source})"
+            ),
+            "success": True,
+            "method": extraction_source,
+        })
+
+        # 7. Inspection snapshot (reutiliza formato simplificado para acórdãos)
+        try:
+            self._emit_acordao_inspection_snapshot(
+                acordao_devices, canonical_text, canonical_hash,
+                extract_duration, request, pages_data,
+                extraction_source=extraction_source,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit acordao inspector snapshot: {e}")
+
+        # 8. Converte AcordaoDevice -> ProcessedChunk
+        chunks = self._acordao_to_processed_chunks(
+            acordao_devices, canonical_text, canonical_hash,
+            request, header_metadata,
+        )
+
+        report_progress("acordao_extraction", 0.65)
+
+        # 9. OriginClassifier simplificado: acórdãos são sempre "self"
+        for chunk in chunks:
+            chunk.origin_type = "self"
+            chunk.origin_confidence = "high"
+            chunk.origin_reference = ""
+            chunk.origin_reference_name = ""
+            chunk.is_external_material = False
+            chunk.origin_reason = "rule:acordao_sempre_self"
+
+        report_progress("acordao_extraction", 0.70)
+
+        # 10. Embeddings
+        if not request.skip_embeddings:
+            report_progress("embedding", 0.70)
+            for chunk in chunks:
+                text_for_embedding = chunk.retrieval_text or chunk.text
+                embed_result = self.embedder.encode([text_for_embedding])
+                chunk.dense_vector = embed_result.dense_embeddings[0]
+                chunk.sparse_vector = (
+                    embed_result.sparse_embeddings[0]
+                    if embed_result.sparse_embeddings
+                    else {}
+                )
+            report_progress("embedding", 0.88)
+
+            result.phases.append({
+                "name": "embedding",
+                "duration_seconds": round(time.perf_counter() - phase_start - extract_duration, 2),
+                "output": f"Embeddings para {len(chunks)} chunks Acórdão",
+                "success": True,
+            })
+
+        # 11. Artifacts upload
+        report_progress("artifacts_upload", 0.88)
+        self._phase_artifacts_upload(
+            pdf_content, canonical_text, canonical_hash,
+            chunks, request, result,
+        )
+        report_progress("artifacts_upload", 0.94)
+
+        # 12. Valida invariantes do contrato
+        validate_chunk_invariants(chunks, request.document_id)
+
+        # 13. Drift register
+        drift_detector.register_run(
+            document_id=request.document_id,
+            pdf_hash=result.document_hash,
+            pipeline_version=app_config.pipeline_version,
+            canonical_hash=canonical_hash,
+            ingest_run_id=result.ingest_run_id,
+        )
+
+        # 14. Manifesto de ingestão
+        result.manifest = self._build_manifest(
+            chunks, canonical_text, canonical_hash, request.document_id,
+            acordao_metadata=header_metadata,
+        )
+
+        result.chunks = chunks
+        result.status = IngestStatus.COMPLETED
+
+        report_progress("completed", 1.0)
+
+        logger.info(
+            f"Pipeline Acórdão concluído: {len(chunks)} chunks, "
+            f"{len(acordao_devices)} dispositivos, "
+            f"manifest: {result.manifest.get('total_spans')} spans"
+        )
+
+    def _acordao_to_processed_chunks(
+        self,
+        devices,
+        canonical_text: str,
+        canonical_hash: str,
+        request: IngestRequest,
+        header_metadata: dict,
+    ) -> List[ProcessedChunk]:
+        """
+        Converte List[AcordaoDevice] -> List[ProcessedChunk].
+
+        Prefixo "acordaos:" em node_id.
+        """
+        chunks = []
+        device_by_span = {d.span_id: d for d in devices}
+
+        numero = header_metadata.get("numero", request.numero)
+        ano = header_metadata.get("ano", str(request.ano))
+        colegiado = header_metadata.get("colegiado", getattr(request, "colegiado", "") or "")
+        processo = header_metadata.get("processo", getattr(request, "processo", "") or "")
+        relator = header_metadata.get("relator", getattr(request, "relator", "") or "")
+        natureza = header_metadata.get("natureza", "")
+        resultado = header_metadata.get("resultado", "")
+        unidade_tecnica = header_metadata.get("unidade_tecnica", getattr(request, "unidade_tecnica", "") or "")
+        data_sessao = header_metadata.get("data_sessao", getattr(request, "data_sessao", "") or "")
+
+        for device in devices:
+            chunk_id = f"{request.document_id}#{device.span_id}"
+            node_id = f"acordaos:{chunk_id}"
+
+            parent_node_id = ""
+            if device.parent_span_id:
+                parent_node_id = f"acordaos:{request.document_id}#{device.parent_span_id}"
+
+            # chunk_level
+            chunk_level = "section" if device.device_type == "section" else "device"
+
+            # Retrieval text
+            retrieval_text = self._build_acordao_retrieval_text(
+                device, numero, ano, colegiado, relator,
+                natureza, resultado, processo, unidade_tecnica,
+                device_by_span,
+            )
+
+            # Citações
+            citations = extract_citations_from_chunk(
+                text=device.text or "",
+                document_id=request.document_id,
+                chunk_node_id=node_id,
+                parent_chunk_id=parent_node_id or None,
+                document_type=request.tipo_documento,
+            )
+
+            pc = ProcessedChunk(
+                node_id=node_id,
+                chunk_id=chunk_id,
+                parent_node_id=parent_node_id,
+                span_id=device.span_id,
+                device_type=device.device_type,
+                chunk_level=chunk_level,
+                text=device.text or "",
+                parent_text="",
+                retrieval_text=retrieval_text,
+                document_id=request.document_id,
+                tipo_documento=request.tipo_documento,
+                numero=request.numero,
+                ano=request.ano,
+                article_number="",
+                citations=citations,
+                # PR13: offsets nativos
+                canonical_start=device.char_start,
+                canonical_end=device.char_end,
+                canonical_hash=canonical_hash,
+                # Coordenadas
+                page_number=device.page_number,
+                bbox=device.bbox,
+                bbox_img=[],
+                img_width=0,
+                img_height=0,
+                confidence=1.0,
+                # Cross-page
+                is_cross_page=False,
+                bbox_spans=[],
+                # Campos Acórdão
+                colegiado=colegiado,
+                processo=processo,
+                relator=relator,
+                data_sessao=data_sessao,
+                unidade_tecnica=unidade_tecnica,
+                # Hierarquia/tipo
+                section_type=device.section_type,
+                authority_level=device.authority_level,
+                section_path=device.section_path,
+            )
+            chunks.append(pc)
+
+        logger.info(f"Acórdão -> ProcessedChunk: {len(chunks)} chunks gerados")
+        return chunks
+
+    @staticmethod
+    def _build_acordao_retrieval_text(
+        device,
+        numero: str,
+        ano: str,
+        colegiado: str,
+        relator: str,
+        natureza: str,
+        resultado: str,
+        processo: str,
+        unidade_tecnica: str,
+        device_by_span: dict,
+    ) -> str:
+        """Constrói retrieval_text enriquecido para acórdãos por authority_level."""
+        text = device.text or ""
+
+        if device.authority_level == "vinculante" and device.device_type == "item_dispositivo":
+            return (
+                f"DECISÃO VINCULANTE – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
+                f"Relator: Min. {relator}. Natureza: {natureza}.\n"
+                f"Resultado: {resultado}.\n"
+                f"Processo: {processo}.\n"
+                f"Dispositivo {device.identifier}:\n"
+                f"{text}"
+            )
+
+        if device.authority_level == "fundamentacao" and device.device_type == "paragraph":
+            return (
+                f"FUNDAMENTAÇÃO DO RELATOR – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
+                f"Relator: Min. {relator}. Natureza: {natureza}.\n"
+                f"Seção: Voto, § {device.identifier}.\n"
+                f"{text}"
+            )
+
+        if device.authority_level == "opinativo" and device.device_type == "paragraph":
+            return (
+                f"ANÁLISE DA UNIDADE TÉCNICA – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
+                f"Unidade técnica: {unidade_tecnica}. Natureza: {natureza}.\n"
+                f"Seção: {device.section_path}.\n"
+                f"{text}"
+            )
+
+        if device.device_type == "section":
+            # Section container — include first 500 chars
+            tipo_upper = {
+                "relatorio": "RELATÓRIO",
+                "voto": "VOTO",
+                "acordao": "ACÓRDÃO",
+            }.get(device.section_type, device.section_type.upper())
+            preview = text[:500] + "..." if len(text) > 500 else text
+            return (
+                f"{tipo_upper} – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
+                f"Seção: {device.section_path}.\n"
+                f"{preview}"
+            )
+
+        # Fallback
+        return text
+
+    def _emit_acordao_inspection_snapshot(
+        self,
+        devices,
+        canonical_text: str,
+        canonical_hash: str,
+        duration_ms: float,
+        request: IngestRequest,
+        pages_data: list,
+        extraction_source: str = "pymupdf_native",
+    ) -> None:
+        """
+        Emite snapshot da classificação de acórdão para o Redis (Inspector).
+        Reutiliza o modelo RegexClassificationArtifact com dados do AcordaoParser.
+        """
+        import unicodedata
+        from ..inspection.storage import InspectionStorage
+        from ..inspection.models import (
+            InspectionStage,
+            InspectionMetadata,
+            InspectionStatus,
+            RegexClassificationArtifact,
+            RegexDevice,
+            RegexClassificationStats,
+            RegexIntegrityChecks,
+            RegexOffsetCheck,
+            PyMuPDFArtifact,
+            PyMuPDFPageResult,
+            PyMuPDFBlock,
+            BBox,
+        )
+
+        storage = InspectionStorage()
+
+        # Build regex devices from acordao devices
+        regex_devices = []
+        by_type: Dict[str, int] = {}
+        for d in devices:
+            by_type[d.device_type] = by_type.get(d.device_type, 0) + 1
+            regex_devices.append(RegexDevice(
+                span_id=d.span_id,
+                device_type=d.device_type,
+                identifier=d.identifier or "",
+                parent_span_id=d.parent_span_id or "",
+                children_span_ids=d.children_span_ids,
+                hierarchy_depth=d.hierarchy_depth,
+                text=d.text,
+                text_preview=d.text_preview,
+                char_start=d.char_start,
+                char_end=d.char_end,
+                page_number=d.page_number,
+                bbox=d.bbox,
+            ))
+
+        stats = RegexClassificationStats(
+            total_blocks=len(devices),
+            devices=len(devices),
+            filtered=0,
+            unclassified=0,
+            by_device_type=by_type,
+            by_filter_type={},
+            max_hierarchy_depth=max((d.hierarchy_depth for d in devices), default=0),
+        )
+
+        # Integrity checks
+        from ..chunking.canonical_offsets import normalize_canonical_text as norm_ct
+
+        offset_details = []
+        offsets_matches = 0
+        for d in regex_devices:
+            sliced = canonical_text[d.char_start:d.char_end] if d.char_start >= 0 else ""
+            match = sliced == d.text
+            if match:
+                offsets_matches += 1
+            offset_details.append(RegexOffsetCheck(
+                span_id=d.span_id,
+                page=d.page_number,
+                char_start=d.char_start,
+                char_end=d.char_end,
+                match=match,
+                expected_preview=d.text[:60],
+                got_preview=sliced[:60],
+            ))
+
+        norm_idempotent = canonical_text == norm_ct(canonical_text)
+        trailing_violations = sum(
+            1 for line in canonical_text.split("\n")
+            if line != line.rstrip()
+        )
+        is_nfc = unicodedata.is_normalized("NFC", canonical_text)
+        has_trailing_nl = canonical_text.endswith("\n") if canonical_text else False
+
+        offsets_pass = offsets_matches == len(offset_details)
+        all_pass = (
+            offsets_pass
+            and norm_idempotent
+            and trailing_violations == 0
+            and is_nfc
+            and has_trailing_nl
+        )
+
+        checks = RegexIntegrityChecks(
+            all_pass=all_pass,
+            offsets_pass=offsets_pass,
+            offsets_total=len(offset_details),
+            offsets_matches=offsets_matches,
+            offsets_details=offset_details,
+            normalization_idempotent=norm_idempotent,
+            no_trailing_spaces=trailing_violations == 0,
+            trailing_space_violations=trailing_violations,
+            unicode_nfc=is_nfc,
+            trailing_newline=has_trailing_nl,
+        )
+
+        artifact = RegexClassificationArtifact(
+            devices=regex_devices,
+            filtered=[],
+            unclassified=[],
+            stats=stats,
+            checks=checks,
+            canonical_text=canonical_text,
+            canonical_hash=canonical_hash,
+            canonical_length=len(canonical_text),
+            duration_ms=duration_ms * 1000,
+            extraction_source=extraction_source,
+        )
+
+        # PyMuPDF artifact
+        pymupdf_pages = []
+        for pg in pages_data:
+            blocks = []
+            for b in pg.blocks:
+                blocks.append(PyMuPDFBlock(
+                    block_index=b.block_index,
+                    text=b.text[:200],
+                    bbox=BBox(
+                        x0=b.bbox_pdf[0], y0=b.bbox_pdf[1],
+                        x1=b.bbox_pdf[2], y1=b.bbox_pdf[3],
+                    ) if len(b.bbox_pdf) == 4 else BBox(x0=0, y0=0, x1=0, y1=0),
+                    page=pg.page_number,
+                ))
+            pymupdf_pages.append(PyMuPDFPageResult(
+                page_number=pg.page_number,
+                width=pg.width,
+                height=pg.height,
+                blocks=blocks,
+                image_base64=pg.image_base64,
+            ))
+
+        pymupdf_artifact = PyMuPDFArtifact(
+            pages=pymupdf_pages,
+            total_blocks=sum(len(p.blocks) for p in pages_data),
+            total_pages=len(pages_data),
+            total_chars=len(canonical_text),
+        )
+
+        # Save to Redis
+        task_id = f"acordao_{request.document_id}_{int(time.time())}"
+
+        metadata = InspectionMetadata(
+            inspection_id=task_id,
+            document_id=request.document_id,
+            tipo_documento=request.tipo_documento,
+            numero=request.numero,
+            ano=request.ano,
+            total_pages=len(pages_data),
+            started_at=datetime.utcnow().isoformat(),
+            status=InspectionStatus.COMPLETED,
+        )
+
+        storage.save_metadata(task_id, metadata)
+        storage.save_artifact(
+            task_id, InspectionStage.REGEX_CLASSIFICATION,
+            artifact.model_dump_json(),
+        )
+        storage.save_artifact(
+            task_id, InspectionStage.PYMUPDF,
+            pymupdf_artifact.model_dump_json(),
+        )
+
+        logger.info(
+            f"Acordao inspector snapshot emitted: {task_id} "
+            f"({len(regex_devices)} devices, checks={'PASS' if all_pass else 'FAIL'})"
+        )
 
     def _phase_milvus_sink(self, materialized, request: IngestRequest, result: PipelineResult):
         """Fase 5.5: Inserir chunks no Milvus remoto (se MILVUS_HOST configurado)."""

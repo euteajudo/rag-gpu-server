@@ -148,7 +148,7 @@ class TestA_ValidateChunkInvariants:
             canonical_hash=VALID_HASH,
             node_id="DOC#ART-001",  # Missing leis: prefix
         )
-        with pytest.raises(ContractViolationError, match="node_id sem prefixo"):
+        with pytest.raises(ContractViolationError, match="node_id com prefixo desconhecido"):
             validate_chunk_invariants([chunk], "DOC")
 
     def test_A7_child_without_parent_node_id(self):
