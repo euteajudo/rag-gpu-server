@@ -1533,14 +1533,7 @@ class IngestionPipeline:
 
         report_progress("acordao_extraction", 0.65)
 
-        # 9. OriginClassifier simplificado: acórdãos são sempre "self"
-        for chunk in chunks:
-            chunk.origin_type = "self"
-            chunk.origin_confidence = "high"
-            chunk.origin_reference = ""
-            chunk.origin_reference_name = ""
-            chunk.is_external_material = False
-            chunk.origin_reason = "rule:acordao_sempre_self"
+        # 9. OriginClassifier: não se aplica a acórdãos (campos removidos do schema acordaos_v1)
 
         report_progress("acordao_extraction", 0.70)
 
@@ -1625,7 +1618,6 @@ class IngestionPipeline:
         relator = header_metadata.get("relator", getattr(request, "relator", "") or "")
         natureza = header_metadata.get("natureza", "")
         resultado = header_metadata.get("resultado", "")
-        unidade_tecnica = header_metadata.get("unidade_tecnica", getattr(request, "unidade_tecnica", "") or "")
         data_sessao = header_metadata.get("data_sessao", getattr(request, "data_sessao", "") or "")
 
         for device in devices:
@@ -1642,7 +1634,7 @@ class IngestionPipeline:
             # Retrieval text
             retrieval_text = self._build_acordao_retrieval_text(
                 device, numero, ano, colegiado, relator,
-                natureza, resultado, processo, unidade_tecnica,
+                natureza, resultado, processo,
                 device_by_span,
             )
 
@@ -1690,7 +1682,6 @@ class IngestionPipeline:
                 processo=processo,
                 relator=relator,
                 data_sessao=data_sessao,
-                unidade_tecnica=unidade_tecnica,
                 # Hierarquia/tipo
                 section_type=device.section_type,
                 authority_level=device.authority_level,
@@ -1711,7 +1702,6 @@ class IngestionPipeline:
         natureza: str,
         resultado: str,
         processo: str,
-        unidade_tecnica: str,
         device_by_span: dict,
     ) -> str:
         """Constrói retrieval_text enriquecido para acórdãos por authority_level."""
@@ -1737,8 +1727,8 @@ class IngestionPipeline:
 
         if device.authority_level == "opinativo" and device.device_type == "paragraph":
             return (
-                f"ANÁLISE DA UNIDADE TÉCNICA – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
-                f"Unidade técnica: {unidade_tecnica}. Natureza: {natureza}.\n"
+                f"Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
+                f"Relator: Min. {relator}. Natureza: {natureza}.\n"
                 f"Seção: {device.section_path}.\n"
                 f"{text}"
             )

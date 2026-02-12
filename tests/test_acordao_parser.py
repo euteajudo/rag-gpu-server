@@ -364,7 +364,7 @@ class TestT10RetrievalText:
         rt = IngestionPipeline._build_acordao_retrieval_text(
             item, "2450", "2025", "Plenario", "Jorge Oliveira",
             "Representação", "Parcialmente procedente",
-            "TC 018.677/2025-8", "AudContratações", device_map,
+            "TC 018.677/2025-8", device_map,
         )
         assert "DECISÃO VINCULANTE" in rt
         assert "2450/2025" in rt
@@ -381,7 +381,7 @@ class TestT10RetrievalText:
         rt = IngestionPipeline._build_acordao_retrieval_text(
             para, "2450", "2025", "Plenario", "Jorge Oliveira",
             "Representação", "Parcialmente procedente",
-            "TC 018.677/2025-8", "AudContratações", device_map,
+            "TC 018.677/2025-8", device_map,
         )
         assert "FUNDAMENTAÇÃO DO RELATOR" in rt
 
@@ -396,9 +396,10 @@ class TestT10RetrievalText:
         rt = IngestionPipeline._build_acordao_retrieval_text(
             para, "2450", "2025", "Plenario", "Jorge Oliveira",
             "Representação", "Parcialmente procedente",
-            "TC 018.677/2025-8", "AudContratações", device_map,
+            "TC 018.677/2025-8", device_map,
         )
-        assert "ANÁLISE DA UNIDADE TÉCNICA" in rt
+        assert "Acórdão 2450/2025" in rt
+        assert "Plenario" in rt
 
 
 # =============================================================================
