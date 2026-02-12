@@ -374,7 +374,15 @@ def classify_document(pages):
                 parent_span_id = current_article["span_id"]
                 parent_chain = {"article_num": current_article["num"], "article_suffix": current_article.get("suffix", ""), "paragraph_num": par_num}
             else:
-                parent_chain = {"article_num": 0, "article_suffix": "", "paragraph_num": par_num}
+                # Parágrafo sem artigo pai (ex: seções narrativas de acórdãos)
+                # Reclassifica como nao_classificado para evitar órfão
+                unclassified.append({
+                    "block_index": block["block_index"],
+                    "page_number": block["page_number"],
+                    "reason": f"Parágrafo '{ident}' sem artigo pai (seção narrativa)",
+                    "text_preview": block["text"][:80],
+                })
+                continue
             current_paragraph = {"span_id": None, "num": par_num}
             current_inciso = None
             hierarchy_depth = 1
@@ -395,7 +403,14 @@ def classify_document(pages):
                 parent_chain = {"article_num": current_article["num"], "article_suffix": current_article.get("suffix", ""), "inciso_num": inc_num}
                 hierarchy_depth = 1
             else:
-                parent_chain = {"article_num": 0, "article_suffix": "", "inciso_num": inc_num}
+                # Inciso sem artigo/parágrafo pai (ex: romanos em seções narrativas)
+                unclassified.append({
+                    "block_index": block["block_index"],
+                    "page_number": block["page_number"],
+                    "reason": f"Inciso '{ident}' sem artigo pai (seção narrativa)",
+                    "text_preview": block["text"][:80],
+                })
+                continue
             current_inciso = {"span_id": None, "num": inc_num}
         elif dtype == "alinea":
             if current_inciso:
@@ -407,9 +422,33 @@ def classify_document(pages):
                     "inciso_num": current_inciso["num"],
                 }
                 hierarchy_depth = 3 if current_paragraph else 2
-            else:
-                parent_chain = {"article_num": current_article["num"] if current_article else 0, "article_suffix": current_article.get("suffix", "") if current_article else ""}
+            elif current_paragraph:
+                # Fallback: alínea diretamente sob parágrafo (sem inciso)
+                parent_span_id = current_paragraph["span_id"]
+                parent_chain = {
+                    "article_num": current_article["num"] if current_article else 0,
+                    "article_suffix": current_article.get("suffix", "") if current_article else "",
+                    "paragraph_num": current_paragraph["num"],
+                }
+                hierarchy_depth = 2
+            elif current_article:
+                # Fallback: alínea diretamente sob artigo
+                parent_span_id = current_article["span_id"]
+                parent_chain = {
+                    "article_num": current_article["num"],
+                    "article_suffix": current_article.get("suffix", ""),
+                }
                 hierarchy_depth = 1
+            else:
+                # Sem contexto legal (ex: itens a), b), c) em RELATÓRIO de acórdão)
+                # Reclassifica como nao_classificado
+                unclassified.append({
+                    "block_index": block["block_index"],
+                    "page_number": block["page_number"],
+                    "reason": f"Alínea '{ident}' sem contexto de artigo/inciso (seção narrativa)",
+                    "text_preview": block["text"][:80],
+                })
+                continue
 
         span_id = _build_span_id(dtype, ident, parent_chain)
 
