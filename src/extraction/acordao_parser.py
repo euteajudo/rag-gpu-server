@@ -65,6 +65,18 @@ RE_NUMBERED_PARA = re.compile(r'^(\d{1,3})\.\s+', re.MULTILINE)
 RE_ITEM = re.compile(r'^(\d+\.\d+(?:\.\d+)*)\.\s+', re.MULTILINE)
 
 
+def _strip_with_offsets(text: str, base_offset: int):
+    """Strip text and return (stripped_text, adjusted_start, adjusted_end).
+
+    Garante que canonical_text[start:end] == stripped_text.
+    """
+    lead = len(text) - len(text.lstrip())
+    stripped = text.strip()
+    start = base_offset + lead
+    end = start + len(stripped)
+    return stripped, start, end
+
+
 def _slugify(text: str) -> str:
     """Converte heading para slug de span_id: 'EXAME TÉCNICO' → 'EXAME-TECNICO'."""
     import unicodedata
@@ -130,7 +142,11 @@ class AcordaoParser:
 
             devices.extend(sec_devices)
 
-        # 3. Hierarquia
+        # 3. Deduplica span_ids (citações de acórdãos anteriores no VOTO
+        #    geram parágrafos com números repetidos: PAR-VOTO-13, PAR-VOTO-13-2)
+        devices = self._deduplicate_span_ids(devices)
+
+        # 4. Hierarquia
         devices = self._build_hierarchy(devices)
 
         logger.info(
@@ -211,20 +227,21 @@ class AcordaoParser:
         devices: List[AcordaoDevice] = []
 
         # Seção primária RELATÓRIO
+        sec_stripped, sec_cs, sec_ce = _strip_with_offsets(text, base_offset)
         sec_device = AcordaoDevice(
             device_type="section",
             span_id="SEC-RELATORIO",
             parent_span_id="",
-            text=text.strip(),
-            text_preview=text.strip()[:120],
+            text=sec_stripped,
+            text_preview=sec_stripped[:120],
             identifier="RELATÓRIO",
             section_type="relatorio",
             authority_level="opinativo",
             section_path="RELATÓRIO",
             hierarchy_depth=0,
-            char_start=base_offset,
-            char_end=base_offset + len(text),
-            page_number=self._page_for_offset(base_offset, page_boundaries),
+            char_start=sec_cs,
+            char_end=sec_ce,
+            page_number=self._page_for_offset(sec_cs, page_boundaries),
         )
         devices.append(sec_device)
 
@@ -232,22 +249,31 @@ class AcordaoParser:
         subsections = self._detect_subsections(text)
 
         if subsections:
+            used_sub_ids = set()
             for sub in subsections:
                 sub_start = sub["start"]
                 sub_end = sub["end"]
-                sub_text = text[sub_start:sub_end].strip()
+                raw_sub = text[sub_start:sub_end]
+                sub_text, abs_start, abs_end = _strip_with_offsets(
+                    raw_sub, base_offset + sub_start,
+                )
                 heading_name = sub["heading"]
                 slug = _slugify(heading_name)
 
                 # Span ID baseado no tipo de heading
                 if sub.get("numbering"):
                     # Numeração romana preservada: I.3.1
-                    span_id = f"SEC-RELATORIO-{sub['numbering']}"
+                    base_span_id = f"SEC-RELATORIO-{sub['numbering']}"
                 else:
-                    span_id = f"SEC-RELATORIO-{slug}"
+                    base_span_id = f"SEC-RELATORIO-{slug}"
 
-                abs_start = base_offset + sub_start
-                abs_end = base_offset + sub_end
+                # Deduplica span_id (ex: DESPACHO DO RELATOR aparece múltiplas vezes)
+                span_id = base_span_id
+                counter = 2
+                while span_id in used_sub_ids:
+                    span_id = f"{base_span_id}-{counter}"
+                    counter += 1
+                used_sub_ids.add(span_id)
 
                 sub_device = AcordaoDevice(
                     device_type="section",
@@ -297,20 +323,21 @@ class AcordaoParser:
         devices: List[AcordaoDevice] = []
 
         # Seção primária VOTO
+        sec_stripped, sec_cs, sec_ce = _strip_with_offsets(text, base_offset)
         sec_device = AcordaoDevice(
             device_type="section",
             span_id="SEC-VOTO",
             parent_span_id="",
-            text=text.strip(),
-            text_preview=text.strip()[:120],
+            text=sec_stripped,
+            text_preview=sec_stripped[:120],
             identifier="VOTO",
             section_type="voto",
             authority_level="fundamentacao",
             section_path="VOTO",
             hierarchy_depth=0,
-            char_start=base_offset,
-            char_end=base_offset + len(text),
-            page_number=self._page_for_offset(base_offset, page_boundaries),
+            char_start=sec_cs,
+            char_end=sec_ce,
+            page_number=self._page_for_offset(sec_cs, page_boundaries),
         )
         devices.append(sec_device)
 
@@ -335,20 +362,21 @@ class AcordaoParser:
         devices: List[AcordaoDevice] = []
 
         # Seção primária ACÓRDÃO
+        sec_stripped, sec_cs, sec_ce = _strip_with_offsets(text, base_offset)
         sec_device = AcordaoDevice(
             device_type="section",
             span_id="SEC-ACORDAO",
             parent_span_id="",
-            text=text.strip(),
-            text_preview=text.strip()[:120],
+            text=sec_stripped,
+            text_preview=sec_stripped[:120],
             identifier="ACÓRDÃO",
             section_type="acordao",
             authority_level="vinculante",
             section_path="ACÓRDÃO",
             hierarchy_depth=0,
-            char_start=base_offset,
-            char_end=base_offset + len(text),
-            page_number=self._page_for_offset(base_offset, page_boundaries),
+            char_start=sec_cs,
+            char_end=sec_ce,
+            page_number=self._page_for_offset(sec_cs, page_boundaries),
         )
         devices.append(sec_device)
 
@@ -365,9 +393,10 @@ class AcordaoParser:
             else:
                 item_end = len(text)
 
-            item_text = text[item_start:item_end].strip()
-            abs_start = base_offset + item_start
-            abs_end = base_offset + item_end
+            raw_item = text[item_start:item_end]
+            item_text, abs_start, abs_end = _strip_with_offsets(
+                raw_item, base_offset + item_start,
+            )
 
             # Hierarquia: 9.4.1 → pai é 9.4
             parts = item_number.split(".")
@@ -529,12 +558,12 @@ class AcordaoParser:
             else:
                 para_end = len(text)
 
-            para_text = text[para_start:para_end].strip()
+            raw_para = text[para_start:para_end]
+            para_text, abs_start, abs_end = _strip_with_offsets(
+                raw_para, base_offset + para_start,
+            )
             if not para_text:
                 continue
-
-            abs_start = base_offset + para_start
-            abs_end = base_offset + para_end
 
             device = AcordaoDevice(
                 device_type="paragraph",
@@ -564,6 +593,28 @@ class AcordaoParser:
                 return i + 1
         # Se offset está além da última boundary, retorna última página
         return len(page_boundaries)
+
+    def _deduplicate_span_ids(self, devices: List[AcordaoDevice]) -> List[AcordaoDevice]:
+        """
+        Garante unicidade de span_ids, adicionando sufixo -2, -3 para duplicatas.
+
+        Necessário porque o VOTO frequentemente cita acórdãos anteriores verbatim,
+        e os parágrafos citados têm a mesma numeração dos originais.
+        """
+        seen: Dict[str, int] = {}
+        dupes_found = 0
+        for device in devices:
+            sid = device.span_id
+            if sid in seen:
+                seen[sid] += 1
+                new_sid = f"{sid}-{seen[sid]}"
+                device.span_id = new_sid
+                dupes_found += 1
+            else:
+                seen[sid] = 1
+        if dupes_found:
+            logger.info(f"AcordaoParser: {dupes_found} span_ids deduplicados")
+        return devices
 
     def _build_hierarchy(self, devices: List[AcordaoDevice]) -> List[AcordaoDevice]:
         """Atribui parent_span_id e children_span_ids."""
