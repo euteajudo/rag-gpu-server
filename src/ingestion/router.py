@@ -92,7 +92,10 @@ def _set_task_result(task_id: str, result: PipelineResult):
                 "phases": result.phases,
                 "errors": [{"phase": e.phase, "message": e.message, "details": e.details} for e in result.errors],
                 "total_time_seconds": result.total_time_seconds,
-                "chunks": [c.model_dump() for c in result.chunks],
+                "chunks": [
+                    c.model_dump(exclude={"citations"})
+                    for c in result.chunks
+                ],
                 "document_hash": result.document_hash,
                 "manifest": result.manifest,
             }
