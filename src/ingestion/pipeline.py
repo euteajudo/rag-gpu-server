@@ -1525,9 +1525,28 @@ class IngestionPipeline:
         except Exception as e:
             logger.warning(f"Failed to emit acordao inspector snapshot: {e}")
 
-        # 8. Converte AcordaoDevice -> ProcessedChunk
+        # 8. Section chunking: AcordaoDevice → ParsedSection → AcordaoChunk → ProcessedChunk
+        from ..extraction.acordao_chunker import AcordaoChunker, build_sections
+
+        sections = build_sections(acordao_devices, canonical_text, header_metadata)
+        chunker = AcordaoChunker()
+        acordao_chunks = chunker.chunk(
+            sections=sections,
+            document_id=request.document_id,
+            canonical_hash=canonical_hash,
+            metadata={
+                "numero": header_metadata.get("numero", request.numero),
+                "ano": header_metadata.get("ano", str(request.ano)),
+                "colegiado": header_metadata.get("colegiado", ""),
+                "processo": header_metadata.get("processo", ""),
+                "relator": header_metadata.get("relator", ""),
+                "data_sessao": header_metadata.get("data_sessao", ""),
+                "natureza": header_metadata.get("natureza", ""),
+                "resultado": header_metadata.get("resultado", ""),
+            },
+        )
         chunks = self._acordao_to_processed_chunks(
-            acordao_devices, canonical_text, canonical_hash,
+            acordao_chunks, canonical_text, canonical_hash,
             request, header_metadata,
         )
 
@@ -1597,158 +1616,67 @@ class IngestionPipeline:
 
     def _acordao_to_processed_chunks(
         self,
-        devices,
+        acordao_chunks,
         canonical_text: str,
         canonical_hash: str,
         request: IngestRequest,
         header_metadata: dict,
     ) -> List[ProcessedChunk]:
         """
-        Converte List[AcordaoDevice] -> List[ProcessedChunk].
+        Converte List[AcordaoChunk] -> List[ProcessedChunk].
 
         Prefixo "acordaos:" em node_id.
         """
         chunks = []
-        device_by_span = {d.span_id: d for d in devices}
 
-        numero = header_metadata.get("numero", request.numero)
-        ano = header_metadata.get("ano", str(request.ano))
         colegiado = header_metadata.get("colegiado", getattr(request, "colegiado", "") or "")
         processo = header_metadata.get("processo", getattr(request, "processo", "") or "")
         relator = header_metadata.get("relator", getattr(request, "relator", "") or "")
-        natureza = header_metadata.get("natureza", "")
-        resultado = header_metadata.get("resultado", "")
         data_sessao = header_metadata.get("data_sessao", getattr(request, "data_sessao", "") or "")
 
-        for device in devices:
-            chunk_id = f"{request.document_id}#{device.span_id}"
+        for ac in acordao_chunks:
+            chunk_id = f"{request.document_id}#{ac.span_id}"
             node_id = f"acordaos:{chunk_id}"
-
-            parent_node_id = ""
-            if device.parent_span_id:
-                parent_node_id = f"acordaos:{request.document_id}#{device.parent_span_id}"
-
-            # chunk_level
-            chunk_level = "section" if device.device_type == "section" else "device"
-
-            # Retrieval text
-            retrieval_text = self._build_acordao_retrieval_text(
-                device, numero, ano, colegiado, relator,
-                natureza, resultado, processo,
-                device_by_span,
-            )
-
-            # Citações
-            citations = extract_citations_from_chunk(
-                text=device.text or "",
-                document_id=request.document_id,
-                chunk_node_id=node_id,
-                parent_chunk_id=parent_node_id or None,
-                document_type=request.tipo_documento,
-            )
 
             pc = ProcessedChunk(
                 node_id=node_id,
                 chunk_id=chunk_id,
-                parent_node_id=parent_node_id,
-                span_id=device.span_id,
-                device_type=device.device_type,
-                chunk_level=chunk_level,
-                text=device.text or "",
+                parent_node_id="",
+                span_id=ac.span_id,
+                device_type="section",
+                chunk_level="section",
+                text=ac.text or "",
                 parent_text="",
-                retrieval_text=retrieval_text,
+                retrieval_text=ac.retrieval_text,
                 document_id=request.document_id,
                 tipo_documento=request.tipo_documento,
                 numero=request.numero,
                 ano=request.ano,
                 article_number="",
-                citations=citations,
-                # PR13: offsets nativos
-                canonical_start=device.char_start,
-                canonical_end=device.char_end,
+                citations=[],
+                canonical_start=ac.canonical_start,
+                canonical_end=ac.canonical_end,
                 canonical_hash=canonical_hash,
-                # Coordenadas
-                page_number=device.page_number,
-                bbox=device.bbox,
+                page_number=ac.page_number,
+                bbox=[],
                 bbox_img=[],
                 img_width=0,
                 img_height=0,
                 confidence=1.0,
-                # Cross-page
                 is_cross_page=False,
                 bbox_spans=[],
-                # Campos Acórdão
                 colegiado=colegiado,
                 processo=processo,
                 relator=relator,
                 data_sessao=data_sessao,
-                # Hierarquia/tipo
-                section_type=device.section_type,
-                authority_level=device.authority_level,
-                section_path=device.section_path,
+                section_type=ac.section_type,
+                authority_level=ac.authority_level,
+                section_path=ac.section_path,
             )
             chunks.append(pc)
 
         logger.info(f"Acórdão -> ProcessedChunk: {len(chunks)} chunks gerados")
         return chunks
-
-    @staticmethod
-    def _build_acordao_retrieval_text(
-        device,
-        numero: str,
-        ano: str,
-        colegiado: str,
-        relator: str,
-        natureza: str,
-        resultado: str,
-        processo: str,
-        device_by_span: dict,
-    ) -> str:
-        """Constrói retrieval_text enriquecido para acórdãos por authority_level."""
-        text = device.text or ""
-
-        if device.authority_level == "vinculante" and device.device_type == "item_dispositivo":
-            return (
-                f"DECISÃO VINCULANTE – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
-                f"Relator: Min. {relator}. Natureza: {natureza}.\n"
-                f"Resultado: {resultado}.\n"
-                f"Processo: {processo}.\n"
-                f"Dispositivo {device.identifier}:\n"
-                f"{text}"
-            )
-
-        if device.authority_level == "fundamentacao" and device.device_type == "paragraph":
-            return (
-                f"FUNDAMENTAÇÃO DO RELATOR – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
-                f"Relator: Min. {relator}. Natureza: {natureza}.\n"
-                f"Seção: Voto, § {device.identifier}.\n"
-                f"{text}"
-            )
-
-        if device.authority_level == "opinativo" and device.device_type == "paragraph":
-            return (
-                f"Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
-                f"Relator: Min. {relator}. Natureza: {natureza}.\n"
-                f"Seção: {device.section_path}.\n"
-                f"{text}"
-            )
-
-        if device.device_type == "section":
-            # Section container — include first 500 chars
-            tipo_upper = {
-                "relatorio": "RELATÓRIO",
-                "voto": "VOTO",
-                "acordao": "ACÓRDÃO",
-            }.get(device.section_type, device.section_type.upper())
-            preview = text[:500] + "..." if len(text) > 500 else text
-            return (
-                f"{tipo_upper} – Acórdão {numero}/{ano} – TCU – {colegiado}.\n"
-                f"Seção: {device.section_path}.\n"
-                f"{preview}"
-            )
-
-        # Fallback
-        return text
 
     def _emit_acordao_inspection_snapshot(
         self,

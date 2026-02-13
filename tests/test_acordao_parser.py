@@ -276,12 +276,9 @@ class TestT8Offsets:
             )
 
     def test_offset_text_matches(self, devices, canonical_text):
-        """T_extra: canonical_text[char_start:char_end] == device.text for non-section devices."""
+        """T_extra: canonical_text[char_start:char_end] == device.text for ALL devices."""
         for d in devices:
-            if d.device_type == "section":
-                # Section text is the full section text stripped — may have whitespace differences
-                continue
-            sliced = canonical_text[d.char_start:d.char_end].strip()
+            sliced = canonical_text[d.char_start:d.char_end]
             assert sliced == d.text, (
                 f"{d.span_id}: offset text mismatch.\n"
                 f"Expected: {d.text[:80]!r}\n"
@@ -350,56 +347,154 @@ class TestSubsections:
 
 
 # =============================================================================
-# T10: Retrieval text enrichment (via _build_acordao_retrieval_text)
+# T10: Retrieval text enrichment (via AcordaoChunker)
 # =============================================================================
 
 class TestT10RetrievalText:
-    def test_vinculante_retrieval_text(self, devices):
-        from src.ingestion.pipeline import IngestionPipeline
-        device_map = {d.span_id: d for d in devices}
+    def test_vinculante_retrieval_text(self, devices, canonical_text, header_metadata):
+        from src.extraction.acordao_chunker import AcordaoChunker, build_sections
 
-        item = device_map.get("ITEM-9.4.1")
-        assert item is not None
-
-        rt = IngestionPipeline._build_acordao_retrieval_text(
-            item, "2450", "2025", "Plenario", "Jorge Oliveira",
-            "Representação", "Parcialmente procedente",
-            "TC 018.677/2025-8", device_map,
-        )
-        assert "DECISÃO VINCULANTE" in rt
-        assert "2450/2025" in rt
+        sections = build_sections(devices, canonical_text, header_metadata)
+        chunker = AcordaoChunker()
+        meta = {
+            "numero": "2450", "ano": "2025", "colegiado": "Plenario",
+            "relator": "Jorge Oliveira", "processo": "TC 018.677/2025-8",
+            "data_sessao": "22/10/2025", "natureza": "Representação",
+            "resultado": "Parcialmente procedente",
+        }
+        chunks = chunker.chunk(sections, "doc-1", "hash-1", meta)
+        ac_chunks = [c for c in chunks if c.section_type == "acordao"]
+        assert len(ac_chunks) > 0
+        rt = ac_chunks[0].retrieval_text
+        assert "vinculante" in rt.lower()
+        assert "2450" in rt
         assert "Plenario" in rt
 
-    def test_fundamentacao_retrieval_text(self, devices):
-        from src.ingestion.pipeline import IngestionPipeline
-        device_map = {d.span_id: d for d in devices}
+    def test_fundamentacao_retrieval_text(self, devices, canonical_text, header_metadata):
+        from src.extraction.acordao_chunker import AcordaoChunker, build_sections
 
-        voto_paras = [d for d in devices if d.section_type == "voto" and d.device_type == "paragraph"]
-        assert len(voto_paras) > 0
-        para = voto_paras[0]
+        sections = build_sections(devices, canonical_text, header_metadata)
+        chunker = AcordaoChunker()
+        meta = {
+            "numero": "2450", "ano": "2025", "colegiado": "Plenario",
+            "relator": "Jorge Oliveira", "processo": "TC 018.677/2025-8",
+            "data_sessao": "22/10/2025", "natureza": "Representação",
+            "resultado": "Parcialmente procedente",
+        }
+        chunks = chunker.chunk(sections, "doc-1", "hash-1", meta)
+        voto_chunks = [c for c in chunks if c.section_type == "voto"]
+        assert len(voto_chunks) > 0
+        rt = voto_chunks[0].retrieval_text
+        assert "Voto" in rt
+        assert "Jorge Oliveira" in rt
 
-        rt = IngestionPipeline._build_acordao_retrieval_text(
-            para, "2450", "2025", "Plenario", "Jorge Oliveira",
-            "Representação", "Parcialmente procedente",
-            "TC 018.677/2025-8", device_map,
-        )
-        assert "FUNDAMENTAÇÃO DO RELATOR" in rt
+    def test_opinativo_retrieval_text(self, devices, canonical_text, header_metadata):
+        from src.extraction.acordao_chunker import AcordaoChunker, build_sections
 
-    def test_opinativo_retrieval_text(self, devices):
-        from src.ingestion.pipeline import IngestionPipeline
-        device_map = {d.span_id: d for d in devices}
-
-        rel_paras = [d for d in devices if d.section_type == "relatorio" and d.device_type == "paragraph"]
-        assert len(rel_paras) > 0
-        para = rel_paras[0]
-
-        rt = IngestionPipeline._build_acordao_retrieval_text(
-            para, "2450", "2025", "Plenario", "Jorge Oliveira",
-            "Representação", "Parcialmente procedente",
-            "TC 018.677/2025-8", device_map,
-        )
+        sections = build_sections(devices, canonical_text, header_metadata)
+        chunker = AcordaoChunker()
+        meta = {
+            "numero": "2450", "ano": "2025", "colegiado": "Plenario",
+            "relator": "Jorge Oliveira", "processo": "TC 018.677/2025-8",
+            "data_sessao": "22/10/2025", "natureza": "Representação",
+            "resultado": "Parcialmente procedente",
+        }
+        chunks = chunker.chunk(sections, "doc-1", "hash-1", meta)
+        rel_chunks = [c for c in chunks if c.section_type == "relatorio"]
+        assert len(rel_chunks) > 0
+        rt = rel_chunks[0].retrieval_text
         assert "Acórdão 2450/2025" in rt
         assert "Plenario" in rt
+
+
+# =============================================================================
+# T_extra: Deduplicação de span_ids
+# =============================================================================
+
+ACORDAO_WITH_CITATIONS = """\
+RELATÓRIO
+
+1. Primeiro parágrafo do relatório.
+
+DESPACHO DO RELATOR
+
+2. Segundo parágrafo.
+
+DESPACHO DO RELATOR
+
+3. Terceiro parágrafo.
+
+VOTO
+
+4. Parágrafo original do voto.
+5. Outro parágrafo do voto.
+6. Citação de acórdão anterior que contém:
+4. Parágrafo citado com mesmo número.
+5. Outro parágrafo citado com mesmo número.
+
+ACÓRDÃO Nº 9999/2025
+
+Os Ministros ACORDAM em:
+
+9.1. conhecer da representação;
+9.2. arquivar o processo.
+"""
+
+
+class TestSpanIdDedup:
+    @pytest.fixture
+    def dedup_parser(self):
+        return AcordaoParser()
+
+    @pytest.fixture
+    def dedup_devices(self, dedup_parser):
+        text = ACORDAO_WITH_CITATIONS
+        total = len(text)
+        return dedup_parser.parse(text, [(0, total)])
+
+    def test_all_span_ids_unique(self, dedup_devices):
+        span_ids = [d.span_id for d in dedup_devices]
+        assert len(span_ids) == len(set(span_ids)), (
+            f"Duplicate span_ids found: "
+            f"{[s for s in span_ids if span_ids.count(s) > 1]}"
+        )
+
+    def test_subsection_dedup(self, dedup_devices):
+        sub_ids = [
+            d.span_id for d in dedup_devices
+            if d.device_type == "section" and "DESPACHO" in d.span_id
+        ]
+        assert len(sub_ids) == 2
+        assert sub_ids[0] != sub_ids[1]
+        assert sub_ids[0] == "SEC-RELATORIO-DESPACHO-DO-RELATOR"
+        assert sub_ids[1] == "SEC-RELATORIO-DESPACHO-DO-RELATOR-2"
+
+    def test_paragraph_dedup(self, dedup_devices):
+        par4_ids = [
+            d.span_id for d in dedup_devices
+            if d.device_type == "paragraph" and d.identifier == "4"
+        ]
+        # Should have PAR-VOTO-4 and PAR-VOTO-4-2
+        assert len(par4_ids) == 2
+        assert par4_ids[0] != par4_ids[1]
+
+    def test_deduped_parents_valid(self, dedup_devices):
+        """Paragraphs in renamed subsections should reference the renamed parent."""
+        span_ids = {d.span_id for d in dedup_devices}
+        for d in dedup_devices:
+            if d.parent_span_id:
+                assert d.parent_span_id in span_ids, (
+                    f"{d.span_id} has parent {d.parent_span_id} which doesn't exist"
+                )
+
+    def test_deduped_hierarchy_consistent(self, dedup_devices):
+        """All children_span_ids must point to existing devices."""
+        span_ids = {d.span_id for d in dedup_devices}
+        for d in dedup_devices:
+            for child_id in d.children_span_ids:
+                assert child_id in span_ids, (
+                    f"{d.span_id} references child {child_id} which doesn't exist"
+                )
 
 
 # =============================================================================
