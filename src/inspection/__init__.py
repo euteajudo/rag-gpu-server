@@ -3,6 +3,7 @@ Módulo de inspeção — Pipeline Inspector v4 (Regex).
 
 Observer-mode: emite snapshots para Redis durante ingestão regex.
 Frontend SPA read-only em /inspect/inspector.
+VPS Forwarder: envia artefatos para persistência de longo prazo (PostgreSQL).
 """
 
 from .models import (
@@ -12,6 +13,7 @@ from .models import (
     RegexClassificationArtifact,
 )
 from .storage import InspectionStorage
+from .vps_forwarder import VpsInspectionForwarder
 
 __all__ = [
     "InspectionStage",
@@ -19,4 +21,5 @@ __all__ = [
     "InspectionMetadata",
     "RegexClassificationArtifact",
     "InspectionStorage",
+    "VpsInspectionForwarder",
 ]

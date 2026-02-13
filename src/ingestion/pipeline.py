@@ -916,6 +916,21 @@ class IngestionPipeline:
             f"({len(regex_devices)} devices, checks={'PASS' if all_pass else 'FAIL'})"
         )
 
+        # --- Forward to VPS (fire-and-forget) ---
+        try:
+            from ..inspection.vps_forwarder import VpsInspectionForwarder
+            forwarder = VpsInspectionForwarder()
+            forwarder.forward_full_snapshot(
+                task_id=task_id,
+                metadata=metadata,
+                stages={
+                    InspectionStage.REGEX_CLASSIFICATION.value: artifact.model_dump_json(),
+                    InspectionStage.PYMUPDF.value: pymupdf_artifact.model_dump_json(),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to forward inspection to VPS: {e}")
+
     def _convert_pages_to_classifier_format(self, pages_data) -> list:
         """
         Converte PageData/BlockData (do PyMuPDFExtractor) para o formato dict
@@ -1861,6 +1876,21 @@ class IngestionPipeline:
             f"Acordao inspector snapshot emitted: {task_id} "
             f"({len(regex_devices)} devices, checks={'PASS' if all_pass else 'FAIL'})"
         )
+
+        # --- Forward to VPS (fire-and-forget) ---
+        try:
+            from ..inspection.vps_forwarder import VpsInspectionForwarder
+            forwarder = VpsInspectionForwarder()
+            forwarder.forward_full_snapshot(
+                task_id=task_id,
+                metadata=metadata,
+                stages={
+                    InspectionStage.REGEX_CLASSIFICATION.value: artifact.model_dump_json(),
+                    InspectionStage.PYMUPDF.value: pymupdf_artifact.model_dump_json(),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to forward acordao inspection to VPS: {e}")
 
     def _phase_milvus_sink(self, materialized, request: IngestRequest, result: PipelineResult):
         """Fase 5.5: Inserir chunks no Milvus remoto (se MILVUS_HOST configurado)."""
