@@ -36,8 +36,8 @@ logger = logging.getLogger(__name__)
 class RemoteLLMConfig:
     """Configuração do cliente LLM remoto."""
 
-    vllm_base_url: str = "http://localhost:8080/v1"
-    model: str = "Qwen/Qwen3-8B-AWQ"
+    vllm_base_url: str = "http://localhost:8002/v1"
+    model: str = "Qwen/Qwen3-VL-8B-Instruct"
     timeout: float = 300.0  # LLM pode demorar
     max_retries: int = 2
     retry_delay: float = 2.0
@@ -51,8 +51,8 @@ class RemoteLLMConfig:
     def from_env(cls) -> "RemoteLLMConfig":
         """Carrega configuração de variáveis de ambiente."""
         return cls(
-            vllm_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8080/v1"),
-            model=os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ"),
+            vllm_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8002/v1"),
+            model=os.getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct"),
             timeout=float(os.getenv("VLLM_TIMEOUT", "300")),
             max_retries=int(os.getenv("VLLM_MAX_RETRIES", "2")),
             retry_delay=float(os.getenv("VLLM_RETRY_DELAY", "2.0")),

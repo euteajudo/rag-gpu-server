@@ -55,7 +55,7 @@ class LLMConfig:
     timeout: float = 120.0  # segundos
 
     # Modelo
-    model: str = field(default_factory=lambda: os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ"))  # Modelo padrao (LOCAL: 8B para 12GB GPU)
+    model: str = field(default_factory=lambda: os.getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct"))  # Modelo padrao (LOCAL: 8B para 12GB GPU)
 
     # Geracao
     temperature: float = 0.0
@@ -73,9 +73,9 @@ class LLMConfig:
     def for_enrichment(cls, model: str = None) -> "LLMConfig":
         """Config otimizada para enriquecimento de chunks (no_think)."""
         if model is None:
-            model = __import__("os").getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+            model = __import__("os").getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
         if model is None:
-            model = os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+            model = os.getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
         return cls(
             model=model,
             temperature=0.0,
@@ -88,9 +88,9 @@ class LLMConfig:
     def for_extraction(cls, model: str = None) -> "LLMConfig":
         """Config para extracao estruturada - JSON complexo (no_think)."""
         if model is None:
-            model = __import__("os").getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+            model = __import__("os").getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
         if model is None:
-            model = os.getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+            model = os.getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
         return cls(
             model=model,
             temperature=0.0,
@@ -102,7 +102,7 @@ class LLMConfig:
     def for_generation(cls, model: str = None) -> "LLMConfig":
         """Config para geracao de resposta ao usuario (thinking habilitado com tokens extras)."""
         if model is None:
-            model = __import__("os").getenv("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+            model = __import__("os").getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
         return cls(
             model=model,
             temperature=0.3,
