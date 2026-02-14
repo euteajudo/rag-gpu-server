@@ -98,6 +98,7 @@ def _set_task_result(task_id: str, result: PipelineResult):
                 ],
                 "document_hash": result.document_hash,
                 "manifest": result.manifest,
+                "inspection_snapshot": result.inspection_snapshot,
             }
 
 

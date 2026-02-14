@@ -215,6 +215,8 @@ class PipelineResult:
     pipeline_version: str = ""
     # Manifesto de ingestão para reconciliação pela VPS
     manifest: dict = field(default_factory=dict)
+    # Snapshot de inspeção para a VPS salvar no PostgreSQL
+    inspection_snapshot: dict = field(default_factory=dict)
 
 
 class IngestionPipeline:
@@ -474,11 +476,11 @@ class IngestionPipeline:
 
             # 6. Emit inspection snapshot (Redis) — reutiliza formato regex
             try:
-                self._emit_regex_inspection_snapshot(
+                result.inspection_snapshot = self._emit_regex_inspection_snapshot(
                     classification_result, canonical_text, canonical_hash,
                     extract_duration, request, pages_data,
                     extraction_source="vlm_ocr",
-                )
+                ) or {}
             except Exception as e:
                 logger.warning(f"Failed to emit inspector snapshot: {e}")
 
@@ -711,10 +713,11 @@ class IngestionPipeline:
         request: IngestRequest,
         pages_data: list,
         extraction_source: str = "pymupdf_native",
-    ) -> None:
+    ) -> dict:
         """
         Emite snapshot da classificação regex para o Redis (Inspector).
         Falha silenciosa — não aborta o pipeline.
+        Retorna dict do snapshot para inclusão no task.result.
         """
         import unicodedata
         from ..inspection.storage import InspectionStorage
@@ -931,6 +934,24 @@ class IngestionPipeline:
         except Exception as e:
             logger.warning(f"Failed to forward inspection to VPS: {e}")
 
+        # Return snapshot dict for inclusion in task.result
+        from ..config import config as app_config
+        return {
+            "document_id": request.document_id,
+            "run_id": task_id,
+            "pipeline_version": getattr(app_config, 'pipeline_version', ''),
+            "canonical_hash": canonical_hash,
+            "total_pages": len(pages_data),
+            "total_devices": len(regex_devices),
+            "total_filtered": len(filtered),
+            "unclassified_count": len(unclassified),
+            "all_checks_pass": all_pass,
+            "stages": {
+                "pymupdf": pymupdf_artifact.model_dump(),
+                "regex_classification": artifact.model_dump(),
+            },
+        }
+
     def _convert_pages_to_classifier_format(self, pages_data) -> list:
         """
         Converte PageData/BlockData (do PyMuPDFExtractor) para o formato dict
@@ -1145,10 +1166,10 @@ class IngestionPipeline:
 
             # === EMIT INSPECTION SNAPSHOT (Redis) ===
             try:
-                self._emit_regex_inspection_snapshot(
+                result.inspection_snapshot = self._emit_regex_inspection_snapshot(
                     classification_result, canonical_text, canonical_hash,
                     extract_duration, request, pages_data,
-                )
+                ) or {}
             except Exception as e:
                 logger.warning(f"Failed to emit inspector snapshot: {e}")
 
