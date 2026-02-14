@@ -143,6 +143,7 @@ class IngestResponse(BaseModel):
     chunks: List[dict] = []
     document_hash: str = ""
     manifest: dict = {}
+    inspection_snapshot: Optional[dict] = None
 
 
 def _background_process(task_id: str, pdf_content: bytes, request: IngestRequest):
