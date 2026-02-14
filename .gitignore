@@ -51,6 +51,7 @@ models/
 .env
 .env.local
 .env.*.local
+restart.sh
 
 # OS
 .DS_Store
