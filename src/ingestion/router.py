@@ -93,7 +93,7 @@ def _set_task_result(task_id: str, result: PipelineResult):
                 "errors": [{"phase": e.phase, "message": e.message, "details": e.details} for e in result.errors],
                 "total_time_seconds": result.total_time_seconds,
                 "chunks": [
-                    c.model_dump(exclude={"citations"})
+                    c.model_dump(exclude={"dense_vector", "sparse_vector", "thesis_vector"})
                     for c in result.chunks
                 ],
                 "document_hash": result.document_hash,

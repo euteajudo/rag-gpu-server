@@ -1,5 +1,16 @@
 """
-Writer para Neo4j - edges (relações).
+DEPRECATED (15/02/2026) - Este módulo é código morto.
+
+O pipeline de sync Milvus → Neo4j agora usa:
+  extracao/src/graph/sync_service.py (Neo4jSyncService)
+
+Este arquivo criava nós :LegalNode e :Document com document_ids contendo
+pontos (ex: LEI-14.133-2021), formato incompatível com o sistema atual.
+Mantido apenas como referência para testes unitários legados.
+
+---
+
+(Original) Writer para Neo4j - edges (relações).
 
 PR3 v2 - Hard Reset RAG Architecture
 PR3 v2.1 - Patches de robustez (confidence tiers, document_version, extraction_method padronizado)

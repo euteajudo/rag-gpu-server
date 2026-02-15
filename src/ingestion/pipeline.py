@@ -1995,6 +1995,7 @@ class IngestionPipeline:
                     "sparse_vector": getattr(chunk, 'sparse_vector', {}),
                     "has_citations": has_citations,
                     "citations_count": citations_count,
+                    "citations": json.dumps(citations, ensure_ascii=False) if citations else "",
                     # VLM: Campos do pipeline Qwen3-VL + PyMuPDF
                     "page_number": getattr(chunk, 'page_number', -1),
                     "bbox": json.dumps(getattr(chunk, 'bbox', []), ensure_ascii=False),
