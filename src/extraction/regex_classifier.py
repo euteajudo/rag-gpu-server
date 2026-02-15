@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 class ClassifiedDevice:
     """Dispositivo legal classificado pelo regex, com offsets nativos do PyMuPDF."""
     device_type: str           # "article", "paragraph", "inciso", "alinea"
-    span_id: str               # "ART-005", "PAR-005-1", "INC-005-1", "ALI-005-1-a"
+    span_id: str               # "ART-005", "PAR-005-1", "INC-005-I", "ALI-005-I-a"
     parent_span_id: str        # "" para artigos, "ART-005" para filhos
     children_span_ids: list    # ["PAR-005-1", "PAR-005-2"]
     text: str                  # texto completo do bloco
@@ -261,7 +261,7 @@ def _extract_paragraph_number(identifier):
     return int(m.group(1)) if m else 0
 
 def _extract_article_number_from_span_id(span_id):
-    """Extrai o numero do artigo de qualquer span_id: ART-005 -> 5, INC-003-2 -> 3"""
+    """Extrai o numero do artigo de qualquer span_id: ART-005 -> 5, INC-003-II -> 3"""
     m = re.match(r"[A-Z]+-(\d+)", span_id or "")
     return int(m.group(1)) if m else 0
 
@@ -277,12 +277,11 @@ def _build_span_id(device_type, identifier, parent_chain):
     if device_type == "inciso":
         art_num = parent_chain.get("article_num", 0)
         par_num = parent_chain.get("paragraph_num", None)
-        roman = identifier or ""
-        inc_num = ROMAN_TO_INT.get(roman, 0)
+        roman = (identifier or "").upper()
         if par_num is not None:
-            return f"INC-{art_num:03d}{art_suffix}-{par_num}-{inc_num}"
+            return f"INC-{art_num:03d}{art_suffix}-{par_num}-{roman}"
         else:
-            return f"INC-{art_num:03d}{art_suffix}-{inc_num}"
+            return f"INC-{art_num:03d}{art_suffix}-{roman}"
     if device_type == "alinea":
         art_num = parent_chain.get("article_num", 0)
         par_num = parent_chain.get("paragraph_num", None)
@@ -387,20 +386,19 @@ def classify_document(pages):
             current_inciso = None
             hierarchy_depth = 1
         elif dtype == "inciso":
-            roman = ident or ""
-            inc_num = ROMAN_TO_INT.get(roman, 0)
+            roman = (ident or "").upper()
             if current_paragraph:
                 parent_span_id = current_paragraph["span_id"]
                 parent_chain = {
                     "article_num": current_article["num"] if current_article else 0,
                     "article_suffix": current_article.get("suffix", "") if current_article else "",
                     "paragraph_num": current_paragraph["num"],
-                    "inciso_num": inc_num,
+                    "inciso_num": roman,
                 }
                 hierarchy_depth = 2
             elif current_article:
                 parent_span_id = current_article["span_id"]
-                parent_chain = {"article_num": current_article["num"], "article_suffix": current_article.get("suffix", ""), "inciso_num": inc_num}
+                parent_chain = {"article_num": current_article["num"], "article_suffix": current_article.get("suffix", ""), "inciso_num": roman}
                 hierarchy_depth = 1
             else:
                 # Inciso sem artigo/parágrafo pai (ex: romanos em seções narrativas)
@@ -411,7 +409,7 @@ def classify_document(pages):
                     "text_preview": block["text"][:80],
                 })
                 continue
-            current_inciso = {"span_id": None, "num": inc_num}
+            current_inciso = {"span_id": None, "num": roman}
         elif dtype == "alinea":
             if current_inciso:
                 parent_span_id = current_inciso["span_id"]

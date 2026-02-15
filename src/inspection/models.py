@@ -36,7 +36,7 @@ class InspectionStatus(str, Enum):
 
 class RegexDevice(BaseModel):
     """Dispositivo classificado pelo regex."""
-    span_id: str = Field(..., description="ART-001, PAR-003-1, INC-009-3, ALI-009-3-a")
+    span_id: str = Field(..., description="ART-001, PAR-003-1, INC-009-III, ALI-009-III-a")
     device_type: str = Field(..., description="article, paragraph, inciso, alinea")
     identifier: str = Field(..., description="Art. 1º, § 1º, I, a")
     parent_span_id: str = Field("", description="Span ID do pai (vazio para artigos)")
