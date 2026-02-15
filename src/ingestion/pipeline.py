@@ -1918,6 +1918,7 @@ class IngestionPipeline:
         phase_start = time.perf_counter()
         try:
             from pymilvus import connections, Collection
+            import json
 
             milvus_host = os.getenv("MILVUS_HOST", "127.0.0.1")
             milvus_port = int(os.getenv("MILVUS_PORT", "19530"))
@@ -1961,13 +1962,18 @@ class IngestionPipeline:
                 has_citations = len(citations) > 0
                 citations_count = len(citations)
 
+                # Serializa citações para persistência no Milvus (Ledger Pattern)
+                citations_json = json.dumps(citations, ensure_ascii=False) if citations else ""
+
                 # Device type
                 device_type = getattr(chunk, 'device_type', 'article')
 
                 # Prepara aliases como JSON string
                 aliases = getattr(chunk, 'aliases', []) or []
-                import json
                 aliases_str = json.dumps(aliases, ensure_ascii=False)
+
+                # Bbox: schema usa 4 campos Float separados
+                bbox = getattr(chunk, 'bbox', []) or []
 
                 data = {
                     "node_id": node_id,
@@ -1995,11 +2001,20 @@ class IngestionPipeline:
                     "sparse_vector": getattr(chunk, 'sparse_vector', {}),
                     "has_citations": has_citations,
                     "citations_count": citations_count,
-                    "citations": json.dumps(citations, ensure_ascii=False) if citations else "",
+                    "citations": citations_json,
                     # VLM: Campos do pipeline Qwen3-VL + PyMuPDF
                     "page_number": getattr(chunk, 'page_number', -1),
-                    "bbox": json.dumps(getattr(chunk, 'bbox', []), ensure_ascii=False),
-                    "confidence": float(getattr(chunk, 'confidence', 0.0)),
+                    "bbox_x0": float(bbox[0]) if len(bbox) >= 4 else 0.0,
+                    "bbox_y0": float(bbox[1]) if len(bbox) >= 4 else 0.0,
+                    "bbox_x1": float(bbox[2]) if len(bbox) >= 4 else 0.0,
+                    "bbox_y1": float(bbox[3]) if len(bbox) >= 4 else 0.0,
+                    # Origin Classifier
+                    "origin_type": getattr(chunk, 'origin_type', 'self'),
+                    "origin_reference": getattr(chunk, 'origin_reference', ''),
+                    "origin_reference_name": getattr(chunk, 'origin_reference_name', ''),
+                    "is_external_material": getattr(chunk, 'is_external_material', False),
+                    "origin_confidence": getattr(chunk, 'origin_confidence', 'high'),
+                    "origin_reason": getattr(chunk, 'origin_reason', ''),
                 }
                 data_list.append(data)
 
