@@ -346,6 +346,37 @@ class CitationExtractor:
                         seen_doc_ids.add(ref_key)
                         references.append(ref)
 
+                        # Multi-ref antes da norma: "arts. 28, 29 e 33 da Lei..."
+                        if ref.span_ref and ref.doc_id:
+                            extra_arts = self._extract_multi_refs_before(
+                                text, match.start()
+                            )
+                            if extra_arts:
+                                prefix = (
+                                    ref.target_node_id.split(":")[0]
+                                    if ref.target_node_id and ":" in ref.target_node_id
+                                    else "leis"
+                                )
+                                for extra_num in extra_arts:
+                                    extra_span = self._build_span_ref(extra_num)
+                                    extra_target = f"{prefix}:{ref.doc_id}#{extra_span}"
+                                    extra_key = f"{ref.doc_id}#{extra_span}"
+                                    if extra_key in seen_doc_ids:
+                                        continue
+                                    seen_doc_ids.add(extra_key)
+                                    references.append(NormativeReference(
+                                        raw=ref.raw,
+                                        type=ref.type,
+                                        doc_id=ref.doc_id,
+                                        span_ref=extra_span,
+                                        target_node_id=extra_target,
+                                        method="regex",
+                                        confidence=ref.confidence,
+                                        is_ambiguous=ref.is_ambiguous,
+                                        rel_type=ref.rel_type,
+                                        rel_type_confidence=ref.rel_type_confidence,
+                                    ))
+
         # 2. Extrai referências internas (artigos/parágrafos/incisos)
         internal_refs = self._extract_internal_references(text, seen_raw)
         references.extend(internal_refs)
@@ -737,6 +768,7 @@ class CitationExtractor:
         # Ex: "art. 9º da Lei", "art. 75, inciso II, alínea 'a', da Lei"
         art_pattern = re.compile(
             r"(?:arts?\.?|artigos?)\s*(\d+)[ºo°]?"
+            r"(?:\s*(?:,\s*\d+[ºo°]?)*(?:\s+(?:e|a)\s+\d+[ºo°]?)?)?"
             r"(?:\s*,?\s*(?:§|par[aá]grafo)\s*(\d+|[úu]nico)[ºo°]?)?"
             r"(?:\s*,?\s*inciso\s+([IVXLCDM]+))?"
             r"(?:\s*,?\s*al[ií]nea\s+['\"]?([a-z])['\"]?)?"
@@ -754,6 +786,49 @@ class CitationExtractor:
         ali_num = match.group(4)
 
         return self._build_span_ref(art_num, par_num, inc_num, ali_num)
+
+    def _extract_multi_refs_before(
+        self,
+        text: str,
+        end_pos: int,
+    ) -> list[str]:
+        """Extrai artigos adicionais de multi-ref antes de menção a norma.
+
+        Ex: "arts. 28, 29 e 33 da Lei 101" → retorna ["29", "33"]
+        (o artigo primário "28" já é capturado por _extract_device_reference_before)
+        """
+        start = max(0, end_pos - 100)
+        search_text = text[start:end_pos]
+
+        pattern = re.compile(
+            r"(?:arts?\.?|artigos?)\s*(\d+)[ºo°]?"
+            r"((?:\s*,\s*\d+[ºo°]?)*(?:\s+(?:e|a)\s+\d+[ºo°]?)?)"
+            r"\s*(?:,\s*)?(?:d[aoe]s?|n[aoe]s?)\s*$",
+            re.IGNORECASE
+        )
+
+        match = pattern.search(search_text)
+        if not match or not match.group(2).strip():
+            return []
+
+        primary_num = match.group(1)
+        rest = match.group(2)
+        extra_nums = []
+
+        # Range: "a 70"
+        range_m = re.search(r'\s+a\s+(\d+)', rest)
+        if range_m:
+            end_num = int(range_m.group(1))
+            start_num = int(primary_num)
+            if 0 < end_num - start_num <= 20:
+                for n in range(start_num + 1, end_num + 1):
+                    extra_nums.append(str(n))
+        else:
+            # Vírgula e "e" separados
+            for m in re.finditer(r'(\d+)', rest):
+                extra_nums.append(m.group(1))
+
+        return extra_nums
 
     def _extract_device_reference(
         self,
