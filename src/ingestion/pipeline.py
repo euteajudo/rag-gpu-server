@@ -1198,6 +1198,16 @@ class IngestionPipeline:
 
             report_progress("pymupdf_regex_extraction", 0.70)
 
+            # 7.6. Dual Ingestion: gera chunks consolidados @FULL
+            from .consolidation import generate_consolidated_chunks
+            consolidated = generate_consolidated_chunks(chunks, request)
+            if consolidated:
+                logger.info(
+                    f"[{request.document_id}] Dual Ingestion: "
+                    f"{len(consolidated)} chunks @FULL gerados"
+                )
+                chunks.extend(consolidated)
+
             # 8. Embeddings (se não pular)
             if not request.skip_embeddings:
                 report_progress("embedding", 0.70)

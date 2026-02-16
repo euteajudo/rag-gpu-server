@@ -548,15 +548,15 @@ class CitationExtractor:
             )
 
             if is_external and "desta" not in after_match[:30]:
-                # Só skip se há número de norma após "da lei/decreto" (NORM_PATTERNS vai capturar)
-                has_norm_number = re.search(
-                    r'(?:lei|decreto|instru[çc][aã]o|portaria)\s+(?:complementar\s+)?(?:n[ºo°]?\s*)?\d',
-                    after_match[:80],
-                    re.IGNORECASE,
-                )
-                if has_norm_number:
+                # Verifica se os padrões de norma já capturaram este artigo.
+                # Se sim, pula (será tratado como externo). Se não, fallback interno.
+                norm_captured = self._is_captured_by_norm_patterns(text, match)
+                if norm_captured:
                     continue
-                # Sem número → NORM_PATTERNS não vai capturar → tratar como ref interna
+                # Fallback: assume documento atual com confiança reduzida
+                confidence_override = 0.6
+            else:
+                confidence_override = None
 
             # Monta span_ref
             span_ref = self._build_span_ref(art_num, par_num, inc_num, ali_num)
@@ -569,7 +569,10 @@ class CitationExtractor:
                 target_node_id = f"leis:{doc_id}#{span_ref}"
 
             # Referências internas têm alta confiança se temos document_id
-            confidence = 0.9 if self.current_document_id else 0.5
+            if confidence_override is not None:
+                confidence = confidence_override
+            else:
+                confidence = 0.9 if self.current_document_id else 0.5
             is_ambiguous = not self.current_document_id
 
             # PR5: Classifica tipo de relacionamento baseado no contexto
@@ -592,46 +595,94 @@ class CitationExtractor:
                 rel_type_confidence=rel_type_confidence,
             ))
 
-            # Multi-referências: captura "arts. 41 e 42", "arts. 62 a 70"
+            # Expande multi-referência ("arts. 41 e 42" → 42 também)
             if not par_num and not inc_num and not ali_num:
-                after_art = text[match.end():match.end() + 50]
-                multi_pat = re.compile(r'(?:,\s*|\s+e\s+)(\d+)', re.IGNORECASE)
-                range_pat = re.compile(r'\s+a\s+(\d+)', re.IGNORECASE)
-
-                extra_art_nums = []
-                for m in multi_pat.finditer(after_art):
-                    extra_art_nums.append(m.group(1))
-
-                range_m = range_pat.search(after_art)
-                if range_m:
-                    range_end = int(range_m.group(1))
-                    range_start = int(art_num)
-                    if 0 < range_end - range_start <= 20:
-                        for n in range(range_start + 1, range_end + 1):
-                            extra_art_nums.append(str(n))
-
-                for extra_num in extra_art_nums:
-                    extra_span = self._build_span_ref(extra_num)
+                extra_nums = self._expand_multi_article_refs(text, match)
+                for extra_num in extra_nums:
+                    extra_span = self._build_span_ref(extra_num, None, None, None)
                     extra_target = None
                     if self.current_document_id:
                         extra_target = f"leis:{self.current_document_id}#{extra_span}"
-                    # Dedup and self-loop check
-                    if extra_target and extra_target in {r.target_node_id for r in references}:
-                        continue
-                    references.append(NormativeReference(
-                        raw=raw.strip(),
-                        type=NormativeType.INTERNO.value,
-                        doc_id=doc_id,
-                        span_ref=extra_span,
-                        target_node_id=extra_target,
-                        method="regex",
-                        confidence=confidence,
-                        is_ambiguous=is_ambiguous,
-                        rel_type=rel_type,
-                        rel_type_confidence=rel_type_confidence,
-                    ))
+                    extra_raw = f"art. {extra_num}"
+                    if extra_raw.lower() not in seen_raw:
+                        seen_raw.add(extra_raw.lower())
+                        references.append(NormativeReference(
+                            raw=extra_raw,
+                            type=NormativeType.INTERNO.value,
+                            doc_id=doc_id,
+                            span_ref=extra_span,
+                            target_node_id=extra_target,
+                            method="regex",
+                            confidence=confidence,
+                            is_ambiguous=is_ambiguous,
+                            rel_type=rel_type,
+                            rel_type_confidence=rel_type_confidence,
+                        ))
 
         return references
+
+    def _is_captured_by_norm_patterns(self, text: str, art_match: re.Match) -> bool:
+        """
+        Verifica se algum NORM_PATTERN captura uma norma que inclui a posição deste artigo.
+
+        Ex: "art. 75 da Lei 14.133/2021" — se NORM_PATTERNS["LEI"] capturou "Lei 14.133/2021"
+        E o device_reference_before extraiu "art. 75", então foi capturada.
+
+        Retorna True se capturada (seguro ignorar como interna), False se não.
+        """
+        art_start = art_match.start()
+        art_end = art_match.end()
+
+        # Busca normas no texto completo que estejam próximas deste artigo
+        for _norm_type, patterns in self._compiled_norms.items():
+            for pattern in patterns:
+                for norm_match in pattern.finditer(text):
+                    # A norma deve estar logo após o artigo (dentro de ~60 chars)
+                    if norm_match.start() >= art_start and norm_match.start() <= art_end + 60:
+                        return True
+                    # Ou o artigo logo antes da norma
+                    if art_start >= norm_match.start() - 120 and art_end <= norm_match.start():
+                        return True
+        return False
+
+    def _expand_multi_article_refs(self, text: str, match: re.Match) -> list[str]:
+        """
+        Expande referências multi-artigo: "arts. 41 e 42" → ["42"]
+        "arts. 41, 42 e 75" → ["42", "75"]
+        "arts. 62 a 70" → ["63", "64", ..., "70"]
+
+        Retorna apenas os números ADICIONAIS (o primeiro já foi capturado pelo match).
+        """
+        primary_num = match.group(1)
+        after = text[match.end():match.end() + 60]
+        extra_nums = []
+        remaining = after
+
+        # Range: " a 70" (expande intervalo)
+        range_m = re.match(r'\s+a\s+(\d+)[ºo°]?', remaining)
+        if range_m:
+            start_num = int(primary_num)
+            end_num = int(range_m.group(1))
+            if 0 < end_num - start_num <= 20:
+                for n in range(start_num + 1, end_num + 1):
+                    extra_nums.append(str(n))
+            return extra_nums
+
+        while remaining:
+            # Captura: ", 42", ", 43"
+            m = re.match(r'\s*,\s*(\d+)[ºo°]?', remaining)
+            if m:
+                extra_nums.append(m.group(1))
+                remaining = remaining[m.end():]
+                continue
+            # Captura: " e 42" (último da lista)
+            m = re.match(r'\s+e\s+(\d+)[ºo°]?', remaining)
+            if m:
+                extra_nums.append(m.group(1))
+                break
+            break
+
+        return extra_nums
 
     def _build_doc_id(
         self,
