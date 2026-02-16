@@ -148,6 +148,11 @@ class ProcessedChunk(BaseModel):
         description="Segmentos geométricos por página [{page_number, bbox_pdf, bbox_img}, ...]"
     )
 
+    # Dual Ingestion (Parent Document Retrieval)
+    is_consolidated: bool = Field(False, description="True se chunk consolidado @FULL (caput + filhos)")
+    child_node_ids: list[str] = Field(default_factory=list, description="Node IDs dos filhos incluidos no consolidado")
+    child_offsets: list[dict] = Field(default_factory=list, description="Offsets dos filhos no texto consolidado [{node_id, start, end}]")
+
     class Config:
         json_schema_extra = {
             "example": {
