@@ -260,7 +260,7 @@ class CitationExtractor:
 
     # Padrões para dispositivos (artigo, parágrafo, inciso, alínea)
     DEVICE_PATTERNS = {
-        "artigo": r"(?:art\.?|artigo)\s*(\d+)[ºo°]?",
+        "artigo": r"(?:arts?\.?|artigos?)\s*(\d+)[ºo°]?",
         "paragrafo": r"(?:§|par[aá]grafo)\s*(\d+|[úu]nico)[ºo°]?",
         "inciso": r"inciso\s+([IVXLCDM]+)",
         "alinea": r"al[ií]nea\s+['\"]?([a-z])['\"]?",
@@ -490,7 +490,7 @@ class CitationExtractor:
 
         # Padrão para artigo com contexto opcional de documento
         art_pattern = re.compile(
-            r"(?:art\.?|artigo)\s*(\d+)[ºo°]?"
+            r"(?:arts?\.?|artigos?)\s*(\d+)[ºo°]?"
             r"(?:\s*,?\s*(?:§|par[aá]grafo)\s*(\d+|[úu]nico)[ºo°]?)?"
             r"(?:\s*,?\s*inciso\s+([IVXLCDM]+))?"
             r"(?:\s*,?\s*al[ií]nea\s+['\"]?([a-z])['\"]?)?",
@@ -517,8 +517,15 @@ class CitationExtractor:
             )
 
             if is_external and "desta" not in after_match[:30]:
-                # É referência externa, já será capturada pelos padrões de norma
-                continue
+                # Só skip se há número de norma após "da lei/decreto" (NORM_PATTERNS vai capturar)
+                has_norm_number = re.search(
+                    r'(?:lei|decreto|instru[çc][aã]o|portaria)\s+(?:complementar\s+)?(?:n[ºo°]?\s*)?\d',
+                    after_match[:80],
+                    re.IGNORECASE,
+                )
+                if has_norm_number:
+                    continue
+                # Sem número → NORM_PATTERNS não vai capturar → tratar como ref interna
 
             # Monta span_ref
             span_ref = self._build_span_ref(art_num, par_num, inc_num, ali_num)
@@ -553,6 +560,45 @@ class CitationExtractor:
                 rel_type=rel_type,
                 rel_type_confidence=rel_type_confidence,
             ))
+
+            # Multi-referências: captura "arts. 41 e 42", "arts. 62 a 70"
+            if not par_num and not inc_num and not ali_num:
+                after_art = text[match.end():match.end() + 50]
+                multi_pat = re.compile(r'(?:,\s*|\s+e\s+)(\d+)', re.IGNORECASE)
+                range_pat = re.compile(r'\s+a\s+(\d+)', re.IGNORECASE)
+
+                extra_art_nums = []
+                for m in multi_pat.finditer(after_art):
+                    extra_art_nums.append(m.group(1))
+
+                range_m = range_pat.search(after_art)
+                if range_m:
+                    range_end = int(range_m.group(1))
+                    range_start = int(art_num)
+                    if 0 < range_end - range_start <= 20:
+                        for n in range(range_start + 1, range_end + 1):
+                            extra_art_nums.append(str(n))
+
+                for extra_num in extra_art_nums:
+                    extra_span = self._build_span_ref(extra_num)
+                    extra_target = None
+                    if self.current_document_id:
+                        extra_target = f"leis:{self.current_document_id}#{extra_span}"
+                    # Dedup and self-loop check
+                    if extra_target and extra_target in {r.target_node_id for r in references}:
+                        continue
+                    references.append(NormativeReference(
+                        raw=raw.strip(),
+                        type=NormativeType.INTERNO.value,
+                        doc_id=doc_id,
+                        span_ref=extra_span,
+                        target_node_id=extra_target,
+                        method="regex",
+                        confidence=confidence,
+                        is_ambiguous=is_ambiguous,
+                        rel_type=rel_type,
+                        rel_type_confidence=rel_type_confidence,
+                    ))
 
         return references
 
@@ -690,7 +736,7 @@ class CitationExtractor:
         # Padrão para "art. X, inciso Y, alínea Z da/do" - busca artigo próximo do final
         # Ex: "art. 9º da Lei", "art. 75, inciso II, alínea 'a', da Lei"
         art_pattern = re.compile(
-            r"(?:art\.?|artigo)\s*(\d+)[ºo°]?"
+            r"(?:arts?\.?|artigos?)\s*(\d+)[ºo°]?"
             r"(?:\s*,?\s*(?:§|par[aá]grafo)\s*(\d+|[úu]nico)[ºo°]?)?"
             r"(?:\s*,?\s*inciso\s+([IVXLCDM]+))?"
             r"(?:\s*,?\s*al[ií]nea\s+['\"]?([a-z])['\"]?)?"
