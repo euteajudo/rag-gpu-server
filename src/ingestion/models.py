@@ -148,6 +148,10 @@ class ProcessedChunk(BaseModel):
         description="Segmentos geométricos por página [{page_number, bbox_pdf, bbox_img}, ...]"
     )
 
+    # Split de artigos longos
+    part_index: int = Field(0, description="Indice da parte (1..N para splits, 0 se nao splitado)")
+    part_total: int = Field(1, description="Total de partes (1 se nao splitado)")
+
     # Dual Ingestion (Parent Document Retrieval)
     is_consolidated: bool = Field(False, description="True se chunk consolidado @FULL (caput + filhos)")
     child_node_ids: list[str] = Field(default_factory=list, description="Node IDs dos filhos incluidos no consolidado")
