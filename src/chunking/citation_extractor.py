@@ -65,7 +65,7 @@ KNOWN_DOCUMENTS = {
     # INs
     "in 65": "IN-65-2021",
     "in 58": "IN-58-2022",
-    "in 5": "IN-5-2017",
+    "in 5": "IN-05-2017",
     # Constituição
     "constituição federal": "CF-1988",
     "cf": "CF-1988",
@@ -701,30 +701,34 @@ class CitationExtractor:
             return None
 
         type_prefix = norm_type.value
-        number_clean = number.replace(".", "").lstrip("0") or number
+        # Remove pontos e zeros à esquerda para lookup canônico
+        number_stripped = number.replace(".", "").lstrip("0") or number
 
         # Tratamento especial para ACORDAO: usa "AC" e não aplica ponto de milhar
         if norm_type == NormativeType.ACORDAO:
-            parts = ["AC", number_clean]
+            parts = ["AC", number_stripped]
             if year:
                 parts.append(str(year))
             # Formato: AC-NUMERO-ANO (ex: AC-2450-2025)
             # Nota: colegiado (P, 1C, 2C) não é capturado pelo regex atual
             return "-".join(parts)
 
-        # Busca ano canônico na tabela
-        canonical_key = (type_prefix, number_clean)
+        # Lookup usa número sem zeros à esquerda (ex: "5" para IN-05)
+        canonical_key = (type_prefix, number_stripped)
         canonical_year = CANONICAL_NORMS.get(canonical_key)
 
         # Valida ano extraído
         validated_year = self._validate_year(
             type_prefix=type_prefix,
-            number=number_clean,
+            number=number_stripped,
             extracted_year=year,
             canonical_year=canonical_year
         )
 
-        parts = [type_prefix, number_clean]
+        # Para o doc_id final, zero-pad números de 1 dígito (ex: "5" → "05")
+        number_output = number_stripped.zfill(2) if number_stripped.isdigit() else number_stripped
+
+        parts = [type_prefix, number_output]
         if validated_year:
             parts.append(str(validated_year))
 
