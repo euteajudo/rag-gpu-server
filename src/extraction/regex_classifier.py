@@ -103,9 +103,10 @@ def _get_first_span(block):
 
 def _is_metadata(block):
     text = block["text"]
-    span = _get_first_span(block)
-    if span and span.get("font", "") in METADATA_FONTS:
-        return True
+    # Font check removido: ArialMT/Arial-BoldMT são fontes genéricas usadas
+    # em PDFs gerados por navegadores (ex: Planalto). Usar font sozinha como
+    # critério filtra TODOS os dispositivos legais nesses PDFs.
+    # Os keyword checks e regex de data abaixo são suficientes.
     for kw in METADATA_KEYWORDS:
         if kw in text:
             return True
