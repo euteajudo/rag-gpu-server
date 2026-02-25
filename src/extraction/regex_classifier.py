@@ -78,6 +78,9 @@ RE_LEGAL_MARKER = re.compile(
 
 ROMAN_TO_INT = {r: i + 1 for i, r in enumerate(ROMAN_NUMERALS)}
 
+# Detecta linhas de índice/sumário (ex: "Art. 1º ..................... Pág 12")
+RE_SUMMARY_LINE = re.compile(r"(\.{5,}|\s_\s|\s-\s{2,})")
+
 # ============================================================
 # Metadata detection
 # ============================================================
@@ -89,8 +92,6 @@ METADATA_KEYWORDS = [
     "https://",
     "http://",
 ]
-METADATA_FONTS = {"ArialMT", "Arial-BoldMT"}
-
 
 def _get_first_span(block):
     lines = block.get("lines", [])
@@ -175,19 +176,19 @@ def _is_cabecalho(block):
 def classify_block(block):
     """
     Classifica um bloco. Retorna (device_type, identifier, reason).
-    ORDEM: 1.Metadata -> 2.Dispositivos -> 3.Filtros editoriais -> 4.Nao classificado
+    ORDEM: 1.Dispositivos -> 2.Metadata por conteúdo -> 3.Filtros editoriais -> 4.Nao classificado
     """
     text = block["text"].strip()
     if not text:
         return "metadata", None, "Bloco vazio"
 
-    # PASSO 1: Metadata do DOU
-    if _is_metadata(block):
-        return "metadata", None, "Font/keyword DOU"
+    # PASSO 1: Dispositivos normativos (PRIORIDADE MÁXIMA)
+    is_summary = bool(RE_SUMMARY_LINE.search(text))
 
-    # PASSO 2: Dispositivos normativos (PRIORIDADE MAXIMA)
     m = RE_ARTICLE.match(text)
     if m:
+        if is_summary:
+            return "metadata", None, "Linha de sumário/índice"
         num_str = m.group(1)  # "337", "5", "1.048"
         suffix = m.group(2) or ""  # "-E" or ""
         num_int = int(num_str.replace(".", ""))
@@ -199,6 +200,8 @@ def classify_block(block):
 
     m = RE_PARAGRAPH.match(text)
     if m:
+        if is_summary:
+            return "metadata", None, "Linha de sumário/índice"
         if m.group(2):
             num = int(m.group(2))
             return "paragraph", f"§ {num}º", f"§ {num}º"
@@ -207,13 +210,23 @@ def classify_block(block):
 
     m = RE_INCISO.match(text)
     if m:
+        if is_summary:
+            return "metadata", None, "Linha de sumário/índice"
         roman = m.group(1)
         return "inciso", roman, f"Inciso {roman}"
 
     m = RE_ALINEA.match(text)
     if m:
+        if is_summary:
+            return "metadata", None, "Linha de sumário/índice"
         letter = m.group(1)
         return "alinea", letter, f"Alínea {letter}"
+
+    # PASSO 2: Metadata por conteúdo (keywords, regex de data, paginação)
+    if _is_metadata(block):
+        return "metadata", None, "Keyword estática"
+    if re.match(r"^(p[áa]ginas?|p[áa]g\.?|fls?\.?)?\s*\d+(?:\s*(?:/|de)\s*\d+)?\s*$", text, re.IGNORECASE):
+        return "metadata", None, "Paginação solta"
 
     # PASSO 3: Filtros editoriais
     if RE_ORGAO.match(text):
