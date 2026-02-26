@@ -26,7 +26,7 @@ class Config:
 
     # vLLM (container separado)
     vllm_base_url: str = "http://localhost:8002/v1"
-    vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    vllm_model: str = "/workspace/models/Qwen3.5-27B-AWQ"
 
     # VLM Pipeline
     use_vlm_pipeline: bool = True      # Legacy removido, sempre VLM
@@ -55,7 +55,7 @@ class Config:
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
             reranker_model=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
             vllm_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8002/v1"),
-            vllm_model=os.getenv("VLLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct"),
+            vllm_model=os.getenv("VLLM_MODEL", "/workspace/models/Qwen3.5-27B-AWQ"),
             use_vlm_pipeline=True,  # Legacy removido, sempre VLM
             vlm_page_dpi=int(os.getenv("VLM_PAGE_DPI", "300")),
             vlm_max_retries=int(os.getenv("VLM_MAX_RETRIES", "3")),

@@ -58,12 +58,12 @@ def _extract_json(text: str) -> dict:
 
 
 class VLMClient:
-    """Cliente assíncrono para Qwen3-VL via vLLM (multimodal)."""
+    """Cliente assíncrono para Qwen3.5-27B via vLLM (multimodal)."""
 
     def __init__(
         self,
         base_url: str = "http://localhost:8002/v1",
-        model: str = "Qwen/Qwen3-VL-8B-Instruct",
+        model: str = "/workspace/models/Qwen3.5-27B-AWQ",
         timeout: float = 120.0,
         max_retries: int = 3,
         retry_delay: float = 2.0,
