@@ -14,7 +14,7 @@ from .models import IngestRequest, ProcessedChunk
 
 logger = logging.getLogger(__name__)
 
-MIN_CHILDREN = 3          # Minimo de filhos diretos para consolidar
+MIN_CHILDREN = 2          # Minimo de filhos diretos para consolidar
 MAX_CHARS = 2000          # ~500 tokens (4 chars/token)
 OVERLAP_CHILDREN = 1      # Filhos de overlap entre partes
 
