@@ -182,6 +182,17 @@ def classify_block(block):
     if not text:
         return "metadata", None, "Bloco vazio"
 
+    # PASSO 0: Filtrar texto riscado (strikethrough) e versões revogadas
+    # PDFs do Planalto mostram TODAS as versões históricas de artigos alterados:
+    # versões revogadas aparecem com texto riscado (strikethrough via drawings).
+    # Detectado pelo PyMuPDFExtractor via page.get_drawings().
+    if block.get("has_strikethrough", False):
+        return "metadata", None, "Texto riscado (strikethrough)"
+    # Fallback textual: "Vigência encerrada" indica versão revogada mesmo sem
+    # detecção geométrica de strikethrough.
+    if "vig\u00eancia encerrada" in text.lower():
+        return "metadata", None, "Vigência encerrada (versão revogada)"
+
     # PASSO 1: Dispositivos normativos (PRIORIDADE MÁXIMA)
     is_summary = bool(RE_SUMMARY_LINE.search(text))
 
@@ -534,6 +545,20 @@ def classify_document(pages):
         # Remover órfãos que foram mergeados
         unclassified = [u for i, u in enumerate(unclassified) if i not in merged_indices]
 
+    # Pass 2.7: Deduplicação de span_ids (versões revogadas do Planalto)
+    # PDFs do Planalto podem ter múltiplas versões do mesmo artigo: versões
+    # revogadas (riscadas) aparecem antes da versão vigente. Se "Vigência
+    # encerrada" não está no mesmo bloco do dispositivo, o Pass 0 não o filtra.
+    # Safety net: manter apenas a ÚLTIMA ocorrência de cada span_id (a vigente
+    # aparece por último no layout do Planalto).
+    seen_span_ids = {}
+    for idx, device in enumerate(devices):
+        seen_span_ids[device["span_id"]] = idx
+    duplicates_removed = len(devices) - len(seen_span_ids)
+    if duplicates_removed > 0:
+        keep_indices = set(seen_span_ids.values())
+        devices = [d for idx, d in enumerate(devices) if idx in keep_indices]
+
     # Pass 3: children
     span_id_map = {d["span_id"]: d for d in devices}
     for device in devices:
@@ -559,6 +584,7 @@ def classify_document(pages):
             "filtered": len(filtered),
             "unclassified": len(unclassified),
             "orphans_merged": len(merged_indices),
+            "duplicates_removed": duplicates_removed,
             "by_device_type": by_device_type,
             "by_filter_type": by_filter_type,
             "max_hierarchy_depth": max((d["hierarchy_depth"] for d in devices), default=0),

@@ -24,6 +24,7 @@ class BlockData:
     text: str                 # texto do bloco
     page_number: int          # página de origem (1-indexed)
     lines: list = field(default_factory=list)  # line/span data para classifier
+    has_strikethrough: bool = False  # True se linhas de riscado cruzam o bloco
 
 
 @dataclass

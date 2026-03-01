@@ -93,6 +93,37 @@ class PyMuPDFExtractor:
                 img_width = pixmap.width
                 img_height = pixmap.height
 
+                # Detecta linhas de strikethrough (riscado) na página.
+                # PDFs do Planalto mostram versões revogadas com texto riscado.
+                # Strikethrough é renderizado como linhas horizontais desenhadas
+                # sobre o texto. Coletamos essas linhas para marcar blocos afetados.
+                strikethrough_lines = []
+                try:
+                    for drawing in page.get_drawings():
+                        # Strikethrough = linha reta horizontal (rect ou line)
+                        if drawing.get("type") not in ("l", "re"):
+                            # "l" = line, "re" = rect (thin rect = line)
+                            pass
+                        for item in drawing.get("items", []):
+                            kind = item[0]
+                            if kind == "l":
+                                # Line: item = ("l", Point(x0,y0), Point(x1,y1))
+                                p1, p2 = item[1], item[2]
+                                # Horizontal se diferença em y < 2 pontos
+                                if abs(p1.y - p2.y) < 2.0:
+                                    min_x = min(p1.x, p2.x)
+                                    max_x = max(p1.x, p2.x)
+                                    # Linha mínima de 20 pontos (ignora artefatos)
+                                    if max_x - min_x > 20:
+                                        strikethrough_lines.append((min_x, p1.y, max_x, p1.y))
+                            elif kind == "re":
+                                # Rect fino (height < 3pt) = strikethrough line
+                                r = item[1]  # Rect
+                                if hasattr(r, 'height') and r.height < 3.0 and r.width > 20:
+                                    strikethrough_lines.append((r.x0, r.y0, r.x1, r.y0))
+                except Exception as e:
+                    logger.debug(f"get_drawings() falhou na página {page_number}: {e}")
+
                 # Extrai blocos com bbox via dict (reading order com sort=True)
                 page_dict = page.get_text("dict", sort=True)
                 raw_blocks = page_dict.get("blocks", [])
@@ -149,6 +180,21 @@ class PyMuPDFExtractor:
                     # bbox do bloco já está em PDF points (72 DPI)
                     bbox_pdf = list(block.get("bbox", [0, 0, 0, 0]))
 
+                    # Detecta strikethrough: verifica se linhas horizontais cruzam
+                    # a área vertical do bloco (entre y0 e y1 do bbox).
+                    block_has_strikethrough = False
+                    if strikethrough_lines:
+                        bx0, by0, bx1, by1 = bbox_pdf
+                        for lx0, ly, lx1, _ in strikethrough_lines:
+                            # Linha deve estar dentro da faixa vertical do bloco
+                            if by0 <= ly <= by1:
+                                # Linha deve ter overlap horizontal significativo
+                                overlap = min(bx1, lx1) - max(bx0, lx0)
+                                block_width = bx1 - bx0
+                                if block_width > 0 and overlap / block_width > 0.3:
+                                    block_has_strikethrough = True
+                                    break
+
                     block_data_list.append(BlockData(
                         block_index=blk_idx,
                         char_start=block_char_start,
@@ -157,6 +203,7 @@ class PyMuPDFExtractor:
                         text=block_text,
                         page_number=page_number,
                         lines=block_lines,
+                        has_strikethrough=block_has_strikethrough,
                     ))
 
                 page_text = "".join(page_text_parts)

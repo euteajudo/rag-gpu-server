@@ -978,6 +978,7 @@ class IngestionPipeline:
                     "char_end": block.char_end,
                     "bbox": block.bbox_pdf,
                     "lines": block.lines,
+                    "has_strikethrough": getattr(block, "has_strikethrough", False),
                 })
             pages.append({
                 "page_number": page.page_number,
