@@ -487,6 +487,53 @@ def classify_document(pages):
             "children_span_ids": [],
         })
 
+    # Pass 2.5: Merge de blocos órfãos (continuação cross-page)
+    # Blocos "nao_classificado" que estão logo após um device classificado
+    # são provavelmente continuação do dispositivo anterior, fragmentados
+    # por cabeçalhos de página injetados pelo browser (data/hora, URL, paginação).
+    merged_indices = []
+    if unclassified and devices:
+        devices.sort(key=lambda d: d["char_start"])
+
+        for i, orphan in enumerate(unclassified):
+            # Recuperar o bloco original para obter texto e offsets completos
+            orphan_block = None
+            for block in all_blocks:
+                if block["block_index"] == orphan["block_index"]:
+                    orphan_block = block
+                    break
+            if not orphan_block:
+                continue
+
+            orphan_text = orphan_block["text"].strip()
+            if not orphan_text:
+                continue
+
+            # Encontrar o device imediatamente anterior por char_start
+            prev_device = None
+            for d in reversed(devices):
+                if d["char_start"] < orphan_block["char_start"]:
+                    prev_device = d
+                    break
+
+            if prev_device is None:
+                continue
+
+            # Verificar proximidade: gap entre fim do device anterior e início do órfão.
+            # Headers de browser filtrados entre eles têm ~100-200 chars.
+            # Gap > 500 chars provavelmente NÃO é continuação.
+            gap = orphan_block["char_start"] - prev_device["char_end"]
+            if gap > 500:
+                continue
+
+            # Merge: append texto do órfão e estender char_end
+            prev_device["full_text"] = prev_device["full_text"] + "\n" + orphan_text
+            prev_device["char_end"] = max(prev_device["char_end"], orphan_block["char_end"])
+            merged_indices.append(i)
+
+        # Remover órfãos que foram mergeados
+        unclassified = [u for i, u in enumerate(unclassified) if i not in merged_indices]
+
     # Pass 3: children
     span_id_map = {d["span_id"]: d for d in devices}
     for device in devices:
@@ -511,6 +558,7 @@ def classify_document(pages):
             "devices": len(devices),
             "filtered": len(filtered),
             "unclassified": len(unclassified),
+            "orphans_merged": len(merged_indices),
             "by_device_type": by_device_type,
             "by_filter_type": by_filter_type,
             "max_hierarchy_depth": max((d["hierarchy_depth"] for d in devices), default=0),
