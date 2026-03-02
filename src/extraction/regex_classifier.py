@@ -78,6 +78,24 @@ RE_LEGAL_MARKER = re.compile(
 
 ROMAN_TO_INT = {r: i + 1 for i, r in enumerate(ROMAN_NUMERALS)}
 
+
+def _children_sort_key(span_id: str) -> tuple:
+    """Ordena children_span_ids por tipo + número (Roman-aware)."""
+    parts = span_id.split("-")
+    prefix = parts[0] if parts else ""
+    device_order = {"ART": 0, "PAR": 1, "INC": 2, "ALI": 3}.get(prefix, 9)
+    num = 9999
+    try:
+        if prefix == "PAR" and len(parts) >= 3:
+            num = int(parts[2]) if parts[2] != "UNICO" else 0
+        elif prefix == "INC" and len(parts) >= 3:
+            num = ROMAN_TO_INT.get(parts[2], 9999)
+        elif prefix == "ALI" and len(parts) >= 4:
+            num = ord(parts[3].lower()) - ord('a')
+    except (ValueError, IndexError):
+        pass
+    return (device_order, num)
+
 # Detecta linhas de índice/sumário (ex: "Art. 1º ..................... Pág 12")
 RE_SUMMARY_LINE = re.compile(r"(\.{5,}|\s_\s|\s-\s{2,})")
 
@@ -632,12 +650,17 @@ def classify_document(pages):
     if duplicates_removed > 0:
         devices = [d for idx, d in enumerate(devices) if idx in keep_indices]
 
-    # Pass 3: children
+    # Pass 3: children (com ordenação Roman-aware)
     span_id_map = {d["span_id"]: d for d in devices}
     for device in devices:
         parent_id = device["parent_span_id"]
         if parent_id and parent_id in span_id_map:
             span_id_map[parent_id]["children_span_ids"].append(device["span_id"])
+
+    # Ordena children_span_ids de cada device por tipo + número (Roman-aware)
+    for device in devices:
+        if device["children_span_ids"]:
+            device["children_span_ids"].sort(key=_children_sort_key)
 
     # Stats
     by_device_type = {}

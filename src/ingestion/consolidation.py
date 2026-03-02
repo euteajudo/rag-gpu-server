@@ -39,9 +39,53 @@ def should_consolidate(article_node_id: str, all_chunks: list[ProcessedChunk]) -
     return []
 
 
+_ROMAN_VALUES = {"M": 1000, "D": 500, "C": 100, "L": 50, "X": 10, "V": 5, "I": 1}
+
+
+def _roman_to_int(s: str) -> int:
+    """Converte numeral romano para inteiro. Retorna 9999 se inválido."""
+    s = s.upper().strip()
+    if not s or not all(c in _ROMAN_VALUES for c in s):
+        return 9999
+    total = 0
+    for i, c in enumerate(s):
+        val = _ROMAN_VALUES[c]
+        if i + 1 < len(s) and val < _ROMAN_VALUES[s[i + 1]]:
+            total -= val
+        else:
+            total += val
+    return total
+
+
+def _span_sort_key(span_id: str) -> tuple:
+    """
+    Chave de ordenação hierárquica para span_ids (Roman-aware).
+    Retorna tupla (device_order, num).
+    """
+    if not span_id:
+        return (9, 9999)
+
+    parts = span_id.split("-")
+    prefix = parts[0] if parts else ""
+    device_order = {"ART": 0, "PAR": 1, "INC": 2, "ALI": 3}.get(prefix, 9)
+    num = 9999
+
+    try:
+        if prefix == "PAR" and len(parts) >= 3:
+            num = int(parts[2]) if parts[2] != "UNICO" else 0
+        elif prefix == "INC" and len(parts) >= 3:
+            num = _roman_to_int(parts[2])
+        elif prefix == "ALI" and len(parts) >= 4:
+            num = ord(parts[3].lower()) - ord('a')
+    except (ValueError, IndexError):
+        pass
+
+    return (device_order, num)
+
+
 def _sort_children(children: list[ProcessedChunk]) -> list[ProcessedChunk]:
-    """Ordena filhos por span_id para preservar ordem estrutural."""
-    return sorted(children, key=lambda c: c.span_id)
+    """Ordena filhos por span_id (Roman-aware) para preservar ordem estrutural."""
+    return sorted(children, key=lambda c: _span_sort_key(c.span_id))
 
 
 def build_consolidated_text(
