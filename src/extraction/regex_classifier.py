@@ -190,7 +190,8 @@ def classify_block(block):
         return "metadata", None, "Texto riscado (strikethrough)"
     # Fallback textual: "Vigência encerrada" indica versão revogada mesmo sem
     # detecção geométrica de strikethrough.
-    if "vig\u00eancia encerrada" in text.lower():
+    # Normaliza whitespace: PDF pode quebrar "Vigência\nencerrada" em duas linhas.
+    if "vig\u00eancia encerrada" in re.sub(r"\s+", " ", text).lower():
         return "metadata", None, "Vigência encerrada (versão revogada)"
 
     # PASSO 1: Dispositivos normativos (PRIORIDADE MÁXIMA)
@@ -337,6 +338,49 @@ def classify_document(pages):
     for page in pages:
         for block in page["blocks"]:
             all_blocks.append({**block, "page_number": page["page_number"]})
+    all_blocks.sort(key=lambda b: b["char_start"])
+
+    # Pass 0.5: Split de blocos que misturam header de browser com texto legal.
+    # PDFs impressos do Planalto injetam cabeçalhos (data/hora, URL, paginação)
+    # nas quebras de página. Quando um dispositivo cruza a página, PyMuPDF pode
+    # agrupar o header + continuação num único bloco. _is_metadata() filtra o
+    # bloco inteiro e o texto de continuação se perde.
+    # Solução: detectar header de browser no INÍCIO do bloco e, se houver texto
+    # legal substancial depois, splittar em dois blocos.
+    RE_BROWSER_HEADER_PREFIX = re.compile(
+        r"^("
+        r"(?:\d{2}/\d{2}/\d{4},?\s+\d{2}:\d{2}[^\n]*\n)"  # data/hora
+        r"(?:[^\n]*(?:https?://|\.gov\.br|\.htm)[^\n]*\n)?"  # URL (opcional)
+        r"(?:[^\n]*\d+\s*/\s*\d+[^\n]*\n)?"                  # paginação (opcional)
+        r")"
+    )
+    split_blocks = []
+    blocks_split_count = 0
+    for block in all_blocks:
+        text = block["text"]
+        m = RE_BROWSER_HEADER_PREFIX.match(text)
+        if m:
+            header_end = m.end()
+            remaining = text[header_end:].strip()
+            if remaining and len(remaining) > 20:
+                # Split: header vira um bloco, continuação vira outro
+                header_block = {
+                    **block,
+                    "text": text[:header_end].strip(),
+                    "char_end": block["char_start"] + header_end,
+                }
+                continuation_block = {
+                    **block,
+                    "text": remaining,
+                    "char_start": block["char_start"] + header_end,
+                    "block_index": block["block_index"] + 10000,
+                }
+                split_blocks.append(header_block)
+                split_blocks.append(continuation_block)
+                blocks_split_count += 1
+                continue
+        split_blocks.append(block)
+    all_blocks = split_blocks
     all_blocks.sort(key=lambda b: b["char_start"])
 
     # Pass 1: classify
@@ -510,7 +554,7 @@ def classify_document(pages):
             # Recuperar o bloco original para obter texto e offsets completos
             orphan_block = None
             for block in all_blocks:
-                if block["block_index"] == orphan["block_index"]:
+                if block["block_index"] == orphan["block_index"] and block["page_number"] == orphan["page_number"]:
                     orphan_block = block
                     break
             if not orphan_block:
@@ -583,6 +627,7 @@ def classify_document(pages):
             "devices": len(devices),
             "filtered": len(filtered),
             "unclassified": len(unclassified),
+            "blocks_split": blocks_split_count,
             "orphans_merged": len(merged_indices),
             "duplicates_removed": duplicates_removed,
             "by_device_type": by_device_type,
