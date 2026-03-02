@@ -804,11 +804,25 @@ class IngestionPipeline:
         from ..chunking.canonical_offsets import normalize_canonical_text as norm_ct
 
         # Check 1: offsets
+        # Devices que receberam orphan merge (Pass 2.5) têm char_end estendido
+        # até o bloco órfão, mas o full_text não inclui os headers filtrados
+        # que existem no meio do canonical_text. Para esses, verificamos que
+        # o texto do device começa corretamente e que o slice contém o texto.
         offset_details = []
         offsets_matches = 0
         for d in regex_devices:
             sliced = canonical_text[d.char_start:d.char_end] if d.char_start >= 0 else ""
             match = sliced == d.text
+            if not match and d.text and sliced:
+                # Orphan merge: full_text = "parte1\nparte2" sem headers,
+                # mas sliced = "parte1\nheader\nparte2" com headers.
+                # Aceitar se: começa igual E termina igual E todas as partes
+                # do device text existem no slice na ordem correta.
+                parts = d.text.split("\n")
+                all_parts_found = all(part in sliced for part in parts if part.strip())
+                starts_ok = sliced.startswith(d.text.split("\n")[0])
+                if starts_ok and all_parts_found:
+                    match = True
             if match:
                 offsets_matches += 1
             offset_details.append(RegexOffsetCheck(
@@ -1806,6 +1820,12 @@ class IngestionPipeline:
         for d in regex_devices:
             sliced = canonical_text[d.char_start:d.char_end] if d.char_start >= 0 else ""
             match = sliced == d.text
+            if not match and d.text and sliced:
+                parts = d.text.split("\n")
+                all_parts_found = all(part in sliced for part in parts if part.strip())
+                starts_ok = sliced.startswith(d.text.split("\n")[0])
+                if starts_ok and all_parts_found:
+                    match = True
             if match:
                 offsets_matches += 1
             offset_details.append(RegexOffsetCheck(
