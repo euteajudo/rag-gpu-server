@@ -581,9 +581,12 @@ def classify_document(pages):
             if gap > 500:
                 continue
 
-            # Merge: append texto do órfão e estender char_end
+            # Merge: append texto do órfão ao conteúdo semântico.
+            # NÃO estender char_end: entre o device e o órfão existem browser
+            # headers filtrados no canonical_text. Estender char_end faria o
+            # slice canonical_text[start:end] incluir lixo (URLs, datas, paginação)
+            # que apareceria no highlight da evidência.
             prev_device["full_text"] = prev_device["full_text"] + "\n" + orphan_text
-            prev_device["char_end"] = max(prev_device["char_end"], orphan_block["char_end"])
             merged_indices.append(i)
 
         # Remover órfãos que foram mergeados
