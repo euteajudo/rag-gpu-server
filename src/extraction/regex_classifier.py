@@ -182,16 +182,13 @@ def classify_block(block):
     if not text:
         return "metadata", None, "Bloco vazio"
 
-    # PASSO 0: Filtrar texto riscado (strikethrough) e versões revogadas
-    # PDFs do Planalto mostram TODAS as versões históricas de artigos alterados:
-    # versões revogadas aparecem com texto riscado (strikethrough via drawings).
-    # Detectado pelo PyMuPDFExtractor via page.get_drawings().
-    if block.get("has_strikethrough", False):
-        return "metadata", None, "Texto riscado (strikethrough)"
-    # Fallback textual: "Vigência encerrada" indica versão revogada mesmo sem
-    # detecção geométrica de strikethrough.
+    # PASSO 0: Filtrar versões revogadas por indicador textual confiável.
+    # O indicador geométrico (has_strikethrough) NÃO é usado aqui porque
+    # gera falsos positivos com linhas decorativas, bordas de tabela e outros
+    # elementos gráficos do PDF. O flag é propagado para os devices e usado
+    # como tiebreaker no Pass 2.7 (dedup) quando existem versões duplicadas.
     # Normaliza whitespace: PDF pode quebrar "Vigência\nencerrada" em duas linhas.
-    if "vig\u00eancia encerrada" in re.sub(r"\s+", " ", text).lower():
+    if "vigência encerrada" in re.sub(r"\s+", " ", text).lower():
         return "metadata", None, "Vigência encerrada (versão revogada)"
 
     # PASSO 1: Dispositivos normativos (PRIORIDADE MÁXIMA)
@@ -540,6 +537,7 @@ def classify_document(pages):
             "char_end": block["char_end"],
             "bbox": block["bbox"],
             "children_span_ids": [],
+            "has_strikethrough": block.get("has_strikethrough", False),
         })
 
     # Pass 2.5: Merge de blocos órfãos (continuação cross-page)
@@ -594,16 +592,36 @@ def classify_document(pages):
 
     # Pass 2.7: Deduplicação de span_ids (versões revogadas do Planalto)
     # PDFs do Planalto podem ter múltiplas versões do mesmo artigo: versões
-    # revogadas (riscadas) aparecem antes da versão vigente. Se "Vigência
-    # encerrada" não está no mesmo bloco do dispositivo, o Pass 0 não o filtra.
-    # Safety net: manter apenas a ÚLTIMA ocorrência de cada span_id (a vigente
-    # aparece por último no layout do Planalto).
-    seen_span_ids = {}
+    # revogadas (riscadas) aparecem antes da versão vigente.
+    # Regra de prioridade para escolher qual cópia manter:
+    #   1. Preferir versão SEM strikethrough (versão vigente)
+    #   2. Se todas têm mesmo status de strikethrough, manter a ÚLTIMA
+    #      (a vigente aparece por último no layout do Planalto)
+    from collections import defaultdict
+    span_id_occurrences = defaultdict(list)
     for idx, device in enumerate(devices):
-        seen_span_ids[device["span_id"]] = idx
-    duplicates_removed = len(devices) - len(seen_span_ids)
+        span_id_occurrences[device["span_id"]].append(idx)
+
+    duplicates_removed = 0
+    strikethrough_removed = 0
+    keep_indices = set()
+    for span_id, indices in span_id_occurrences.items():
+        if len(indices) == 1:
+            keep_indices.add(indices[0])
+        else:
+            # Múltiplas versões: preferir sem strikethrough
+            non_strike = [i for i in indices if not devices[i].get("has_strikethrough", False)]
+            if non_strike:
+                # Manter a última versão sem strikethrough
+                keep_indices.add(non_strike[-1])
+                strikethrough_removed += len(indices) - 1
+            else:
+                # Todas têm strikethrough (todas revogadas): manter última como fallback
+                keep_indices.add(indices[-1])
+                strikethrough_removed += len(indices) - 1
+            duplicates_removed += len(indices) - 1
+
     if duplicates_removed > 0:
-        keep_indices = set(seen_span_ids.values())
         devices = [d for idx, d in enumerate(devices) if idx in keep_indices]
 
     # Pass 3: children
@@ -633,6 +651,7 @@ def classify_document(pages):
             "blocks_split": blocks_split_count,
             "orphans_merged": len(merged_indices),
             "duplicates_removed": duplicates_removed,
+            "strikethrough_removed": strikethrough_removed,
             "by_device_type": by_device_type,
             "by_filter_type": by_filter_type,
             "max_hierarchy_depth": max((d["hierarchy_depth"] for d in devices), default=0),
