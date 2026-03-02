@@ -67,7 +67,7 @@ def _span_sort_key(span_id: str) -> tuple:
 
     parts = span_id.split("-")
     prefix = parts[0] if parts else ""
-    device_order = {"ART": 0, "PAR": 1, "INC": 2, "ALI": 3}.get(prefix, 9)
+    device_order = {"ART": 0, "INC": 1, "ALI": 2, "PAR": 3}.get(prefix, 9)
     num = 9999
 
     try:
