@@ -566,6 +566,31 @@ def classify_document(pages):
     # Blocos "nao_classificado" que estão logo após um device classificado
     # são provavelmente continuação do dispositivo anterior, fragmentados
     # por cabeçalhos de página injetados pelo browser (data/hora, URL, paginação).
+    #
+    # Heurísticas de merge:
+    #   1. Gap <= 1500 chars: merge direto (PDFs browser-print têm headers de
+    #      ~100-400 chars por quebra de página; com múltiplas quebras pode chegar a ~1200)
+    #   2. Gap > 1500 mas device anterior termina com sentença incompleta
+    #      (preposição, conjunção, vírgula): merge mesmo assim — é quase
+    #      certamente continuação do dispositivo, apenas com gap inflado.
+    _INCOMPLETE_SENTENCE_RE = re.compile(
+        r"""(?:
+            [,]\s*$                                # vírgula no fim
+            | \b(?:e|ou|a|o|os|as|de|do|da|dos|das
+                  |no|na|nos|nas|ao|aos|à|às
+                  |em|com|por|para|que|se|como
+                  |sobre|entre|sob|sem|até
+                  |pelo|pela|pelos|pelas
+                  |seu|sua|seus|suas
+                  |um|uma|uns|umas
+                  |cujo|cuja|cujos|cujas
+                  |quando|onde|qual|quais
+                  |conforme|mediante|perante
+            )\s*$
+        )""",
+        re.IGNORECASE | re.VERBOSE,
+    )
+
     merged_indices = []
     if unclassified and devices:
         devices.sort(key=lambda d: d["char_start"])
@@ -595,11 +620,18 @@ def classify_document(pages):
                 continue
 
             # Verificar proximidade: gap entre fim do device anterior e início do órfão.
-            # Headers de browser filtrados entre eles têm ~100-200 chars.
-            # Gap > 500 chars provavelmente NÃO é continuação.
+            # PDFs browser-print do Planalto injetam headers (URL, data, paginação)
+            # entre dispositivos, inflando o gap. Com múltiplas quebras de página,
+            # o gap pode chegar a ~1200 chars.
             gap = orphan_block["char_start"] - prev_device["char_end"]
-            if gap > 500:
-                continue
+
+            # Heurística 1: gap <= 1500 — merge direto
+            # Heurística 2: gap > 1500 mas sentença incompleta — merge mesmo assim
+            if gap > 1500:
+                # Só faz merge se o device anterior termina com sentença incompleta
+                prev_text = prev_device["full_text"].strip()
+                if not _INCOMPLETE_SENTENCE_RE.search(prev_text):
+                    continue
 
             # Merge: append texto do órfão ao conteúdo semântico.
             # NÃO estender char_end: entre o device e o órfão existem browser
